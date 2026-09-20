@@ -1,0 +1,1023 @@
+package team
+
+import (
+	"encoding/json"
+	"fmt"
+	"log"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/Northlatch-Labs-LLC/hivex/internal/config"
+)
+
+func (b *Broker) dueSchedulerJobsLocked(now time.Time) []schedulerJob {
+	now = now.UTC()
+	var out []schedulerJob
+	for _, job := range b.scheduler {
+		// Delegate to the canonical due predicate so jobs persisted with
+		// only DueAt set (no NextRun) become visible here too. The earlier
+		// inline NextRun-only check silently dropped DueAt-only jobs even
+		// though /scheduler?due_only=true accepted them.
+		if schedulerJobDue(job, now) {
+			out = append(out, job)
+		}
+	}
+	return out
+}
+
+func (b *Broker) SetSchedulerJob(job schedulerJob) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	job = normalizeSchedulerJob(job)
+	if job.Slug == "" {
+		return fmt.Errorf("job slug required")
+	}
+	if err := b.scheduleJobLocked(job); err != nil {
+		return err
+	}
+	return b.saveLocked()
+}
+
+func (b *Broker) ScheduleTaskFollowUp(taskID, channel, owner, label, payload string, when time.Time) error {
+	return b.scheduleJob(schedulerJob{
+		Slug:            normalizeSchedulerSlug("task_follow_up", channel, taskID),
+		Kind:            "task_follow_up",
+		Label:           label,
+		TargetType:      "task",
+		TargetID:        strings.TrimSpace(taskID),
+		Channel:         normalizeChannelSlug(channel),
+		IntervalMinutes: 0,
+		DueAt:           when.UTC().Format(time.RFC3339),
+		NextRun:         when.UTC().Format(time.RFC3339),
+		Status:          "scheduled",
+		Payload:         payload,
+	})
+}
+
+func (b *Broker) ScheduleRequestFollowUp(requestID, channel, label, payload string, when time.Time) error {
+	return b.scheduleJob(schedulerJob{
+		Slug:            normalizeSchedulerSlug("request_follow_up", channel, requestID),
+		Kind:            "request_follow_up",
+		Label:           label,
+		TargetType:      "request",
+		TargetID:        strings.TrimSpace(requestID),
+		Channel:         normalizeChannelSlug(channel),
+		IntervalMinutes: 0,
+		DueAt:           when.UTC().Format(time.RFC3339),
+		NextRun:         when.UTC().Format(time.RFC3339),
+		Status:          "scheduled",
+		Payload:         payload,
+	})
+}
+
+func (b *Broker) ScheduleRecheck(channel, targetType, targetID, label, payload string, when time.Time) error {
+	return b.scheduleJob(schedulerJob{
+		Slug:            normalizeSchedulerSlug("recheck", channel, targetType, targetID),
+		Kind:            "recheck",
+		Label:           label,
+		TargetType:      strings.TrimSpace(targetType),
+		TargetID:        strings.TrimSpace(targetID),
+		Channel:         normalizeChannelSlug(channel),
+		IntervalMinutes: 0,
+		DueAt:           when.UTC().Format(time.RFC3339),
+		NextRun:         when.UTC().Format(time.RFC3339),
+		Status:          "scheduled",
+		Payload:         payload,
+	})
+}
+
+func (b *Broker) scheduleJob(job schedulerJob) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	job = normalizeSchedulerJob(job)
+	if job.Slug == "" {
+		return fmt.Errorf("job slug required")
+	}
+	if job.Channel == "" {
+		job.Channel = "general"
+	}
+	if err := b.scheduleJobLocked(job); err != nil {
+		return err
+	}
+	return b.saveLocked()
+}
+
+func (b *Broker) scheduleJobLocked(job schedulerJob) error {
+	for i := range b.scheduler {
+		if !schedulerJobMatches(b.scheduler[i], job) {
+			continue
+		}
+		b.scheduler[i] = job
+		return nil
+	}
+	b.scheduler = append(b.scheduler, job)
+	return nil
+}
+
+func normalizeSchedulerSlug(parts ...string) string {
+	var filtered []string
+	for _, part := range parts {
+		part = normalizeSlugPart(part)
+		if part != "" {
+			filtered = append(filtered, part)
+		}
+	}
+	return strings.Join(filtered, ":")
+}
+
+func normalizeSlugPart(s string) string {
+	s = strings.ToLower(strings.TrimSpace(s))
+	s = strings.ReplaceAll(s, " ", "-")
+	s = strings.ReplaceAll(s, "_", "-")
+	return s
+}
+
+func normalizeSchedulerJob(job schedulerJob) schedulerJob {
+	job.Slug = strings.TrimSpace(job.Slug)
+	job.Kind = strings.TrimSpace(job.Kind)
+	job.Label = strings.TrimSpace(job.Label)
+	job.TargetType = strings.TrimSpace(job.TargetType)
+	job.TargetID = strings.TrimSpace(job.TargetID)
+	job.Channel = normalizeChannelSlug(job.Channel)
+	job.Provider = strings.TrimSpace(job.Provider)
+	job.ScheduleExpr = strings.TrimSpace(job.ScheduleExpr)
+	job.WorkflowKey = strings.TrimSpace(job.WorkflowKey)
+	job.SkillName = strings.TrimSpace(job.SkillName)
+	if job.Channel == "" {
+		job.Channel = "general"
+	}
+	job.Payload = strings.TrimSpace(job.Payload)
+	job.Status = strings.TrimSpace(job.Status)
+	if job.Status == "" {
+		job.Status = "scheduled"
+	}
+	if job.IntervalMinutes < 0 {
+		job.IntervalMinutes = 0
+	}
+	if job.DueAt == "" && job.NextRun != "" {
+		job.DueAt = job.NextRun
+	}
+	if job.NextRun == "" && job.DueAt != "" {
+		job.NextRun = job.DueAt
+	}
+	return job
+}
+
+func schedulerJobMatches(existing, candidate schedulerJob) bool {
+	if existing.Slug != "" && candidate.Slug != "" && existing.Slug == candidate.Slug {
+		return true
+	}
+	if existing.Kind != "" && candidate.Kind != "" && existing.Kind != candidate.Kind {
+		return false
+	}
+	if existing.TargetType != "" && candidate.TargetType != "" && existing.TargetType != candidate.TargetType {
+		return false
+	}
+	if existing.TargetID != "" && candidate.TargetID != "" && existing.TargetID != candidate.TargetID {
+		return false
+	}
+	if existing.Channel != "" && candidate.Channel != "" && existing.Channel != candidate.Channel {
+		return false
+	}
+	return existing.Kind != "" && existing.Kind == candidate.Kind && existing.TargetType == candidate.TargetType && existing.TargetID == candidate.TargetID && existing.Channel == candidate.Channel
+}
+
+func schedulerJobDue(job schedulerJob, now time.Time) bool {
+	if strings.EqualFold(job.Status, "done") || strings.EqualFold(job.Status, "canceled") {
+		return false
+	}
+	if job.DueAt != "" {
+		if due, err := time.Parse(time.RFC3339, job.DueAt); err == nil && !due.After(now) {
+			return true
+		}
+	}
+	if job.NextRun != "" {
+		if due, err := time.Parse(time.RFC3339, job.NextRun); err == nil && !due.After(now) {
+			return true
+		}
+	}
+	return false
+}
+
+func (b *Broker) completeSchedulerJobsLocked(targetType, targetID, channel string) {
+	for i := range b.scheduler {
+		job := &b.scheduler[i]
+		if targetType != "" && job.TargetType != targetType {
+			continue
+		}
+		if targetID != "" && job.TargetID != targetID {
+			continue
+		}
+		if channel != "" && job.Channel != "" && normalizeChannelSlug(job.Channel) != normalizeChannelSlug(channel) {
+			continue
+		}
+		job.Status = "done"
+		job.DueAt = ""
+		job.NextRun = ""
+		job.LastRun = time.Now().UTC().Format(time.RFC3339)
+	}
+}
+
+func (b *Broker) scheduleTaskLifecycleLocked(task *teamTask) {
+	if task == nil {
+		return
+	}
+	normalizeTaskPlan(task)
+	taskChannel := normalizeChannelSlug(task.Channel)
+	if taskChannel == "" {
+		taskChannel = "general"
+	}
+	followUpMinutes := config.ResolveTaskFollowUpInterval()
+	recheckMinutes := config.ResolveTaskRecheckInterval()
+	reminderMinutes := config.ResolveTaskReminderInterval()
+	now := time.Now().UTC()
+	if strings.EqualFold(task.status, "done") || strings.EqualFold(task.status, "canceled") || strings.EqualFold(task.status, "cancelled") || strings.EqualFold(task.status, "archived") {
+		task.FollowUpAt = ""
+		task.ReminderAt = ""
+		task.RecheckAt = ""
+		task.DueAt = ""
+		b.completeSchedulerJobsLocked("task", task.ID, taskChannel)
+		b.resolveWatchdogAlertsLocked("task", task.ID, taskChannel)
+		return
+	}
+	// Clear any previously-scheduled lifecycle jobs that don't match the
+	// kind we're about to enqueue. The slugs differ between "task_follow_up"
+	// and "recheck", so without this scheduleJobLocked won't find the old
+	// entry to update — it stays around and keeps firing across active-state
+	// transitions like queued → in_progress → blocked.
+	switch strings.ToLower(strings.TrimSpace(task.status)) {
+	case "in_progress":
+		b.cancelSupersededTaskJobsLocked(task.ID, taskChannel, "task_follow_up")
+		due := now.Add(time.Duration(followUpMinutes) * time.Minute)
+		task.FollowUpAt = due.Format(time.RFC3339)
+		task.ReminderAt = due.Add(time.Duration(reminderMinutes) * time.Minute).Format(time.RFC3339)
+		task.RecheckAt = due.Add(time.Duration(recheckMinutes) * time.Minute).Format(time.RFC3339)
+		task.DueAt = task.FollowUpAt
+		_ = b.scheduleJobLocked(normalizeSchedulerJob(schedulerJob{
+			Slug:       normalizeSchedulerSlug("task_follow_up", taskChannel, task.ID),
+			Kind:       "task_follow_up",
+			Label:      "Follow up on " + task.Title,
+			TargetType: "task",
+			TargetID:   task.ID,
+			Channel:    taskChannel,
+			DueAt:      task.FollowUpAt,
+			NextRun:    task.FollowUpAt,
+			Status:     "scheduled",
+			Payload:    task.Details,
+		}))
+	default:
+		b.cancelSupersededTaskJobsLocked(task.ID, taskChannel, "recheck")
+		due := now.Add(time.Duration(recheckMinutes) * time.Minute)
+		task.RecheckAt = due.Format(time.RFC3339)
+		task.ReminderAt = due.Add(time.Duration(reminderMinutes) * time.Minute).Format(time.RFC3339)
+		task.FollowUpAt = task.RecheckAt
+		task.DueAt = task.RecheckAt
+		_ = b.scheduleJobLocked(normalizeSchedulerJob(schedulerJob{
+			Slug:       normalizeSchedulerSlug("recheck", taskChannel, "task", task.ID),
+			Kind:       "recheck",
+			Label:      "Recheck task " + truncateSummary(task.Title, 48),
+			TargetType: "task",
+			TargetID:   task.ID,
+			Channel:    taskChannel,
+			DueAt:      task.RecheckAt,
+			NextRun:    task.RecheckAt,
+			Status:     "scheduled",
+			Payload:    task.Details,
+		}))
+	}
+}
+
+// cancelSupersededTaskJobsLocked marks any scheduled lifecycle job for the
+// given task whose Kind differs from keepKind as done. Used during state
+// transitions so a stale recheck doesn't keep firing alongside a fresh
+// task_follow_up (or vice versa).
+func (b *Broker) cancelSupersededTaskJobsLocked(taskID, channel, keepKind string) {
+	now := time.Now().UTC().Format(time.RFC3339)
+	for i := range b.scheduler {
+		job := &b.scheduler[i]
+		if job.TargetType != "task" || job.TargetID != taskID {
+			continue
+		}
+		if normalizeChannelSlug(job.Channel) != normalizeChannelSlug(channel) {
+			continue
+		}
+		if job.Kind == keepKind {
+			continue
+		}
+		if strings.EqualFold(job.Status, "done") || strings.EqualFold(job.Status, "canceled") {
+			continue
+		}
+		job.Status = "done"
+		job.DueAt = ""
+		job.NextRun = ""
+		job.LastRun = now
+	}
+}
+
+func (b *Broker) scheduleRequestLifecycleLocked(req *humanInterview) {
+	if req == nil {
+		return
+	}
+	reqChannel := normalizeChannelSlug(req.Channel)
+	if reqChannel == "" {
+		reqChannel = "general"
+	}
+	reminderMinutes := config.ResolveTaskReminderInterval()
+	followUpMinutes := config.ResolveTaskFollowUpInterval()
+	now := time.Now().UTC()
+	if strings.EqualFold(req.Status, "answered") || strings.EqualFold(req.Status, "canceled") {
+		req.DueAt = ""
+		req.ReminderAt = ""
+		req.RecheckAt = ""
+		req.FollowUpAt = ""
+		b.completeSchedulerJobsLocked("request", req.ID, reqChannel)
+		b.resolveWatchdogAlertsLocked("request", req.ID, reqChannel)
+		return
+	}
+	due := now.Add(time.Duration(reminderMinutes) * time.Minute)
+	req.ReminderAt = due.Format(time.RFC3339)
+	req.FollowUpAt = due.Add(time.Duration(followUpMinutes) * time.Minute).Format(time.RFC3339)
+	req.RecheckAt = req.ReminderAt
+	req.DueAt = req.ReminderAt
+	_ = b.scheduleJobLocked(normalizeSchedulerJob(schedulerJob{
+		Slug:       normalizeSchedulerSlug("request_follow_up", reqChannel, req.ID),
+		Kind:       "request_follow_up",
+		Label:      "Follow up on " + req.Title,
+		TargetType: "request",
+		TargetID:   req.ID,
+		Channel:    reqChannel,
+		DueAt:      req.ReminderAt,
+		NextRun:    req.ReminderAt,
+		Status:     "scheduled",
+		Payload:    req.Question,
+	}))
+}
+
+func (b *Broker) handleScheduler(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		b.mu.Lock()
+		jobs := make([]schedulerJob, 0, len(b.scheduler))
+		dueOnly := strings.EqualFold(strings.TrimSpace(r.URL.Query().Get("due_only")), "true")
+		now := time.Now().UTC()
+		for _, job := range b.scheduler {
+			if dueOnly && !schedulerJobDue(job, now) {
+				continue
+			}
+			jobs = append(jobs, job)
+		}
+		b.mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"jobs": jobs})
+	case http.MethodPost:
+		// Delegate to the lifecycle-aware create path: derives a slug
+		// from the label when absent, rejects duplicates, snapshots the
+		// initial revision, and emits a "created" activity event.
+		b.handleCreateSchedulerJob(w, r)
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+// systemCronSpec describes a self-registered cron's identity + default
+// interval (PR 8 Lane G). Read-only crons (one-relay-events for v1) refuse
+// PATCH; everything else can be throttled within its floor.
+type systemCronSpec struct {
+	Slug            string
+	Label           string
+	DefaultInterval func() int // minutes; resolved fresh at registration
+	MinFloor        int        // minutes; minimum interval_override accepted
+	ReadOnly        bool       // one-relay-events: hardcoded for v1
+}
+
+// resolvedDefaultInterval returns the effective default interval for this
+// spec: at least 1, and never below MinFloor.
+func (s systemCronSpec) resolvedDefaultInterval() int {
+	d := s.DefaultInterval()
+	if d <= 0 {
+		d = 1
+	}
+	if s.MinFloor > 0 && d < s.MinFloor {
+		d = s.MinFloor
+	}
+	return d
+}
+
+// systemCronSpecs is the v1 system cron registry. Order is alphabetical
+// for deterministic startup. Each entry SHOULD be invisible in /scheduler
+// today (or surface only sporadically); registration makes them
+// configurable from the Calendar app.
+func systemCronSpecs() []systemCronSpec {
+	return []systemCronSpec{
+		{
+			Slug:            "one-relay-events",
+			Label:           "One relay events",
+			DefaultInterval: func() int { return 1 },
+			MinFloor:        1,
+			ReadOnly:        true, // hardcoded for v1 — surface only
+		},
+		{
+			Slug:            "request_follow_up",
+			Label:           "Request follow-up reminders",
+			DefaultInterval: func() int { return config.ResolveTaskFollowUpInterval() },
+			MinFloor:        5,
+		},
+		{
+			Slug:            "review-expiry",
+			Label:           "Review expiry sweep",
+			DefaultInterval: func() int { return 10 },
+			MinFloor:        5,
+		},
+		{
+			Slug:            "wiki-archive-sweep",
+			Label:           "Wiki archive sweep",
+			DefaultInterval: func() int { return 1440 }, // daily
+			MinFloor:        60,
+		},
+		{
+			Slug:            "task_follow_up",
+			Label:           "Task follow-up reminders",
+			DefaultInterval: func() int { return config.ResolveTaskFollowUpInterval() },
+			MinFloor:        5,
+		},
+		{
+			Slug:            "task_recheck",
+			Label:           "Task recheck cadence",
+			DefaultInterval: func() int { return config.ResolveTaskRecheckInterval() },
+			MinFloor:        5,
+		},
+		{
+			Slug:            "task_reminder",
+			Label:           "Task reminder cadence",
+			DefaultInterval: func() int { return config.ResolveTaskReminderInterval() },
+			MinFloor:        5,
+		},
+	}
+}
+
+// registerSystemCrons self-registers every system cron from
+// systemCronSpecs. Idempotent: existing entries keep their Enabled and
+// IntervalOverride values; only the Label / SystemManaged / IntervalMinutes
+// (default) fields refresh, so a config change to the env-resolved default
+// shows up the next time the broker starts.
+//
+// Takes b.mu internally — DO NOT call while holding the lock.
+func (b *Broker) registerSystemCrons() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for _, spec := range systemCronSpecs() {
+		defaultInterval := spec.resolvedDefaultInterval()
+		// Find existing — preserve user-controlled fields.
+		var existing *schedulerJob
+		for i := range b.scheduler {
+			if b.scheduler[i].Slug == spec.Slug {
+				existing = &b.scheduler[i]
+				break
+			}
+		}
+		if existing != nil {
+			// Migration: rows written before the cron registry had no
+			// Enabled field; JSON zero-value is false. Re-enable any
+			// system-managed row that was disabled only because it
+			// predates the registry (not by a deliberate user action).
+			if !existing.SystemManaged {
+				existing.Enabled = true
+			}
+			existing.Label = spec.Label
+			existing.SystemManaged = true
+			existing.IntervalMinutes = defaultInterval
+			continue
+		}
+		b.scheduler = append(b.scheduler, schedulerJob{
+			Slug:            spec.Slug,
+			Label:           spec.Label,
+			IntervalMinutes: defaultInterval,
+			Status:          "scheduled",
+			SystemManaged:   true,
+			Enabled:         true,
+		})
+	}
+	if err := b.saveLocked(); err != nil {
+		log.Printf("registerSystemCronsLocked: saveLocked failed: %v", err)
+	}
+}
+
+// updateSchedulerHeartbeat refreshes the in-memory scheduler entry for slug
+// with the latest interval / next-run / status fields (PR 8 Lane G). When
+// the slug isn't yet registered we fall through to a fresh entry so legacy
+// subsystems that surface a cron without going through registerSystemCrons
+// still appear in the Calendar app's System Schedules panel.
+func (b *Broker) updateSchedulerHeartbeat(slug, label string, intervalMinutes int, nextRun time.Time, status string, runStatus string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	now := time.Now().UTC().Format(time.RFC3339)
+	for i := range b.scheduler {
+		if b.scheduler[i].Slug != slug {
+			continue
+		}
+		b.scheduler[i].Label = label
+		b.scheduler[i].IntervalMinutes = intervalMinutes
+		if !nextRun.IsZero() {
+			b.scheduler[i].NextRun = nextRun.UTC().Format(time.RFC3339)
+		}
+		if status != "" {
+			b.scheduler[i].Status = status
+		}
+		if status == "sleeping" || runStatus != "" {
+			b.scheduler[i].LastRun = now
+		}
+		if runStatus != "" {
+			b.scheduler[i].LastRunStatus = runStatus
+		}
+		_ = b.saveLocked()
+		return
+	}
+	// Slug missing — fall back to a fresh entry so legacy subsystems that
+	// surface a cron without registerSystemCrons still appear.
+	job := schedulerJob{
+		Slug:            slug,
+		Label:           label,
+		IntervalMinutes: intervalMinutes,
+		Status:          status,
+		Enabled:         true,
+	}
+	if !nextRun.IsZero() {
+		job.NextRun = nextRun.UTC().Format(time.RFC3339)
+	}
+	if status == "sleeping" || runStatus != "" {
+		job.LastRun = now
+	}
+	if runStatus != "" {
+		job.LastRunStatus = runStatus
+	}
+	job = normalizeSchedulerJob(job)
+	b.scheduler = append(b.scheduler, job)
+	_ = b.saveLocked()
+}
+
+// systemCronSpecJSON is the wire shape for a single entry in
+// GET /scheduler/system-specs. It is intentionally flat so callers
+// never need to read systemCronSpec (an internal type) directly.
+type systemCronSpecJSON struct {
+	Slug                   string `json:"slug"`
+	MinFloorMinutes        int    `json:"min_floor_minutes"`
+	DefaultIntervalMinutes int    `json:"default_interval_minutes"`
+	Description            string `json:"description"`
+}
+
+// handleSchedulerSystemSpecs serves GET /scheduler/system-specs.
+// It serialises every entry from systemCronSpecs() so the web UI can
+// derive MinFloor values at runtime instead of maintaining a hardcoded
+// mirror constant. No request body; no auth-specific data — read-only.
+func (b *Broker) handleSchedulerSystemSpecs(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	specs := systemCronSpecs()
+	out := make([]systemCronSpecJSON, 0, len(specs))
+	for _, s := range specs {
+		out = append(out, systemCronSpecJSON{
+			Slug:                   s.Slug,
+			MinFloorMinutes:        s.MinFloor,
+			DefaultIntervalMinutes: s.resolvedDefaultInterval(),
+			Description:            s.Label,
+		})
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{"specs": out})
+}
+
+// handleSchedulerSubpath dispatches /scheduler/{slug} and /scheduler/{slug}/run.
+// Supported: GET /scheduler/system-specs, POST /scheduler/{slug}/run,
+// PATCH /scheduler/{slug} (PR 8 Lane G + min-floor-from-api + PR 9).
+func (b *Broker) handleSchedulerSubpath(w http.ResponseWriter, r *http.Request) {
+	rest := strings.TrimPrefix(r.URL.Path, "/scheduler/")
+	rest = strings.TrimSpace(rest)
+	if rest == "" {
+		http.Error(w, "scheduler slug required in path", http.StatusBadRequest)
+		return
+	}
+	// system-specs is a read-only sub-resource, not a per-job path.
+	if rest == "system-specs" {
+		b.handleSchedulerSystemSpecs(w, r)
+		return
+	}
+
+	// routines is the bot registration sub-resource (team_routine MCP
+	// tool): persistent, deduped standing automations. Not a per-job path.
+	if rest == "routines" {
+		b.handleRegisterRoutine(w, r)
+		return
+	}
+
+	// /scheduler/{slug}/run — POST only, force-triggers the job once without
+	// touching next_run or the recurring schedule.
+	if strings.HasSuffix(rest, "/run") {
+		slug := strings.TrimSuffix(rest, "/run")
+		slug = strings.TrimSpace(slug)
+		if slug == "" {
+			http.Error(w, "scheduler slug required in path", http.StatusBadRequest)
+			return
+		}
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		b.handleRunSchedulerJob(w, r, slug)
+		return
+	}
+
+	// /scheduler/{slug}/runs — GET only, returns the per-slug ring buffer
+	// of fires (most-recent-first). Powers the "Previous runs" surface in
+	// the Routines detail drawer.
+	if strings.HasSuffix(rest, "/runs") {
+		slug := strings.TrimSuffix(rest, "/runs")
+		slug = strings.TrimSpace(slug)
+		if slug == "" {
+			http.Error(w, "scheduler slug required in path", http.StatusBadRequest)
+			return
+		}
+		b.handleSchedulerRuns(w, r, slug)
+		return
+	}
+
+	// /scheduler/{slug}/activity — GET only.
+	if strings.HasSuffix(rest, "/activity") {
+		slug := strings.TrimSuffix(rest, "/activity")
+		slug = strings.TrimSpace(slug)
+		if slug == "" {
+			http.Error(w, "scheduler slug required in path", http.StatusBadRequest)
+			return
+		}
+		b.handleSchedulerActivity(w, r, slug)
+		return
+	}
+
+	// /scheduler/{slug}/revisions — GET only.
+	if strings.HasSuffix(rest, "/revisions") {
+		slug := strings.TrimSuffix(rest, "/revisions")
+		slug = strings.TrimSpace(slug)
+		if slug == "" {
+			http.Error(w, "scheduler slug required in path", http.StatusBadRequest)
+			return
+		}
+		b.handleSchedulerRevisions(w, r, slug)
+		return
+	}
+
+	// /scheduler/{slug}/revisions/{version}/restore — POST only.
+	if strings.HasSuffix(rest, "/restore") {
+		trimmed := strings.TrimSuffix(rest, "/restore")
+		idx := strings.LastIndex(trimmed, "/revisions/")
+		if idx < 0 {
+			http.Error(w, "invalid restore path", http.StatusBadRequest)
+			return
+		}
+		slug := strings.TrimSpace(trimmed[:idx])
+		version := strings.TrimSpace(trimmed[idx+len("/revisions/"):])
+		if slug == "" || version == "" {
+			http.Error(w, "slug and version required", http.StatusBadRequest)
+			return
+		}
+		b.handleRestoreSchedulerRevision(w, r, slug, version)
+		return
+	}
+
+	// /scheduler/{slug} — PATCH only.
+	slug := rest
+	switch r.Method {
+	case http.MethodPatch:
+		b.handlePatchSchedulerJob(w, r, slug)
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+// handleRunSchedulerJob implements POST /scheduler/{slug}/run.
+//
+// Behaviour by job type:
+//
+//   - Workflow cron jobs (TargetType == "workflow"): next_run is set to now
+//     so the watchdog scheduler's next poll finds the job as due and dispatches
+//     processWorkflowJob. The job executes within one scheduler tick (~20 s).
+//
+//   - System crons (SystemManaged == true, e.g. review-expiry):
+//     executed by dedicated broker goroutines that cannot be poked from the HTTP
+//     layer. LastRun and LastRunStatus are updated so the Calendar panel shows the
+//     manual trigger; actual side-effects happen on the goroutine's natural tick.
+//
+//   - Task / request cron jobs: LastRun and LastRunStatus updated only.
+//     These are driven by data state (task status, request lifecycle) that the
+//     HTTP handler has no context to evaluate.
+//
+// Idempotency: this handler never touches the notification cursor. It cannot
+// cause the cursor to advance twice; the notifications goroutine advances
+// the cursor via SetNotificationCursor only after a successful API round-trip,
+// entirely independently of this endpoint.
+func (b *Broker) handleRunSchedulerJob(w http.ResponseWriter, r *http.Request, slug string) {
+	b.mu.Lock()
+	var job *schedulerJob
+	for i := range b.scheduler {
+		if b.scheduler[i].Slug == slug {
+			job = &b.scheduler[i]
+			break
+		}
+	}
+	if job == nil {
+		b.mu.Unlock()
+		http.Error(w, "scheduler job not found", http.StatusNotFound)
+		return
+	}
+	now := time.Now().UTC()
+	prevLastRun := job.LastRun
+	prevLastRunStatus := job.LastRunStatus
+	prevNextRun := job.NextRun
+	prevDueAt := job.DueAt
+	job.LastRun = now.Format(time.RFC3339)
+	job.LastRunStatus = "triggered"
+	// Workflow cron jobs are dispatched through the watchdog scheduler's
+	// processWorkflowJob path, and OPERATOR routines (custom-app owners)
+	// through processOperatorRoutineJob. Marking next_run = now makes the
+	// job appear due on the next scheduler poll so it executes within one
+	// tick.
+	if strings.TrimSpace(job.TargetType) == "workflow" ||
+		(strings.TrimSpace(job.TargetType) == "agent" && isOperatorBotTarget(job.TargetID)) {
+		job.NextRun = now.Format(time.RFC3339)
+		job.DueAt = job.NextRun
+	}
+	b.recordSchedulerRunLocked(schedulerRun{
+		Slug:        slug,
+		StartedAt:   now.Format(time.RFC3339),
+		Status:      "triggered",
+		Message:     "Manual run from Routines UI",
+		TriggeredBy: "human",
+		TargetType:  job.TargetType,
+		TargetID:    job.TargetID,
+		Events: []string{
+			fmt.Sprintf("Human triggered routine %s at %s", slug, now.Format(time.RFC3339)),
+		},
+	})
+	b.recordSchedulerActivityLocked(slug, schedulerActivity{
+		Kind:    "triggered",
+		Actor:   "human",
+		Summary: "Routine triggered manually",
+	})
+	if err := b.saveLocked(); err != nil {
+		job.LastRun = prevLastRun
+		job.LastRunStatus = prevLastRunStatus
+		job.NextRun = prevNextRun
+		job.DueAt = prevDueAt
+		// Roll back the run record AND the activity event so an aborted
+		// trigger doesn't leave phantom rows in either history.
+		if hist := b.schedulerRuns[slug]; len(hist) > 0 {
+			b.schedulerRuns[slug] = hist[:len(hist)-1]
+			if len(b.schedulerRuns[slug]) == 0 {
+				delete(b.schedulerRuns, slug)
+			}
+		}
+		if act := b.schedulerActivity[slug]; len(act) > 0 {
+			b.schedulerActivity[slug] = act[:len(act)-1]
+			if len(b.schedulerActivity[slug]) == 0 {
+				delete(b.schedulerActivity, slug)
+			}
+		}
+		b.mu.Unlock()
+		http.Error(w, "failed to persist trigger", http.StatusInternalServerError)
+		return
+	}
+	b.mu.Unlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"triggered": true,
+		"slug":      slug,
+		"at":        now.Format(time.RFC3339),
+	})
+}
+
+// handlePatchSchedulerJob updates the Enabled flag and / or
+// IntervalOverride on a registered cron. System-managed read-only crons
+// (one-relay-events for v1) reject any change with 400.
+//
+//	PATCH /scheduler/{slug}
+//	{ "enabled"?: bool, "interval_override"?: int }
+//
+// Validation:
+//   - interval_override of 0 clears the override (fall back to default).
+//   - interval_override > 0 must be >= the spec's MinFloor; otherwise 400.
+//   - Unknown slug → 404.
+//   - Read-only spec (one-relay-events) → 400 with reason.
+func (b *Broker) handlePatchSchedulerJob(w http.ResponseWriter, r *http.Request, slug string) {
+	var body struct {
+		Enabled          *bool   `json:"enabled,omitempty"`
+		IntervalOverride *int    `json:"interval_override,omitempty"`
+		Label            *string `json:"label,omitempty"`
+		ScheduleExpr     *string `json:"schedule_expr,omitempty"`
+		IntervalMinutes  *int    `json:"interval_minutes,omitempty"`
+		Payload          *string `json:"payload,omitempty"`
+		TargetType       *string `json:"target_type,omitempty"`
+		TargetID         *string `json:"target_id,omitempty"`
+		Channel          *string `json:"channel,omitempty"`
+		ChangeNote       string  `json:"change_note,omitempty"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "invalid json", http.StatusBadRequest)
+		return
+	}
+	hasContentEdit := body.Label != nil || body.ScheduleExpr != nil ||
+		body.IntervalMinutes != nil || body.Payload != nil ||
+		body.TargetType != nil || body.TargetID != nil ||
+		body.Channel != nil
+	if body.Enabled == nil && body.IntervalOverride == nil && !hasContentEdit {
+		http.Error(w, "no editable fields supplied", http.StatusBadRequest)
+		return
+	}
+
+	// Look up the spec for floor + read-only enforcement. System-cron specs
+	// are the source of truth; non-system jobs (workflow / task follow-ups
+	// scheduled per-instance) inherit a generic 5-minute floor.
+	var spec *systemCronSpec
+	for _, s := range systemCronSpecs() {
+		if s.Slug == slug {
+			cp := s
+			spec = &cp
+			break
+		}
+	}
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	var job *schedulerJob
+	for i := range b.scheduler {
+		if b.scheduler[i].Slug == slug {
+			job = &b.scheduler[i]
+			break
+		}
+	}
+	if job == nil {
+		http.Error(w, "scheduler job not found", http.StatusNotFound)
+		return
+	}
+	if spec != nil && spec.ReadOnly {
+		http.Error(w, fmt.Sprintf("scheduler job %q is read-only in v1", slug), http.StatusBadRequest)
+		return
+	}
+
+	// Snapshot before mutation so we can roll back if persistence fails.
+	snapshot := *job
+
+	if body.IntervalOverride != nil {
+		override := *body.IntervalOverride
+		if override < 0 {
+			http.Error(w, "interval_override must be >= 0", http.StatusBadRequest)
+			return
+		}
+		floor := 5
+		if spec != nil {
+			floor = spec.MinFloor
+		}
+		if override > 0 && override < floor {
+			http.Error(w, fmt.Sprintf("interval_override below floor (%d minutes)", floor), http.StatusBadRequest)
+			return
+		}
+		job.IntervalOverride = override
+	}
+	if body.Enabled != nil {
+		job.Enabled = *body.Enabled
+		// Reflect in Status so /scheduler GET surfaces the disabled state
+		// without requiring callers to read Enabled separately.
+		if !job.Enabled {
+			job.Status = "disabled"
+		} else if strings.EqualFold(job.Status, "disabled") {
+			job.Status = "scheduled"
+		}
+	}
+
+	if hasContentEdit {
+		if spec != nil && spec.ReadOnly {
+			http.Error(w, fmt.Sprintf("scheduler job %q is read-only in v1", slug), http.StatusBadRequest)
+			return
+		}
+		if body.Label != nil {
+			trimmed := strings.TrimSpace(*body.Label)
+			if trimmed == "" {
+				http.Error(w, "label cannot be empty", http.StatusBadRequest)
+				return
+			}
+			job.Label = trimmed
+		}
+		if body.ScheduleExpr != nil {
+			job.ScheduleExpr = strings.TrimSpace(*body.ScheduleExpr)
+		}
+		if body.IntervalMinutes != nil {
+			if *body.IntervalMinutes < 0 {
+				http.Error(w, "interval_minutes must be >= 0", http.StatusBadRequest)
+				return
+			}
+			job.IntervalMinutes = *body.IntervalMinutes
+		}
+		if body.Payload != nil {
+			job.Payload = *body.Payload
+		}
+		if body.TargetType != nil {
+			job.TargetType = strings.TrimSpace(*body.TargetType)
+		}
+		if body.TargetID != nil {
+			job.TargetID = strings.TrimSpace(*body.TargetID)
+		}
+		if body.Channel != nil {
+			job.Channel = strings.TrimSpace(*body.Channel)
+		}
+		if strings.TrimSpace(job.ScheduleExpr) == "" && job.IntervalMinutes <= 0 {
+			// Legacy workflow routines (One workflows) declare cadence via
+			// WorkflowKey + Provider rather than schedule_expr / interval_minutes,
+			// matching the POST /scheduler shape. Don't reject content edits on
+			// those rows — label/payload/target changes are still meaningful.
+			if strings.TrimSpace(job.WorkflowKey) == "" || strings.TrimSpace(job.Provider) == "" {
+				http.Error(w, "routine must have a schedule (schedule_expr or interval_minutes)", http.StatusBadRequest)
+				return
+			}
+		}
+		// Enforce the 15-minute floor on user-created routines.
+		// System-managed crons (which never reach this PATCH path through
+		// the UI — they're created at boot) keep their own intervals.
+		if !job.SystemManaged {
+			if msg := validateRoutineCadence(job.ScheduleExpr, job.IntervalMinutes); msg != "" {
+				http.Error(w, msg, http.StatusBadRequest)
+				return
+			}
+		}
+		// Schedule fields changed — recompute NextRun so the new cadence
+		// takes effect on the next scheduler tick instead of after the old
+		// timer fires once.
+		if body.ScheduleExpr != nil || body.IntervalMinutes != nil {
+			nextRun := nextRoutineRun(*job, time.Now().UTC())
+			job.NextRun = nextRun.Format(time.RFC3339)
+			job.DueAt = job.NextRun
+		}
+	}
+
+	// Snapshot a revision for any content edit. Enable/throttle changes
+	// alone are operational and don't merit a revision row — they show up
+	// in the activity feed as `paused`/`resumed`/`throttled` instead.
+	var newRevision *schedulerRevision
+	if hasContentEdit {
+		rev := snapshotSchedulerRevision(*job)
+		rev.ChangeNote = strings.TrimSpace(body.ChangeNote)
+		rev.Author = "human"
+		saved := b.recordSchedulerRevisionLocked(slug, rev)
+		newRevision = &saved
+	}
+
+	// Activity events. We emit at most one row per request: a content
+	// edit subsumes the operational toggles, but isolated enable/throttle
+	// changes still need their own audit line.
+	switch {
+	case hasContentEdit:
+		summary := "Routine edited"
+		if note := strings.TrimSpace(body.ChangeNote); note != "" {
+			summary = fmt.Sprintf("Edited: %s", note)
+		}
+		detail := ""
+		if newRevision != nil {
+			detail = fmt.Sprintf("Saved as v%d", newRevision.Version)
+		}
+		b.recordSchedulerActivityLocked(slug, schedulerActivity{
+			Kind:    "edited",
+			Actor:   "human",
+			Summary: summary,
+			Detail:  detail,
+		})
+	case body.Enabled != nil && *body.Enabled && strings.EqualFold(snapshot.Status, "disabled"):
+		b.recordSchedulerActivityLocked(slug, schedulerActivity{
+			Kind:    "resumed",
+			Actor:   "human",
+			Summary: "Routine resumed",
+		})
+	case body.Enabled != nil && !*body.Enabled:
+		b.recordSchedulerActivityLocked(slug, schedulerActivity{
+			Kind:    "paused",
+			Actor:   "human",
+			Summary: "Routine paused",
+		})
+	case body.IntervalOverride != nil:
+		b.recordSchedulerActivityLocked(slug, schedulerActivity{
+			Kind:    "throttled",
+			Actor:   "human",
+			Summary: fmt.Sprintf("Cadence override set to %d min", *body.IntervalOverride),
+		})
+	}
+
+	if err := b.saveLocked(); err != nil {
+		// Restore in-memory state so the broker stays consistent with disk.
+		*job = snapshot
+		http.Error(w, "failed to persist scheduler update", http.StatusInternalServerError)
+		return
+	}
+
+	updated := *job
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{"job": updated})
+}

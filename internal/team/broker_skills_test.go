@@ -1,0 +1,528 @@
+package team
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/Northlatch-Labs-LLC/hivex/internal/bot"
+)
+
+// userSkills drops the skills the office seeds for every bot (app-building,
+// wiki-maintenance). Tests here are about skills a HUMAN or a bot created, and
+// asserting on raw counts made every one of them break the moment a system
+// skill was added.
+func userSkills(skills []teamSkill) []teamSkill {
+	out := make([]teamSkill, 0, len(skills))
+	for _, sk := range skills {
+		if !sk.System {
+			out = append(out, sk)
+		}
+	}
+	return out
+}
+
+// TestHandlePostSkill_RejectsDuplicateName pins the 409 path. Two skill
+// records sharing a name break findSkillByNameLocked's "first non-archived
+// match wins" semantics — every callsite would observe a stale reference.
+// Keep this guard in place.
+func TestHandlePostSkill_RejectsDuplicateName(t *testing.T) {
+	b := newTestBroker(t)
+
+	mk := func(name string) *httptest.ResponseRecorder {
+		body := bytes.NewBufferString(fmt.Sprintf(`{
+			"name":%q,
+			"title":"Dup",
+			"description":"Dup skill body.",
+			"content":"do the thing",
+			"created_by":"cos",
+			"channel":"team"
+		}`, name))
+		req := httptest.NewRequest(http.MethodPost, "/skills", body)
+		rec := httptest.NewRecorder()
+		b.handlePostSkill(rec, req)
+		return rec
+	}
+
+	if rec := mk("dup-skill"); rec.Code != http.StatusOK {
+		t.Fatalf("first create: expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	rec := mk("dup-skill")
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("second create: expected 409, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestSeedDefaultSkills_IsIdempotent locks the contract documented on
+// SeedDefaultSkills: a second call with the same specs MUST NOT create
+// duplicate skill entries. The Launcher invokes this every boot, so a
+// regression here would multiply seeded skills across restarts.
+func TestSeedDefaultSkills_IsIdempotent(t *testing.T) {
+	b := newTestBroker(t)
+	specs := []bot.PackSkillSpec{
+		{Name: "deploy", Title: "Deploy", Description: "Deploy app", Content: "1. push tag"},
+		{Name: "rollback", Title: "Rollback", Description: "Roll back app", Content: "1. revert"},
+	}
+
+	b.SeedDefaultSkills(specs)
+	b.SeedDefaultSkills(specs)
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	seeded := userSkills(b.skills)
+	if len(seeded) != 2 {
+		t.Fatalf("expected 2 seeded skills after idempotent reseed, got %d: %+v", len(seeded), seeded)
+	}
+	names := map[string]int{}
+	for _, sk := range seeded {
+		names[sk.Name]++
+	}
+	if names["deploy"] != 1 || names["rollback"] != 1 {
+		t.Errorf("expected one of each, got %+v", names)
+	}
+}
+
+// TestFindSkillByWorkflowKey_PrefersNonArchived guards a subtle precedence
+// rule: archived skills are invisible to lookup. A new active skill that
+// reuses an archived skill's workflow_key should be returned by
+// findSkillByWorkflowKeyLocked rather than the archived original.
+func TestFindSkillByWorkflowKey_PrefersNonArchived(t *testing.T) {
+	b := newTestBroker(t)
+	b.mu.Lock()
+	b.skills = append(b.skills,
+		teamSkill{ID: "old", Name: "old-deploy", WorkflowKey: "deploy", Status: "archived"},
+		teamSkill{ID: "new", Name: "new-deploy", WorkflowKey: "deploy", Status: "active"},
+	)
+	got := b.findSkillByWorkflowKeyLocked("deploy")
+	b.mu.Unlock()
+
+	if got == nil {
+		t.Fatal("expected to find non-archived skill")
+	}
+	if got.ID != "new" {
+		t.Errorf("expected non-archived skill, got %+v", got)
+	}
+}
+
+func TestInvokeSkillTracksInvokerChannelAndExecutionMetadata(t *testing.T) {
+	b := newTestBroker(t)
+	b.mu.Lock()
+	b.skills = append(b.skills, teamSkill{
+		ID:        "skill-youtube-factory-bootstrap",
+		Name:      "youtube-factory-bootstrap",
+		Title:     "Bootstrap Automated YouTube Factory",
+		Status:    "active",
+		Channel:   "team",
+		CreatedBy: "cos",
+	})
+	b.channels = append(b.channels, teamChannel{
+		Slug:    "youtube-factory",
+		Name:    "YouTube Factory",
+		Members: []string{"cos", "ops"},
+	})
+	b.mu.Unlock()
+
+	body := bytes.NewBufferString(`{"name":"youtube-factory-bootstrap","invoked_by":"you","channel":"youtube-factory"}`)
+	req := httptest.NewRequest(http.MethodPost, "/skills/youtube-factory-bootstrap/invoke", body)
+	rec := httptest.NewRecorder()
+
+	b.handleInvokeSkill(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	invoked := userSkills(b.skills)
+	if len(invoked) == 0 {
+		t.Fatalf("no user skill present: %+v", b.skills)
+	}
+	if invoked[0].UsageCount != 1 {
+		t.Fatalf("expected usage count 1, got %d", invoked[0].UsageCount)
+	}
+	if invoked[0].LastExecutionStatus != "invoked" {
+		t.Fatalf("expected last execution status invoked, got %q", invoked[0].LastExecutionStatus)
+	}
+	if invoked[0].LastExecutionAt == "" {
+		t.Fatal("expected last execution timestamp to be set")
+	}
+	last := b.messages[len(b.messages)-1]
+	if last.Channel != "youtube-factory" {
+		t.Fatalf("expected invocation message in youtube-factory, got %q", last.Channel)
+	}
+	if last.From != "you" {
+		t.Fatalf("expected invocation from you, got %q", last.From)
+	}
+	if !strings.Contains(last.Content, "@you") {
+		t.Fatalf("expected invocation content to reference @you, got %q", last.Content)
+	}
+}
+
+func TestInvokeSkillCreatesSkillRunTask(t *testing.T) {
+	b := newTestBroker(t)
+	b.mu.Lock()
+	b.members = []officeMember{{Slug: "cos", Name: "CEO", Role: "lead"}}
+	b.skills = append(b.skills, teamSkill{
+		ID:      "skill-deploy",
+		Name:    "deploy",
+		Title:   "Deploy to Production",
+		Status:  "active",
+		Channel: "team",
+		Content: "Step 1: Run tests. Step 2: Push tag.",
+	})
+	b.mu.Unlock()
+
+	body := bytes.NewBufferString(`{"invoked_by":"eng","channel":"team"}`)
+	req := httptest.NewRequest(http.MethodPost, "/skills/deploy/invoke", body)
+	rec := httptest.NewRecorder()
+
+	b.handleInvokeSkill(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	// Response must include task_id.
+	var out map[string]any
+	if err := json.NewDecoder(rec.Body).Decode(&out); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	taskID, ok := out["task_id"].(string)
+	if !ok || taskID == "" {
+		t.Fatalf("expected task_id in response, got %v", out["task_id"])
+	}
+
+	// A task with TaskType=skill_run must exist in b.tasks.
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	var found *teamTask
+	for i := range b.tasks {
+		if b.tasks[i].ID == taskID {
+			found = &b.tasks[i]
+			break
+		}
+	}
+	if found == nil {
+		t.Fatalf("task %q not found in b.tasks", taskID)
+	}
+	if found.TaskType != "skill_run" {
+		t.Errorf("expected TaskType=skill_run, got %q", found.TaskType)
+	}
+	if found.PipelineID != "skill_invocation" {
+		t.Errorf("expected PipelineID=skill_invocation, got %q", found.PipelineID)
+	}
+	if found.Owner != "cos" {
+		t.Errorf("expected owner=cos (office lead), got %q", found.Owner)
+	}
+	if !strings.Contains(found.Title, "Deploy to Production") {
+		t.Errorf("expected task title to contain skill title, got %q", found.Title)
+	}
+	if !strings.Contains(found.Details, "Invoked by @eng") {
+		t.Errorf("expected details to include invoker header, got %q", found.Details)
+	}
+	if !strings.Contains(found.Details, "Step 1: Run tests") {
+		t.Errorf("expected details to include skill content, got %q", found.Details)
+	}
+}
+
+// Test 10: buildPrompt for the lead includes SKILL & BOT AWARENESS section.
+func TestBuildPromptLeadIncludesSkillAwareness(t *testing.T) {
+	l := &Launcher{
+		pack: &bot.PackDefinition{
+			LeadSlug: "cos",
+			Bots: []bot.BotConfig{
+				{Slug: "cos", Name: "CEO"},
+				{Slug: "fe", Name: "Frontend Engineer"},
+			},
+		},
+	}
+	prompt := l.buildPrompt("cos")
+	if !strings.Contains(prompt, "SKILL & BOT AWARENESS") {
+		t.Fatalf("expected SKILL & BOT AWARENESS block in lead prompt")
+	}
+	if strings.Contains(prompt, "team_skill_create") {
+		t.Fatalf("lead prompt must not mention team_skill_create — the tool was removed (skills come only from playbook compilation)")
+	}
+	if !strings.Contains(prompt, "compiled automatically from playbook articles") {
+		t.Fatalf("expected playbook-compilation guidance in lead prompt")
+	}
+}
+
+// Test 10: a created skill persists and reloads correctly (no interview).
+func TestSkillCreatePersistenceRoundTrip(t *testing.T) {
+	b := newTestBroker(t)
+	b.mu.Lock()
+	b.members = []officeMember{{Slug: "cos", Name: "CEO", Role: "lead"}}
+	for i := range b.channels {
+		if b.channels[i].Slug == "team" {
+			b.channels[i].Members = append(b.channels[i].Members, "cos")
+		}
+	}
+	b.mu.Unlock()
+	body := bytes.NewBufferString(`{
+		"name":"persist-skill",
+		"title":"Persist Skill",
+		"description":"Persisted skill",
+		"content":"1. Do the thing",
+		"created_by":"cos",
+		"channel":"team"
+	}`)
+	req := httptest.NewRequest(http.MethodPost, "/skills", body)
+	rec := httptest.NewRecorder()
+	b.handlePostSkill(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("handlePostSkill: expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	reloaded := reloadedBroker(t, b)
+	reloaded.mu.Lock()
+	skills := userSkills(reloaded.skills)
+	requests := append([]humanInterview(nil), reloaded.requests...)
+	reloaded.mu.Unlock()
+
+	if len(skills) != 1 || skills[0].Name != "persist-skill" {
+		t.Fatalf("expected persisted skill 'persist-skill', got %d skills", len(skills))
+	}
+	if skills[0].Status != "active" {
+		t.Fatalf("expected active status, got %q", skills[0].Status)
+	}
+	// No approval interview rides along anymore (core-loop R5).
+	if len(requests) != 0 {
+		t.Fatalf("expected no persisted requests, got %d", len(requests))
+	}
+}
+
+// brokerWithWiki wires a temp git-backed wiki worker onto a fresh broker so
+// tests that exercise the wiki write path can read SKILL.md back from disk.
+// Returns the broker plus a cleanup that stops the worker.
+func brokerWithWiki(t *testing.T) (*Broker, func()) {
+	t.Helper()
+	root := filepath.Join(t.TempDir(), "wiki")
+	backup := filepath.Join(t.TempDir(), "wiki.bak")
+	repo := NewRepoAt(root, backup)
+	if err := repo.Init(context.Background()); err != nil {
+		t.Fatalf("init repo: %v", err)
+	}
+	b := newTestBroker(t)
+	worker := NewWikiWorker(repo, b)
+	ctx, cancel := context.WithCancel(context.Background())
+	worker.Start(ctx)
+	b.mu.Lock()
+	b.wikiWorker = worker
+	b.mu.Unlock()
+	return b, func() {
+		cancel()
+		worker.Stop()
+	}
+}
+
+// skillFilePath asserts that the on-disk SKILL.md for slug exists and
+// returns its absolute path. WikiWorker.Enqueue is synchronous (blocks on
+// its reply channel until the commit lands), so handlePostSkill / the
+// backfill helpers return only after the file is on disk — no polling
+// required.
+func skillFilePath(t *testing.T, b *Broker, slug string) string {
+	t.Helper()
+	root := b.wikiWorker.Repo().Root()
+	path := filepath.Join(root, "team", "skills", slug+".md")
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("SKILL.md missing on disk: %v (path=%s)", err, path)
+	}
+	return path
+}
+
+// TestHandlePostSkill_WritesWikiFile is the regression guard for the
+// "team/skills/<slug>.md: no such file or directory" bug. handlePostSkill
+// previously updated broker state without enqueuing the SKILL.md write, so
+// the wiki UI hit a raw filesystem error on first open.
+func TestHandlePostSkill_WritesWikiFile(t *testing.T) {
+	b, cleanup := brokerWithWiki(t)
+	defer cleanup()
+
+	body := bytes.NewBufferString(`{
+		"action":"create",
+		"name":"flake-quarantine",
+		"title":"Flake Quarantine",
+		"description":"Move repeatedly-flaking E2E tests to a quarantine lane.",
+		"content":"# Flake Quarantine\n\nQuarantine flakes that fail >3 times in 24h.",
+		"created_by":"cos",
+		"channel":"team",
+		"tags":["qa","ci"]
+	}`)
+	req := httptest.NewRequest(http.MethodPost, "/skills", body)
+	rec := httptest.NewRecorder()
+	b.handlePostSkill(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("handlePostSkill: expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	path := skillFilePath(t, b, "flake-quarantine")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read SKILL.md: %v", err)
+	}
+	fm, parsedBody, err := ParseSkillMarkdown(raw)
+	if err != nil {
+		t.Fatalf("parse SKILL.md: %v", err)
+	}
+	if fm.Name != "flake-quarantine" {
+		t.Errorf("frontmatter name: got %q, want flake-quarantine", fm.Name)
+	}
+	if !strings.Contains(parsedBody, "Quarantine flakes that fail") {
+		t.Errorf("body missing skill content, got %q", parsedBody)
+	}
+}
+
+// TestHandlePostSkill_RejectsProposeAction pins the fail-closed guard: the
+// proposal flow was removed (core-loop R5), and a stale caller sending
+// action=propose must get 410 Gone — NOT a silently-activated skill.
+func TestHandlePostSkill_RejectsProposeAction(t *testing.T) {
+	b := newTestBroker(t)
+	body := bytes.NewBufferString(`{
+		"action":"propose",
+		"name":"stale-proposal",
+		"title":"Stale Proposal",
+		"description":"Sent by a stale caller.",
+		"content":"1. Do the thing",
+		"created_by":"cos",
+		"channel":"team"
+	}`)
+	req := httptest.NewRequest(http.MethodPost, "/skills", body)
+	rec := httptest.NewRecorder()
+	b.handlePostSkill(rec, req)
+	if rec.Code != http.StatusGone {
+		t.Fatalf("expected 410 Gone for action=propose, got %d: %s", rec.Code, rec.Body.String())
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if created := userSkills(b.skills); len(created) != 0 {
+		t.Fatalf("expected no skill created, got %+v", created)
+	}
+}
+
+// TestHandlePostSkill_RequiresDescription locks in the 400 returned when
+// description is absent. The field is required by RenderSkillMarkdown, so
+// omitting it would silently skip the SKILL.md write and leave the wiki 404.
+func TestHandlePostSkill_RequiresDescription(t *testing.T) {
+	b := newTestBroker(t)
+	body := bytes.NewBufferString(`{
+		"action":"create",
+		"name":"no-desc-skill",
+		"title":"No Description",
+		"content":"step 1.",
+		"created_by":"cos"
+	}`)
+	req := httptest.NewRequest(http.MethodPost, "/skills", body)
+	rec := httptest.NewRecorder()
+	b.handlePostSkill(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 when description is missing, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestBackfillSkillFilesFromState_WritesMissingFiles covers the boot path
+// for skills that already live in broker-state.json but have no SKILL.md
+// (e.g. created before the create-time wiki write was wired up). Without
+// the backfill these zombies stay invisible to /wiki/article forever.
+func TestBackfillSkillFilesFromState_WritesMissingFiles(t *testing.T) {
+	b, cleanup := brokerWithWiki(t)
+	defer cleanup()
+
+	now := time.Now().UTC().Format(time.RFC3339)
+	b.mu.Lock()
+	b.skills = append(b.skills, teamSkill{
+		ID:          "skill-flake-quarantine",
+		Name:        "flake-quarantine",
+		Title:       "Flake Quarantine",
+		Description: "Move flakes to a quarantine lane.",
+		Content:     "# Flake Quarantine\n\nQuarantine flakes.",
+		CreatedBy:   "cos",
+		Channel:     "team",
+		Status:      "active",
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	})
+	// Archived skills must NOT be backfilled — leave the tombstone alone.
+	b.skills = append(b.skills, teamSkill{
+		ID:          "skill-archived-old",
+		Name:        "archived-old",
+		Title:       "Archived",
+		Description: "Already retired.",
+		Content:     "old body",
+		CreatedBy:   "cos",
+		Channel:     "team",
+		Status:      "archived",
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	})
+	b.mu.Unlock()
+
+	root := b.wikiWorker.Repo().Root()
+	activePath := filepath.Join(root, "team", "skills", "flake-quarantine.md")
+	archivedPath := filepath.Join(root, "team", "skills", "archived-old.md")
+	if _, err := os.Stat(activePath); !os.IsNotExist(err) {
+		t.Fatalf("precondition: SKILL.md should be missing, got %v", err)
+	}
+
+	// backfillSkillFilesFromState calls WikiWorker.Enqueue synchronously per
+	// missing skill, so by the time it returns every backfilled SKILL.md is
+	// on disk. No polling needed.
+	b.backfillSkillFilesFromState(context.Background())
+
+	if _, err := os.Stat(activePath); err != nil {
+		t.Fatalf("backfill did not create active SKILL.md: %v", err)
+	}
+	if _, err := os.Stat(archivedPath); !os.IsNotExist(err) {
+		t.Errorf("backfill should not resurrect archived skills, but %s exists", archivedPath)
+	}
+}
+
+// TestBackfillSkillFilesFromState_PreservesExistingFile covers the no-op
+// path: when a SKILL.md already exists on disk, backfill must leave the
+// file (and its commit history) untouched.
+func TestBackfillSkillFilesFromState_PreservesExistingFile(t *testing.T) {
+	b, cleanup := brokerWithWiki(t)
+	defer cleanup()
+
+	body := bytes.NewBufferString(`{
+		"action":"create",
+		"name":"already-on-disk",
+		"title":"Already On Disk",
+		"description":"Skill that already has SKILL.md.",
+		"content":"# Already On Disk\n\nbody.",
+		"created_by":"cos",
+		"channel":"team"
+	}`)
+	req := httptest.NewRequest(http.MethodPost, "/skills", body)
+	rec := httptest.NewRecorder()
+	b.handlePostSkill(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("handlePostSkill: expected 200, got %d", rec.Code)
+	}
+	path := skillFilePath(t, b, "already-on-disk")
+	originalRaw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read before backfill: %v", err)
+	}
+
+	b.backfillSkillFilesFromState(context.Background())
+
+	rawAfter, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read after backfill: %v", err)
+	}
+	// Byte-for-byte equality, not just size: a same-length rewrite
+	// (different commit metadata or whitespace) would slip a size-only
+	// check and still indicate the no-op contract is broken.
+	if !bytes.Equal(rawAfter, originalRaw) {
+		t.Errorf("backfill rewrote an existing file: %d bytes -> %d bytes, content differs",
+			len(originalRaw), len(rawAfter))
+	}
+}

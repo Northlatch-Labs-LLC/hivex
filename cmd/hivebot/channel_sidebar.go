@@ -1,0 +1,308 @@
+package main
+
+import (
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
+
+	"github.com/Northlatch-Labs-LLC/hivex/cmd/hivebot/channelui"
+)
+
+// renderSidebar renders the Slack-style sidebar with channels and team members.
+func renderSidebar(channels []channelui.ChannelInfo, members []channelui.Member, tasks []channelui.Task, activeChannel string, activeApp channelui.OfficeApp, cursor int, rosterOffset int, focused bool, quickJump quickJumpTarget, workspace channelui.WorkspaceUIState, width, height int, checklist ...onboardingChecklist) string {
+	if width < 2 {
+		return ""
+	}
+
+	bg := lipgloss.Color(channelui.SidebarBG)
+	innerW := width - 2 // 1 char padding each side
+
+	sectionBandStyle := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("#D4D4D8")).
+		Background(lipgloss.Color("#20242A")).
+		Bold(true).
+		Padding(0, 1)
+	workspaceStyle := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("#FFFFFF")).
+		Bold(true)
+	workspaceMetaStyle := lipgloss.NewStyle().
+		Foreground(lipgloss.Color(channelui.SidebarMuted))
+	workspaceSummaryStyle := workspaceMetaStyle
+	workspaceHintStyle := workspaceMetaStyle
+	activeRowStyle := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("#FFFFFF")).
+		Background(lipgloss.Color(channelui.SidebarActive)).
+		Bold(true).
+		Padding(0, 1)
+	cursorRowStyle := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("#E5E7EB")).
+		Background(lipgloss.Color("#253041")).
+		Padding(0, 1)
+	channelRowStyle := lipgloss.NewStyle().
+		Foreground(lipgloss.Color(channelui.SidebarMuted)).
+		Padding(0, 1)
+	memberMetaStyle := lipgloss.NewStyle().
+		Foreground(lipgloss.Color(channelui.SidebarMuted))
+
+	switch {
+	case !workspace.BrokerConnected:
+		workspaceSummaryStyle = workspaceSummaryStyle.Foreground(lipgloss.Color("#F59E0B"))
+		workspaceHintStyle = workspaceHintStyle.Foreground(lipgloss.Color("#FBBF24"))
+	case workspace.BlockingCount > 0:
+		workspaceSummaryStyle = workspaceSummaryStyle.Foreground(lipgloss.Color("#FBBF24"))
+		workspaceHintStyle = workspaceHintStyle.Foreground(lipgloss.Color("#FCD34D")).Bold(true)
+	case strings.TrimSpace(workspace.AwaySummary) != "":
+		workspaceSummaryStyle = workspaceSummaryStyle.Foreground(lipgloss.Color("#93C5FD"))
+		workspaceHintStyle = workspaceHintStyle.Foreground(lipgloss.Color("#BFDBFE"))
+	default:
+		workspaceHintStyle = workspaceHintStyle.Foreground(lipgloss.Color("#D1FAE5"))
+	}
+
+	summaryLine := channelui.TruncateLabel(workspace.SidebarSummaryLine(activeApp), channelui.MaxInt(8, innerW-1))
+	hintLine := channelui.TruncateLabel(workspace.SidebarHintLine(), channelui.MaxInt(8, innerW-1))
+
+	var lines []string
+	lines = append(lines, "")
+	lines = append(lines, channelui.SidebarPlainRow(workspaceStyle.Render("hivebot"), width))
+	lines = append(lines, channelui.SidebarPlainRow(workspaceMetaStyle.Render("hivebot"), width))
+	lines = append(lines, channelui.SidebarPlainRow(workspaceSummaryStyle.Render(summaryLine), width))
+	lines = append(lines, channelui.SidebarPlainRow(workspaceMetaStyle.Render("Ctrl+G channels · Ctrl+O apps · d DM bot"), width))
+	lines = append(lines, channelui.SidebarPlainRow(workspaceHintStyle.Render(hintLine), width))
+	lines = append(lines, "")
+	channelHeaderText := "Channels"
+	if quickJump == quickJumpChannels {
+		channelHeaderText = "Channels · 1-9"
+	}
+	lines = append(lines, channelui.SidebarStyledRow(sectionBandStyle, channelHeaderText, width))
+	if len(channels) == 0 {
+		channels = []channelui.ChannelInfo{{Slug: "general", Name: "general"}}
+	}
+	sidebarIndex := 0
+	for _, ch := range channels {
+		label := "# " + ch.Slug
+		shortcut := channelui.SidebarShortcutLabel(sidebarIndex)
+		if shortcut != "" {
+			label = shortcut + "  " + label
+		}
+		switch {
+		case ch.Slug == activeChannel:
+			lines = append(lines, channelui.SidebarStyledRow(activeRowStyle, label, width))
+		case focused && cursor == sidebarIndex:
+			lines = append(lines, channelui.SidebarStyledRow(cursorRowStyle, label, width))
+		default:
+			lines = append(lines, channelui.SidebarStyledRow(channelRowStyle, label, width))
+		}
+		sidebarIndex++
+	}
+
+	lines = append(lines, "")
+	appHeaderText := "Apps"
+	if quickJump == quickJumpApps {
+		appHeaderText = "Apps · 1-9"
+	}
+	lines = append(lines, channelui.SidebarStyledRow(sectionBandStyle, appHeaderText, width))
+	apps := channelui.OfficeSidebarApps()
+	const minRosterReserve = 3
+	maxAppRows := height - len(lines) - minRosterReserve
+	if maxAppRows < 1 {
+		maxAppRows = 1
+	}
+	for _, app := range channelui.VisibleSidebarApps(apps, activeApp, maxAppRows) {
+		label := channelui.AppIcon(app.App) + " " + app.Label
+		appIndex := 0
+		for idx, candidate := range apps {
+			if candidate.App == app.App {
+				appIndex = idx
+				break
+			}
+		}
+		shortcut := channelui.SidebarShortcutLabel(appIndex)
+		if shortcut != "" {
+			label = shortcut + "  " + label
+		}
+		switch {
+		case activeApp == app.App:
+			lines = append(lines, channelui.SidebarStyledRow(activeRowStyle, label, width))
+		case focused && cursor == sidebarIndex:
+			lines = append(lines, channelui.SidebarStyledRow(cursorRowStyle, label, width))
+		default:
+			lines = append(lines, channelui.SidebarStyledRow(channelRowStyle, label, width))
+		}
+		sidebarIndex++
+	}
+
+	dividerStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(channelui.SidebarDivider))
+	divider := dividerStyle.Render(strings.Repeat("\u2500", innerW))
+	lines = append(lines, channelui.SidebarPlainRow(divider, width))
+
+	// Insert onboarding checklist section above the bots list, if provided and active.
+	if len(checklist) > 0 {
+		if cl := checklist[0]; !cl.Dismissed {
+			clSection := renderOnboardingChecklist(cl, width)
+			if clSection != "" {
+				lines = append(lines, strings.Split(clSection, "\n")...)
+			}
+		}
+	}
+
+	usedLines := len(lines)
+	availableLines := height - usedLines - 1
+	if availableLines < 0 {
+		availableLines = 0
+	}
+	compact := availableLines < 14
+	maxMembers := availableLines / 4
+	if compact {
+		maxMembers = availableLines // 1 line per member in compact mode
+	}
+	if maxMembers < 1 {
+		maxMembers = 1
+	}
+
+	fallbackRoster := len(members) == 0
+	if fallbackRoster {
+		members = channelui.DefaultSidebarRoster()
+	}
+
+	totalMembers := len(members)
+	start := rosterOffset
+	if start < 0 {
+		start = 0
+	}
+	if totalMembers <= maxMembers {
+		start = 0
+	}
+	maxStart := totalMembers - maxMembers
+	if maxStart < 0 {
+		maxStart = 0
+	}
+	if start > maxStart {
+		start = maxStart
+	}
+	end := start + maxMembers
+	if end > totalMembers {
+		end = totalMembers
+	}
+	peopleHeader := "Agents"
+	if fallbackRoster {
+		peopleHeader = "Bots · office roster"
+	} else if totalMembers > 0 && end > start {
+		peopleHeader = fmt.Sprintf("Bots · %d-%d/%d", start+1, end, totalMembers)
+	}
+	lines = append(lines, channelui.SidebarStyledRow(sectionBandStyle, peopleHeader, width))
+
+	now := time.Now()
+	for i := start; i < end; i++ {
+		m := members[i]
+		summary := channelui.DeriveMemberRuntimeSummary(m, tasks, now)
+		act := summary.Activity
+		character := channelui.RenderOfficeCharacter(m, act, now)
+		if summary.Bubble != "" {
+			character.Bubble = summary.Bubble
+		}
+
+		dotStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(act.Color))
+		dot := dotStyle.Render(act.Dot)
+
+		nameColor := channelui.BotColor(m.Slug)
+		name := m.Name
+		if name == "" {
+			name = channelui.DisplayName(m.Slug)
+		}
+		sidebarLabel := act.Label
+		nameMax := innerW - 8 - ansi.StringWidth(sidebarLabel)
+		if nameMax < 8 {
+			nameMax = 8
+		}
+		name = channelui.TruncateLabel(name, nameMax)
+		nameStyle := lipgloss.NewStyle().
+			Foreground(lipgloss.Color(nameColor)).
+			Bold(true)
+		nameRendered := nameStyle.Render(name)
+		accent := lipgloss.NewStyle().Foreground(lipgloss.Color(nameColor)).Render("▎")
+		leftPart := accent + " " + dot + " " + nameRendered
+		if compact {
+			// Compact: single line per member with a simple glyph.
+			meta := memberMetaStyle.Render(sidebarLabel)
+			mini := lipgloss.NewStyle().Foreground(lipgloss.Color(nameColor)).Render(channelui.BotAvatar(m.Slug))
+			line := leftPart + " " + mini
+			pad := innerW - ansi.StringWidth(line) - ansi.StringWidth(sidebarLabel)
+			if pad < 1 {
+				pad = 1
+			}
+			lines = append(lines, channelui.SidebarPlainRow(line+strings.Repeat(" ", pad)+meta, width))
+		} else {
+			// Full mode: two dense rows per member, using the second row for real detail.
+			const avatarW = 4
+			avatarTop := ""
+			avatarBottom := ""
+			if len(character.Avatar) > 0 {
+				avatarTop = character.Avatar[0]
+			}
+			if len(character.Avatar) > 1 {
+				avatarBottom = character.Avatar[1]
+			}
+			if ansi.StringWidth(avatarTop) < avatarW {
+				avatarTop += strings.Repeat(" ", avatarW-ansi.StringWidth(avatarTop))
+			}
+			if ansi.StringWidth(avatarBottom) < avatarW {
+				avatarBottom += strings.Repeat(" ", avatarW-ansi.StringWidth(avatarBottom))
+			}
+
+			linePrefix := avatarTop + " " + leftPart
+			pad := innerW - ansi.StringWidth(linePrefix) - ansi.StringWidth(sidebarLabel)
+			if pad < 1 {
+				pad = 1
+			}
+			lines = append(lines, channelui.SidebarPlainRow(linePrefix+strings.Repeat(" ", pad)+memberMetaStyle.Render(sidebarLabel), width))
+			detail := strings.TrimSpace(summary.Detail)
+			if detail == "" {
+				detail = "No updates yet."
+			}
+			detail = channelui.TruncateLabel(detail, channelui.MaxInt(12, innerW-avatarW-2))
+			secondLine := avatarBottom
+			if secondLine == "" {
+				secondLine = strings.Repeat(" ", avatarW)
+			}
+			secondLine = secondLine + " " + memberMetaStyle.Render(detail)
+			lines = append(lines, channelui.SidebarPlainRow(secondLine, width))
+			if character.Bubble != "" {
+				for _, bubbleLine := range channelui.RenderThoughtBubble(character.Bubble, innerW-2) {
+					lines = append(lines, channelui.SidebarPlainRow(bubbleLine, width))
+				}
+			}
+		}
+	}
+
+	if totalMembers > maxMembers {
+		hint := memberMetaStyle.Render("PgUp/PgDn scroll bots")
+		lines = append(lines, channelui.SidebarPlainRow(hint, width))
+	}
+
+	// Pad remaining height with empty lines.
+	for len(lines) < height {
+		lines = append(lines, "")
+	}
+
+	// Truncate if somehow over height.
+	if len(lines) > height {
+		lines = lines[:height]
+	}
+
+	// Apply sidebar background to each line, padded to full width.
+	panel := lipgloss.NewStyle().Background(bg)
+
+	var rendered []string
+	for _, l := range lines {
+		visibleWidth := ansi.StringWidth(l)
+		if visibleWidth < width {
+			l += strings.Repeat(" ", width-visibleWidth)
+		}
+		rendered = append(rendered, panel.Render(l))
+	}
+
+	return strings.Join(rendered, "\n")
+}

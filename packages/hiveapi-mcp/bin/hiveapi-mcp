@@ -1,0 +1,8 @@
+#!/usr/bin/env bun
+/**
+ * hiveapi-mcp — MCP server for the HiveAPI Gateway (stdio transport).
+ * Configuration via HIVEAPI_* environment variables (see README.md).
+ */
+import { main } from "../src/main.ts";
+
+await main();

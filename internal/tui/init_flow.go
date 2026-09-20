@@ -1,0 +1,785 @@
+package tui
+
+import (
+	"context"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
+
+	"github.com/Northlatch-Labs-LLC/hivex/internal/bot"
+	"github.com/Northlatch-Labs-LLC/hivex/internal/config"
+	"github.com/Northlatch-Labs-LLC/hivex/internal/gbrain"
+	"github.com/Northlatch-Labs-LLC/hivex/internal/operations"
+	"github.com/Northlatch-Labs-LLC/hivex/internal/runtimebin"
+)
+
+var initFlowLookPathFn = runtimebin.LookPath
+
+type initReadinessCheck struct {
+	Label  string
+	Status string
+	Detail string
+}
+
+// InitPhase represents a step in the onboarding flow.
+type InitPhase string
+
+const (
+	InitIdle             InitPhase = "idle"
+	InitProviderChoice   InitPhase = "provider_choice" // kept for backward compat, skipped in flow
+	InitOneAPIKey        InitPhase = "one_api_key"     // kept for backward compat, skipped in flow
+	InitMemoryChoice     InitPhase = "memory_choice"
+	InitGBrainOpenAIKey  InitPhase = "gbrain_openai_key"
+	InitGBrainAnthropKey InitPhase = "gbrain_anthropic_key"
+	InitBlueprintChoice  InitPhase = "blueprint_choice"
+	InitPackChoice       InitPhase = "pack_choice" // legacy alias
+	InitCompanyURL       InitPhase = "company_url"
+	InitCompanyFiles     InitPhase = "company_files"
+	InitOwnerName        InitPhase = "owner_name"
+	InitOwnerRole        InitPhase = "owner_role"
+	InitCompanyScan      InitPhase = "company_scan"
+	InitCompanyDone      InitPhase = "company_done"
+	InitDone             InitPhase = "done"
+)
+
+// companyScanDoneMsg is emitted when the company context scan completes.
+type companyScanDoneMsg struct{ result *operations.CompanySeedResult }
+
+// companyScanErrMsg is emitted when the company context scan fails.
+type companyScanErrMsg struct{ err error }
+
+// InitFlowModel is the state machine for the /init onboarding flow.
+type InitFlowModel struct {
+	phase     InitPhase
+	provider  string
+	memory    string
+	blueprint string
+
+	companyURL   string
+	companyFiles string // comma-separated file paths
+	ownerName    string
+	ownerRole    string
+	scanResult   *operations.CompanySeedResult
+	scanErr      error
+	scanRunning  bool
+
+	// Text input buffer for key / email entry
+	keyInput []rune
+	keyError string
+}
+
+// NewInitFlow creates an idle InitFlowModel.
+func NewInitFlow() InitFlowModel {
+	return InitFlowModel{phase: InitIdle}
+}
+
+// Phase returns the current phase.
+func (f InitFlowModel) Phase() InitPhase {
+	return f.phase
+}
+
+// IsActive returns true if the flow is in progress (not idle and not done).
+func (f InitFlowModel) IsActive() bool {
+	return f.phase != InitIdle && f.phase != InitDone
+}
+
+// Start begins the init flow.
+// Order: provider choice → memory choice → blueprint choice → done.
+// Memory comes before blueprint because it's a higher-level architectural
+// decision (where org knowledge lives) that the blueprint will then act on top of.
+func (f InitFlowModel) Start() (InitFlowModel, tea.Cmd) {
+	f.provider = config.ResolveLLMProvider("")
+	f.memory = config.ResolveMemoryBackend("")
+	if cfg, err := config.Load(); err == nil {
+		f.blueprint = cfg.ActiveBlueprint()
+	}
+	f.phase = InitProviderChoice
+	return f, f.emitPhase(InitProviderChoice)
+}
+
+// Update advances the flow based on incoming messages.
+func (f InitFlowModel) Update(msg tea.Msg) (InitFlowModel, tea.Cmd) {
+	switch m := msg.(type) {
+	case InitFlowMsg:
+		f.phase = InitPhase(m.Phase)
+		if v, ok := m.Data["provider"]; ok {
+			f.provider = v
+		}
+		if v, ok := m.Data["memory"]; ok {
+			f.memory = v
+		}
+		if v, ok := m.Data["blueprint"]; ok {
+			f.blueprint = v
+		}
+		if v, ok := m.Data["pack"]; ok && strings.TrimSpace(f.blueprint) == "" {
+			f.blueprint = v
+		}
+
+	case PickerSelectMsg:
+		switch f.phase {
+		case InitProviderChoice:
+			f.provider = m.Value
+			f.phase = InitMemoryChoice
+			return f, f.emitPhase(InitMemoryChoice)
+		case InitMemoryChoice:
+			f.memory = m.Value
+			return f.advanceAfterMemoryChoice()
+		case InitBlueprintChoice, InitPackChoice:
+			f.blueprint = m.Value
+			f.phase = InitCompanyURL
+			return f, f.emitPhase(InitCompanyURL)
+		}
+
+	case companyScanDoneMsg:
+		if f.phase == InitCompanyScan {
+			f.scanRunning = false
+			f.scanResult = m.result
+			f.phase = InitCompanyDone
+			return f, f.emitPhase(InitCompanyDone)
+		}
+		return f, nil // late message after skip — ignore
+
+	case companyScanErrMsg:
+		if f.phase == InitCompanyScan {
+			f.scanRunning = false
+			f.scanErr = m.err
+			cfg, _ := config.Load()
+			cfg.PendingCompanySeed = true
+			_ = config.Save(cfg)
+			return f.finish()
+		}
+		return f, nil // late message after skip — ignore
+
+	case tea.KeyMsg:
+		if f.phase == InitCompanyScan && (m.String() == "s" || m.String() == "S") {
+			cfg, _ := config.Load()
+			cfg.PendingCompanySeed = true
+			_ = config.Save(cfg)
+			return f.finish()
+		}
+		if f.phase == InitCompanyDone {
+			if m.Type == tea.KeyEnter || m.String() == " " {
+				return f.finish()
+			}
+			return f, nil
+		}
+		if f.requiresTextInput() {
+			return f.updateTextInput(m)
+		}
+	}
+	return f, nil
+}
+
+// advanceAfterMemoryChoice transitions to the right key/registration phase
+// based on which memory backend the user chose, or straight to blueprint
+// if no additional setup is needed.
+func (f InitFlowModel) advanceAfterMemoryChoice() (InitFlowModel, tea.Cmd) {
+	switch f.memory {
+	case config.MemoryBackendGBrain:
+		// GBrain needs a semantic embedder. OpenAI is the strongest (one key
+		// serves chat + embeddings), but a local Ollama embedding model works
+		// with no cloud key at all. Only prompt for an OpenAI key when neither
+		// is available — and even then keyword-only is possible.
+		if config.ResolveOpenAIAPIKey() != "" || gbrain.OllamaEmbeddingModel() != "" {
+			ensureGBrainBrain()
+			f.phase = InitBlueprintChoice
+			return f, f.emitPhase(InitBlueprintChoice)
+		}
+		f.phase = InitGBrainOpenAIKey
+		return f, f.emitPhase(InitGBrainOpenAIKey)
+	default:
+		f.phase = InitBlueprintChoice
+		return f, f.emitPhase(InitBlueprintChoice)
+	}
+}
+
+func (f InitFlowModel) requiresTextInput() bool {
+	switch f.phase {
+	case InitGBrainOpenAIKey, InitGBrainAnthropKey,
+		InitCompanyURL, InitCompanyFiles, InitOwnerName, InitOwnerRole:
+		return true
+	}
+	return false
+}
+
+// updateTextInput handles keystrokes during any text-entry phase
+// (GBrain OpenAI/Anthropic keys, company URL/files, owner name/role).
+func (f InitFlowModel) updateTextInput(msg tea.KeyMsg) (InitFlowModel, tea.Cmd) {
+	switch msg.String() {
+	case "enter":
+		value := strings.TrimSpace(string(f.keyInput))
+		return f.submitTextInput(value)
+	case "backspace":
+		if len(f.keyInput) > 0 {
+			f.keyInput = f.keyInput[:len(f.keyInput)-1]
+			f.keyError = ""
+		}
+		return f, nil
+	case "esc":
+		f.phase = InitIdle
+		f.keyInput = nil
+		f.keyError = ""
+		return f, nil
+	default:
+		runes := []rune(msg.String())
+		if len(runes) == 1 && runes[0] >= 32 {
+			f.keyInput = append(f.keyInput, runes[0])
+			f.keyError = ""
+		}
+		return f, nil
+	}
+}
+
+func (f InitFlowModel) submitTextInput(value string) (InitFlowModel, tea.Cmd) {
+	switch f.phase {
+	case InitGBrainOpenAIKey:
+		// An OpenAI key is the path to cloud embeddings, but it is optional:
+		// pressing Enter proceeds on a local Ollama embedder if present, or
+		// keyword-only search otherwise. GBrain stays usable with no cloud key.
+		if value != "" {
+			// Persist immediately so gbrain can use it.
+			cfg, _ := config.Load()
+			cfg.OpenAIAPIKey = value
+			_ = config.Save(cfg)
+		}
+		// Initialize the brain now with the best available embedder (the OpenAI
+		// key just entered, else a local Ollama model, else keyword-only).
+		ensureGBrainBrain()
+		f.keyError = ""
+		f.keyInput = nil
+		// Optional: ask for Anthropic key too (chat provider, not embeddings).
+		if config.ResolveAnthropicAPIKey() == "" {
+			f.phase = InitGBrainAnthropKey
+			return f, f.emitPhase(InitGBrainAnthropKey)
+		}
+		f.phase = InitBlueprintChoice
+		return f, f.emitPhase(InitBlueprintChoice)
+
+	case InitGBrainAnthropKey:
+		// Anthropic key is optional; empty means skip.
+		if value != "" {
+			cfg, _ := config.Load()
+			cfg.AnthropicAPIKey = value
+			_ = config.Save(cfg)
+		}
+		f.keyError = ""
+		f.keyInput = nil
+		f.phase = InitBlueprintChoice
+		return f, f.emitPhase(InitBlueprintChoice)
+
+	case InitCompanyURL:
+		f.companyURL = value
+		f.keyInput = nil
+		f.keyError = ""
+		f.phase = InitCompanyFiles
+		return f, f.emitPhase(InitCompanyFiles)
+
+	case InitCompanyFiles:
+		f.companyFiles = value
+		f.keyInput = nil
+		f.keyError = ""
+		f.phase = InitOwnerName
+		return f, f.emitPhase(InitOwnerName)
+
+	case InitOwnerName:
+		f.ownerName = value
+		f.keyInput = nil
+		f.keyError = ""
+		f.phase = InitOwnerRole
+		return f, f.emitPhase(InitOwnerRole)
+
+	case InitOwnerRole:
+		f.ownerRole = value
+		f.keyInput = nil
+		f.keyError = ""
+		f.phase = InitCompanyScan
+		f.scanRunning = true
+		wikiRoot := filepath.Join(config.RuntimeHomeDir(), ".hivex", "wiki")
+		return f, tea.Batch(
+			f.emitPhase(InitCompanyScan),
+			runCompanyScan(
+				operations.CompanySeedInput{
+					WebsiteURL: f.companyURL,
+					FilePaths:  splitFilePaths(f.companyFiles),
+					OwnerName:  f.ownerName,
+					OwnerRole:  f.ownerRole,
+					Completer:  cliCompleter{},
+					WikiRoot:   wikiRoot,
+				},
+				saveCompanyProfile,
+			),
+		)
+	}
+	return f, nil
+}
+
+// ensureGBrainBrain initializes a gbrain brain with the best available embedder
+// during explicit /init setup. It is best-effort and never blocks onboarding:
+// when gbrain is not installed it is a no-op, and gbrain.EnsureBrain is strictly
+// idempotent, so a brain that already exists is left untouched. Errors are
+// surfaced later by the readiness/doctor reports rather than failing setup.
+func ensureGBrainBrain() {
+	if !gbrain.IsInstalled() {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	_, _ = gbrain.EnsureBrain(ctx)
+}
+
+// finish saves config and transitions to done.
+func (f InitFlowModel) finish() (InitFlowModel, tea.Cmd) {
+	cfg, _ := config.Load()
+	cfg.LLMProvider = f.provider
+	if normalized := config.NormalizeMemoryBackend(f.memory); normalized != "" {
+		cfg.MemoryBackend = normalized
+	}
+	if strings.TrimSpace(f.blueprint) != "" {
+		cfg.SetActiveBlueprint(f.blueprint)
+	}
+	if w := strings.TrimSpace(f.companyURL); w != "" {
+		cfg.CompanyWebsite = w
+	}
+	if paths := splitFilePaths(f.companyFiles); len(paths) > 0 {
+		cfg.CompanyFilePaths = paths
+	}
+	if n := strings.TrimSpace(f.ownerName); n != "" {
+		cfg.OwnerName = n
+	}
+	if r := strings.TrimSpace(f.ownerRole); r != "" {
+		cfg.OwnerRole = r
+	}
+
+	_ = config.Save(cfg)
+
+	f.phase = InitDone
+	return f, f.emitPhase(InitDone)
+}
+
+// emitPhase returns a tea.Cmd that emits an InitFlowMsg for the given phase.
+func (f InitFlowModel) emitPhase(phase InitPhase) tea.Cmd {
+	data := map[string]string{
+		"provider":  f.provider,
+		"memory":    f.memory,
+		"blueprint": f.blueprint,
+		"pack":      f.blueprint,
+	}
+	return func() tea.Msg {
+		return InitFlowMsg{Phase: string(phase), Data: data}
+	}
+}
+
+// ProviderOptions returns the picker options for LLM provider selection.
+func ProviderOptions() []PickerOption {
+	claudeDesc := "Claude via claude CLI (recommended)"
+	if _, err := initFlowLookPathFn("claude"); err != nil {
+		claudeDesc = "Claude via claude CLI (not found in PATH!)"
+	}
+	codexDesc := "Codex via codex CLI"
+	if _, err := initFlowLookPathFn("codex"); err != nil {
+		codexDesc = "Codex via codex CLI (not found in PATH!)"
+	}
+	opencodeDesc := "Opencode via opencode CLI (BYO provider: Claude, OpenAI, local/Ollama)"
+	if _, err := initFlowLookPathFn("opencode"); err != nil {
+		opencodeDesc = "Opencode via opencode CLI (not found in PATH!)"
+	}
+	options := []PickerOption{
+		{Label: "Claude Code (default)", Value: "claude-code", Description: claudeDesc},
+		{Label: "Codex CLI", Value: "codex", Description: codexDesc},
+		{Label: "Opencode CLI", Value: "opencode", Description: opencodeDesc},
+	}
+	return options
+}
+
+// MemoryOptions returns the picker options for organizational memory backend
+// selection. Order matches the recommended default-first, then opt-out.
+func MemoryOptions() []PickerOption {
+	return []PickerOption{
+		{
+			Label:       "GBrain (recommended)",
+			Value:       config.MemoryBackendGBrain,
+			Description: "Local-first knowledge graph CLI. Good when you want everything on your machine.",
+		},
+		{
+			Label:       "No shared memory",
+			Value:       config.MemoryBackendNone,
+			Description: "Skip the memory layer. Bots only know what's in the current conversation.",
+		},
+	}
+}
+
+// BlueprintOptions returns the picker options for operation blueprint selection.
+func BlueprintOptions() []PickerOption {
+	if repoRoot := resolveInitRepoRoot(); repoRoot != "" {
+		if blueprints, err := operations.ListBlueprints(repoRoot); err == nil && len(blueprints) > 0 {
+			options := make([]PickerOption, len(blueprints))
+			for i, bp := range blueprints {
+				label := bp.Name
+				if i == 0 {
+					label += " (default)"
+				}
+				desc := strings.TrimSpace(bp.Description)
+				if desc == "" {
+					desc = strings.TrimSpace(bp.Objective)
+				}
+				options[i] = PickerOption{
+					Label:       label,
+					Value:       bp.ID,
+					Description: desc,
+				}
+			}
+			return options
+		}
+	}
+	return legacyPackOptions()
+}
+
+// PackOptions is a legacy alias retained for compatibility with older callers.
+func PackOptions() []PickerOption { return BlueprintOptions() }
+
+func legacyPackOptions() []PickerOption {
+	packs := bot.ListLegacyPacks()
+	options := make([]PickerOption, len(packs))
+	for i, p := range packs {
+		label := p.Name
+		if i == 0 {
+			label += " (default)"
+		}
+		options[i] = PickerOption{
+			Label:       label,
+			Value:       p.Slug,
+			Description: p.Description,
+		}
+	}
+	return options
+}
+
+// View renders the current phase and instructions.
+func (f InitFlowModel) View() string {
+	heading, instructions := f.phaseText()
+	labelStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(BrandPurple))
+	muteStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(MutedColor))
+
+	view := labelStyle.Render(heading) + "\n" + muteStyle.Render(instructions)
+
+	if readiness := f.renderReadinessSummary(); readiness != "" {
+		view += "\n\n" + readiness
+	}
+
+	if f.requiresTextInput() {
+		view += "\n\n" + f.renderAPIKeyInput()
+	}
+
+	return view
+}
+
+// renderAPIKeyInput renders the text input for the current text-entry phase.
+func (f InitFlowModel) renderAPIKeyInput() string {
+	input := string(f.keyInput)
+	cursorStyle := lipgloss.NewStyle().Reverse(true)
+
+	var label string
+	switch f.phase {
+	case InitGBrainOpenAIKey:
+		label = "OpenAI Key (Enter to skip): "
+	case InitGBrainAnthropKey:
+		label = "Anthropic Key (Enter to skip): "
+	case InitCompanyURL:
+		label = "URL (Enter to skip): "
+	case InitCompanyFiles:
+		label = "Files (Enter to skip): "
+	case InitOwnerName:
+		label = "Name: "
+	case InitOwnerRole:
+		label = "Role: "
+	default:
+		label = "API Key: "
+	}
+	prompt := lipgloss.NewStyle().Foreground(lipgloss.Color(BrandBlue)).Bold(true).Render(label)
+
+	display := prompt + input + cursorStyle.Render(" ")
+
+	if f.keyError != "" {
+		errStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(Error))
+		display += "\n" + errStyle.Render(f.keyError)
+	}
+
+	return display
+}
+
+func (f InitFlowModel) renderReadinessSummary() string {
+	checks := f.readinessChecks()
+	if len(checks) == 0 {
+		return ""
+	}
+
+	titleStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(BrandBlue))
+	mutedStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(MutedColor))
+
+	lines := []string{
+		titleStyle.Render("Setup Readiness"),
+		mutedStyle.Render("Use /doctor for the full capability report."),
+	}
+	for _, check := range checks {
+		lines = append(lines, f.renderReadinessCheck(check))
+	}
+	return strings.Join(lines, "\n")
+}
+
+func (f InitFlowModel) renderReadinessCheck(check initReadinessCheck) string {
+	statusStyle := lipgloss.NewStyle().
+		Bold(true).
+		Foreground(lipgloss.Color("#E5E7EB")).
+		Background(lipgloss.Color(readinessStatusColor(check.Status))).
+		Padding(0, 1)
+	labelStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(ValueColor))
+	detailStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(MutedColor))
+
+	return statusStyle.Render(strings.ToUpper(check.Status)) + " " +
+		labelStyle.Render(check.Label) + " " +
+		detailStyle.Render(check.Detail)
+}
+
+func readinessStatusColor(status string) string {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "ready":
+		return "#166534"
+	case "next":
+		return "#1D4ED8"
+	default:
+		return "#991B1B"
+	}
+}
+
+func (f InitFlowModel) readinessChecks() []initReadinessCheck {
+	provider := strings.TrimSpace(f.provider)
+	if provider == "" {
+		provider = "claude-code"
+	}
+	memory := strings.TrimSpace(f.memory)
+	if memory == "" {
+		memory = config.ResolveMemoryBackend("")
+	}
+
+	checks := []initReadinessCheck{
+		{
+			Label:  "tmux office runtime",
+			Status: readinessStatusForBool(binaryAvailable("tmux")),
+			Detail: binaryReadinessDetail("tmux", "hivebot can open the team panes.", "Install tmux before launching the team."),
+		},
+		{
+			Label:  "LLM runtime",
+			Status: providerRuntimeStatus(provider),
+			Detail: providerRuntimeDetail(provider),
+		},
+		{
+			Label:  "Memory backend",
+			Status: memoryReadinessStatus(memory),
+			Detail: memoryReadinessDetail(memory),
+		},
+		{
+			Label:  "Operation template",
+			Status: blueprintReadinessStatus(f.blueprint),
+			Detail: blueprintReadinessDetail(f.blueprint),
+		},
+		{
+			Label:  "Integrations",
+			Status: "ready",
+			Detail: config.OneSetupSummary(),
+		},
+	}
+
+	// Provider API key readiness
+	providerKeys := []struct {
+		label   string
+		resolve func() string
+	}{
+		{"Gemini API key", config.ResolveGeminiAPIKey},
+		{"Anthropic API key", config.ResolveAnthropicAPIKey},
+		{"OpenAI API key", config.ResolveOpenAIAPIKey},
+		{"Minimax API key", config.ResolveMinimaxAPIKey},
+	}
+	for _, pk := range providerKeys {
+		set := pk.resolve() != ""
+		detail := "Not configured. Set via /config set or env var."
+		if set {
+			detail = "Configured."
+		}
+		checks = append(checks, initReadinessCheck{
+			Label:  pk.label,
+			Status: readinessStatusForOptional(set),
+			Detail: detail,
+		})
+	}
+
+	return checks
+}
+
+func readinessStatusForBool(ok bool) string {
+	if ok {
+		return "ready"
+	}
+	return "missing"
+}
+
+func readinessStatusForOptional(set bool) string {
+	if set {
+		return "ready"
+	}
+	return "next"
+}
+
+func blueprintReadinessStatus(blueprint string) string {
+	if strings.TrimSpace(blueprint) == "" {
+		return "next"
+	}
+	return "ready"
+}
+
+func blueprintReadinessDetail(blueprint string) string {
+	if name := blueprintDisplayName(strings.TrimSpace(blueprint)); name != "" {
+		if strings.TrimSpace(blueprint) != "" {
+			return "Selected " + name + "."
+		}
+	}
+	return "Choose which operation template or blueprint should open after setup."
+}
+
+func memoryReadinessStatus(backend string) string {
+	switch config.NormalizeMemoryBackend(backend) {
+	case config.MemoryBackendGBrain, config.MemoryBackendMarkdown:
+		return "ready"
+	case config.MemoryBackendNone:
+		return "next"
+	default:
+		return "next"
+	}
+}
+
+func memoryReadinessDetail(backend string) string {
+	switch config.NormalizeMemoryBackend(backend) {
+	case config.MemoryBackendMarkdown:
+		return "Git-native markdown wiki on your machine."
+	case config.MemoryBackendGBrain:
+		return "Local knowledge graph via GBrain CLI."
+	case config.MemoryBackendNone:
+		return "No shared memory. Bots only know what's in the current conversation."
+	default:
+		return "Pick a memory backend so the team can remember what it learns."
+	}
+}
+
+func providerRuntimeStatus(provider string) string {
+	switch strings.TrimSpace(provider) {
+	case "", "claude-code":
+		return readinessStatusForBool(binaryAvailable("claude"))
+	case "codex":
+		return readinessStatusForBool(binaryAvailable("codex"))
+	case "opencode":
+		return readinessStatusForBool(binaryAvailable("opencode"))
+	default:
+		return "ready"
+	}
+}
+
+func providerRuntimeDetail(provider string) string {
+	switch strings.TrimSpace(provider) {
+	case "", "claude-code":
+		return binaryReadinessDetail("claude", "Claude CLI is ready for teammate sessions.", "Install claude or pick another provider.")
+	case "codex":
+		return binaryReadinessDetail("codex", "Codex CLI is ready for teammate sessions.", "Install codex or pick another provider.")
+	case "opencode":
+		return binaryReadinessDetail("opencode", "Opencode CLI is ready for teammate sessions.", "Install opencode or pick another provider.")
+	case "gemini":
+		return "Gemini uses an API key. No local CLI is required."
+	default:
+		return provider + " is selected."
+	}
+}
+
+func binaryReadinessDetail(name, readyDetail, missingDetail string) string {
+	if binaryAvailable(name) {
+		return readyDetail
+	}
+	return missingDetail
+}
+
+func binaryAvailable(name string) bool {
+	_, err := initFlowLookPathFn(name)
+	return err == nil
+}
+
+func (f InitFlowModel) phaseText() (heading, instructions string) {
+	switch f.phase {
+	case InitIdle:
+		return "Setup", "Run /init to begin."
+	case InitProviderChoice:
+		return "Choose LLM Provider", "Select your preferred AI provider for teammate sessions."
+	case InitMemoryChoice:
+		return "Choose Memory Backend", "Where should the team remember what it learns? GBrain is a local knowledge graph, or skip for no shared memory."
+	case InitGBrainOpenAIKey:
+		return "Enter OpenAI API Key (optional)", "GBrain uses OpenAI for cloud embeddings. Paste your OpenAI API key (starts with sk-), or press Enter to use a local Ollama embedding model if present, or keyword-only search."
+	case InitGBrainAnthropKey:
+		return "Enter Anthropic API Key (optional)", "GBrain can optionally use Anthropic for reasoning. Press Enter to skip, or paste your key."
+	case InitBlueprintChoice, InitPackChoice:
+		return "Choose Operation Template", "Select the blueprint or template that will seed your startup."
+	case InitCompanyURL:
+		return "Company Website URL?", "Company website URL? (optional, press Enter to skip)"
+	case InitCompanyFiles:
+		return "Context Documents?", "Context documents? (comma-separated paths, Enter to skip)"
+	case InitOwnerName:
+		return "Your Name?", "Your name?"
+	case InitOwnerRole:
+		return "Your Role?", "Your role? (e.g. founder, CTO)"
+	case InitCompanyScan:
+		return "Scanning Company Context", "Scanning company context... (press s to skip to background)"
+	case InitCompanyDone:
+		return "Company Context Ready", "Company context written to wiki. Press Enter to continue."
+	case InitDone:
+		blueprintName := blueprintDisplayName(f.blueprint)
+		memoryName := config.MemoryBackendLabel(f.memory)
+		return "Setup Complete", "Provider: " + f.provider + " | Memory: " + memoryName + " | Blueprint: " + blueprintName + ". " + config.OneSetupBlurb()
+	default:
+		return "Setup", "Run /init to begin."
+	}
+}
+
+func blueprintDisplayName(id string) string {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return ""
+	}
+	if repoRoot := resolveInitRepoRoot(); repoRoot != "" {
+		if blueprint, err := operations.LoadBlueprint(repoRoot, id); err == nil {
+			if name := strings.TrimSpace(blueprint.Name); name != "" {
+				return name
+			}
+		}
+	}
+	return id
+}
+
+func resolveInitRepoRoot() string {
+	current, err := os.Getwd()
+	if err != nil {
+		return ""
+	}
+	current = filepath.Clean(current)
+	for {
+		if _, err := os.Stat(filepath.Join(current, "go.mod")); err == nil {
+			return current
+		}
+		if _, err := os.Stat(filepath.Join(current, "templates")); err == nil {
+			return current
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return ""
+		}
+		current = parent
+	}
+}

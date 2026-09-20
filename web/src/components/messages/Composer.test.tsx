@@ -1,0 +1,156 @@
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+import type { Message } from "../../api/client";
+import * as Toast from "../ui/Toast";
+import { __test__ } from "./Composer";
+
+const {
+  historyKey,
+  readHistory,
+  pushHistory,
+  resolveLeadSlug,
+  unknownSlashCommandMessage,
+  handleSlashCommand,
+  askPrefix,
+  latestMessageIdFromQueryData,
+  emptyMessagesQueryData,
+  COMPOSER_HISTORY_LIMIT,
+} = __test__;
+
+beforeEach(() => {
+  sessionStorage.clear();
+  vi.restoreAllMocks();
+});
+
+describe("per-channel composer history", () => {
+  it("stores one message and recalls it", () => {
+    pushHistory("general", "hello world");
+    expect(readHistory("general")).toEqual(["hello world"]);
+  });
+
+  it("keeps channels isolated", () => {
+    pushHistory("general", "in-general");
+    pushHistory("eng", "in-eng");
+    expect(readHistory("general")).toEqual(["in-general"]);
+    expect(readHistory("eng")).toEqual(["in-eng"]);
+  });
+
+  it("caps history at COMPOSER_HISTORY_LIMIT entries", () => {
+    for (let i = 0; i < COMPOSER_HISTORY_LIMIT + 5; i++) {
+      pushHistory("general", `m${i}`);
+    }
+    const hist = readHistory("general");
+    expect(hist.length).toBe(COMPOSER_HISTORY_LIMIT);
+    // Should be the TAIL of the input, so most recent is last.
+    expect(hist[hist.length - 1]).toBe(`m${COMPOSER_HISTORY_LIMIT + 4}`);
+  });
+
+  it("skips consecutive duplicates", () => {
+    pushHistory("general", "hi");
+    pushHistory("general", "hi");
+    pushHistory("general", "hi");
+    expect(readHistory("general")).toEqual(["hi"]);
+  });
+
+  it("ignores empty pushes", () => {
+    pushHistory("general", "   ");
+    pushHistory("general", "");
+    expect(readHistory("general")).toEqual([]);
+  });
+
+  it("uses a stable key shape", () => {
+    expect(historyKey("eng")).toBe("hivex:composer-history:eng");
+    // No "general" default any more. historyKey's only caller is
+    // ChannelComposer, whose channel is non-empty by construction, and
+    // bucketing a channel-less history under #general mixed unrelated drafts
+    // into the retired room's key. Real channels keep the same key shape, so
+    // no existing history is orphaned.
+    expect(historyKey("")).toBe("hivex:composer-history:");
+  });
+
+  it("handles corrupt JSON gracefully", () => {
+    sessionStorage.setItem(historyKey("general"), "{not-json");
+    expect(readHistory("general")).toEqual([]);
+  });
+});
+
+describe("team-lead resolution for /ask", () => {
+  it("prefers the configured slug", () => {
+    expect(resolveLeadSlug("coo", [])).toBe("coo");
+  });
+
+  it("falls back to the first built-in bot", () => {
+    expect(
+      resolveLeadSlug("", [
+        { slug: "pm", built_in: false },
+        { slug: "cos", built_in: true },
+      ]),
+    ).toBe("cos");
+  });
+
+  it('falls back to "cos" when nothing is known', () => {
+    expect(resolveLeadSlug(undefined, [])).toBe("cos");
+  });
+
+  it("lowercases configured slugs", () => {
+    expect(resolveLeadSlug("COS", [])).toBe("cos");
+  });
+});
+
+describe("askPrefix", () => {
+  it("emits @slug with a trailing space", () => {
+    expect(askPrefix("cos")).toBe("@cos ");
+  });
+
+  it("defaults to @cos", () => {
+    expect(askPrefix(undefined)).toBe("@cos ");
+    expect(askPrefix("")).toBe("@cos ");
+  });
+});
+
+describe("/clear query helpers", () => {
+  it("uses the newest cached message id as the clear marker", () => {
+    const messages = [{ id: "msg-1" }, { id: "msg-2" }] as Message[];
+
+    expect(latestMessageIdFromQueryData({ messages })).toBe("msg-2");
+  });
+
+  it("empties cached messages without dropping other query fields", () => {
+    const data = {
+      messages: [{ id: "msg-1" }] as Message[],
+      extra: "kept",
+    };
+
+    expect(emptyMessagesQueryData(data)).toEqual({
+      messages: [],
+      extra: "kept",
+    });
+  });
+});
+
+describe("unknown slash commands", () => {
+  it("names the command and points to help", () => {
+    expect(unknownSlashCommandMessage("/object list")).toBe(
+      "Unknown command: /object. Try /help.",
+    );
+  });
+
+  it("are consumed instead of sent as chat messages", () => {
+    const sendAsMessage = vi.fn();
+    const showNotice = vi.spyOn(Toast, "showNotice").mockReturnValue();
+
+    const consumed = handleSlashCommand("/object list", {
+      leadSlug: "cos",
+      clearMessages: vi.fn(),
+      sendAsMessage,
+      channel: "general",
+    });
+
+    expect(consumed).toBe(true);
+    expect(sendAsMessage).not.toHaveBeenCalled();
+    expect(showNotice).toHaveBeenCalledWith(
+      "Unknown command: /object. Try /help.",
+      "info",
+    );
+  });
+});

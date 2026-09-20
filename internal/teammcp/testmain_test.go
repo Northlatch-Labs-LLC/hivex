@@ -1,0 +1,40 @@
+package teammcp
+
+import (
+	"os"
+	"path/filepath"
+	"testing"
+
+	"github.com/Northlatch-Labs-LLC/hivex/internal/team"
+)
+
+// TestMain mirrors internal/team/worktree_guard_test.go's flag flip for
+// tests that live outside the team package but exercise the
+// local_worktree dispatch path (handleTeamTask etc). Without this, real
+// `git worktree add` calls land on the developer's hivex repo and
+// register transient branches like `hivex-<hash>-task-1` on the invoking
+// worktree — observed locally during pre-push as dozens of leaked refs
+// and an interleaved HEAD ref-lock failure on `git push`.
+func TestMain(m *testing.M) {
+	team.DisableRealTaskWorktreeForTests()
+	os.Exit(m.Run())
+}
+
+// newTestBroker mirrors internal/team's unexported newTestBroker(t):
+// returns a Broker whose state path is pinned under t.TempDir(), so each
+// test gets its own bound statePath rather than sharing the package-var
+// default resolution. Use this for any teammcp test that constructs a
+// broker; reach for team.NewBrokerAt directly only when the test also
+// needs the path string itself.
+func newTestBroker(t *testing.T) *team.Broker {
+	t.Helper()
+	// Tests in this package exercise CEO-scope tool paths with my_slug
+	// "cos"; since the R6 hardening, claiming a privileged slug requires
+	// the trusted env identity to match — launch the fixtures AS the CEO.
+	t.Setenv("HIVEX_AGENT_SLUG", "cos")
+	b := team.NewBrokerAt(filepath.Join(t.TempDir(), "broker-state.json"))
+	// These tests post into a room; #general is no longer seeded by the
+	// product, so the fixture supplies it. See SeedLegacyRoomForTest.
+	team.SeedLegacyRoomForTest(b)
+	return b
+}

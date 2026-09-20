@@ -1,0 +1,9 @@
+{
+  "memory_backend": "markdown",
+  "llm_provider": "claude-code",
+  "llm_provider_priority": [
+    "claude-code"
+  ],
+  "analytics_telemetry_enabled": true,
+  "analytics_session_recording_enabled": true
+}

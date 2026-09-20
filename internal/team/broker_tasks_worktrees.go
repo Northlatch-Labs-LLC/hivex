@@ -1,0 +1,449 @@
+package team
+
+import (
+	"fmt"
+	"log"
+	"strings"
+)
+
+func taskNeedsLocalWorktree(task *teamTask) bool {
+	if task == nil {
+		return false
+	}
+	if !strings.EqualFold(strings.TrimSpace(task.ExecutionMode), "local_worktree") {
+		return false
+	}
+	if strings.TrimSpace(task.Owner) == "" {
+		return false
+	}
+	switch strings.TrimSpace(task.status) {
+	case "", "open":
+		return false
+	case "done":
+		return strings.TrimSpace(task.WorktreePath) != "" || strings.TrimSpace(task.WorktreeBranch) != ""
+	default:
+		return true
+	}
+}
+
+func taskBlockReasonLooksLikeWorkspaceWriteIssue(reason string) bool {
+	reason = strings.ToLower(strings.TrimSpace(reason))
+	if reason == "" {
+		return false
+	}
+	markers := []string{
+		"read-only",
+		"read only",
+		"writable workspace",
+		"write access",
+		"filesystem sandbox",
+		"workspace sandbox",
+		"operation not permitted",
+		"permission denied",
+	}
+	for _, marker := range markers {
+		if strings.Contains(reason, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func rejectFalseLocalWorktreeBlock(task *teamTask, reason string) error {
+	if task == nil {
+		return nil
+	}
+	if !strings.EqualFold(strings.TrimSpace(task.ExecutionMode), "local_worktree") {
+		return nil
+	}
+	if !taskBlockReasonLooksLikeWorkspaceWriteIssue(reason) {
+		return nil
+	}
+	worktreePath := strings.TrimSpace(task.WorktreePath)
+	if worktreePath == "" {
+		return nil
+	}
+	if err := verifyTaskWorktreeWritable(worktreePath); err == nil {
+		return fmt.Errorf("assigned local worktree is writable at %s; do not request writable-workspace approval; continue implementation in that worktree", worktreePath)
+	}
+	return nil
+}
+
+// taskRequiresExclusiveOwnerTurn used to force a task to be the owner's only
+// active task of its kind — admission control queued a second such task behind
+// the first by injecting a synthetic dependency. That synthetic serialization
+// is gone: the product rule is that ONLY a real, declared dependency
+// (`depends_on`, gated by hasUnresolvedDepsLocked) holds a task back. Anything
+// non-dependent runs concurrently.
+//
+// Safety is now enforced at the right layers, not by withholding the task:
+//   - worktree tasks: the headless scheduler keys dispatch lanes by worktree
+//     path (see laneForTurn), so two worktree turns run in parallel only when
+//     their worktrees differ and serialize the moment they share a tree.
+//   - office / live_external: no shared worktree; concurrent turns are the same
+//     concurrency the system already runs across different bots (broker
+//     mediates shared state). If two external actions must be ordered, the
+//     caller declares a dependency.
+//
+// Always false now — kept (with its callers) as the single switch so the
+// admission lane can be re-armed for a specific mode later without re-threading
+// every call site.
+func taskRequiresExclusiveOwnerTurn(task *teamTask) bool {
+	return false
+}
+
+func taskStatusConsumesExclusiveOwnerTurn(status string) bool {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "in_progress", "review":
+		return true
+	default:
+		return false
+	}
+}
+
+func (b *Broker) syncTaskWorktreeLocked(task *teamTask) error {
+	if task == nil {
+		return nil
+	}
+	// Automatically assign local_worktree mode when a coding bot claims a task.
+	if task.ExecutionMode == "" && codingBotSlugs[strings.TrimSpace(task.Owner)] {
+		switch strings.TrimSpace(task.status) {
+		case "", "open", "done":
+			// not yet in-progress; leave mode unset
+		default:
+			task.ExecutionMode = "local_worktree"
+		}
+	}
+	if taskNeedsLocalWorktree(task) {
+		if strings.TrimSpace(task.WorktreePath) != "" || strings.TrimSpace(task.WorktreeBranch) != "" {
+			if taskWorktreeSourceLooksUsable(task.WorktreePath) {
+				return nil
+			}
+			if err := cleanupTaskWorktree(task.WorktreePath, task.WorktreeBranch); err != nil {
+				return err
+			}
+			task.WorktreePath = ""
+			task.WorktreeBranch = ""
+		}
+		if path, branch := b.reusableDependencyWorktreeLocked(task); path != "" && branch != "" {
+			task.WorktreePath = path
+			task.WorktreeBranch = branch
+			return nil
+		}
+		path, branch, err := prepareTaskWorktree(task.ID)
+		if err != nil {
+			return err
+		}
+		task.WorktreePath = path
+		task.WorktreeBranch = branch
+		return nil
+	}
+
+	if strings.TrimSpace(task.WorktreePath) == "" && strings.TrimSpace(task.WorktreeBranch) == "" {
+		return nil
+	}
+	if err := cleanupTaskWorktree(task.WorktreePath, task.WorktreeBranch); err != nil {
+		return err
+	}
+	task.WorktreePath = ""
+	task.WorktreeBranch = ""
+	return nil
+}
+
+func (b *Broker) reusableDependencyWorktreeLocked(task *teamTask) (string, string) {
+	if b == nil || task == nil || len(task.DependsOn) == 0 {
+		return "", ""
+	}
+	owner := strings.TrimSpace(task.Owner)
+	var fallbackPath string
+	var fallbackBranch string
+	for _, depID := range task.DependsOn {
+		depID = strings.TrimSpace(depID)
+		if depID == "" {
+			continue
+		}
+		for i := range b.tasks {
+			dep := &b.tasks[i]
+			if strings.TrimSpace(dep.ID) != depID {
+				continue
+			}
+			if !strings.EqualFold(strings.TrimSpace(dep.ExecutionMode), "local_worktree") {
+				continue
+			}
+			path := strings.TrimSpace(dep.WorktreePath)
+			branch := strings.TrimSpace(dep.WorktreeBranch)
+			if path == "" || branch == "" {
+				continue
+			}
+			status := strings.ToLower(strings.TrimSpace(dep.status))
+			review := strings.ToLower(strings.TrimSpace(dep.reviewState))
+			if status != "review" && status != "done" && review != "ready_for_review" && review != "approved" {
+				continue
+			}
+			if owner != "" && strings.TrimSpace(dep.Owner) == owner {
+				return path, branch
+			}
+			if fallbackPath == "" && fallbackBranch == "" {
+				fallbackPath = path
+				fallbackBranch = branch
+			}
+		}
+	}
+	return fallbackPath, fallbackBranch
+}
+
+func (b *Broker) activeExclusiveOwnerTaskLocked(owner, excludeTaskID string) *teamTask {
+	owner = strings.TrimSpace(owner)
+	excludeTaskID = strings.TrimSpace(excludeTaskID)
+	if b == nil || owner == "" {
+		return nil
+	}
+	for i := range b.tasks {
+		task := &b.tasks[i]
+		if excludeTaskID != "" && strings.TrimSpace(task.ID) == excludeTaskID {
+			continue
+		}
+		if !strings.EqualFold(strings.TrimSpace(task.Owner), owner) {
+			continue
+		}
+		if !taskRequiresExclusiveOwnerTurn(task) {
+			continue
+		}
+		if !taskStatusConsumesExclusiveOwnerTurn(task.status) {
+			continue
+		}
+		return task
+	}
+	return nil
+}
+
+func (b *Broker) queueTaskBehindActiveOwnerLaneLocked(task *teamTask) {
+	if b == nil || task == nil {
+		return
+	}
+	if !taskRequiresExclusiveOwnerTurn(task) {
+		return
+	}
+	if !taskStatusConsumesExclusiveOwnerTurn(task.status) {
+		return
+	}
+	active := b.activeExclusiveOwnerTaskLocked(task.Owner, task.ID)
+	if active == nil {
+		return
+	}
+	if !stringSliceContainsFold(task.DependsOn, active.ID) {
+		task.DependsOn = append(task.DependsOn, active.ID)
+	}
+	b.markTaskQueuedBehindActiveOwnerLocked(task)
+	queueNote := fmt.Sprintf("Queued behind %s so @%s only carries one active %s lane at a time.", active.ID, strings.TrimSpace(task.Owner), strings.TrimSpace(task.ExecutionMode))
+	switch existing := strings.TrimSpace(task.Details); {
+	case existing == "":
+		task.Details = queueNote
+	case !strings.Contains(existing, queueNote):
+		task.Details = existing + "\n\n" + queueNote
+	}
+}
+
+// preferredTaskChannelLocked resolves the channel slug for a task.
+//
+// An explicit non-empty request wins and is returned normalised. Otherwise the
+// task's home is, in order:
+//
+//  1. the OWNER's home channel,
+//  2. the CREATOR's home channel,
+//  3. EMPTY.
+//
+// Empty is a legal outcome, not a failure. An unowned intake task genuinely
+// has no conversation home yet, and the Tasks surface renders a task without
+// one. Callers MUST therefore treat "" as "no channel" and skip their
+// findChannelLocked / canAccessChannelLocked checks — passing "" to
+// findChannelLocked would normalise it straight back to "general"
+// (normalizeChannelSlug's lobby fallback) and silently re-create exactly the
+// leak this change exists to close.
+//
+// Both steps go through homeChannelForLocked, which is the seam: while
+// #general is enabled it answers "general" for ANY actor, including an empty
+// one, so today's behaviour is unchanged. Once general is switched off the
+// same two calls resolve to real 1:1 DMs and the chain falls through to empty.
+//
+// Landing this BEFORE the flip is the whole point. Every task conversation
+// currently lives in #general — shouldMintPerTaskChannel returns false
+// unconditionally, so nothing mints a per-task room — and without this
+// resolver they would all orphan the moment the switch goes off.
+//
+// The old behaviour of scanning recent execution channels and routing
+// business-objective tasks there was removed earlier; this function is the
+// single place that decides a task's home.
+func (b *Broker) preferredTaskChannelLocked(requestedChannel, createdBy, owner, _, _ string) string {
+	// TrimSpace, not normalizeChannelSlug, for the emptiness test:
+	// normalizeChannelSlug("") returns "general", so normalising first would
+	// make the no-channel case indistinguishable from an explicit #general.
+	if raw := strings.TrimSpace(requestedChannel); raw != "" {
+		return b.reHomeTaskOutOfHumanDMLocked(normalizeChannelSlug(raw), owner)
+	}
+	// The owner's DM, but only if the CREATOR may post in it. A DM has exactly
+	// two participants, so a task one bot opens for another would otherwise
+	// resolve to a private conversation the creator cannot write to, and the
+	// caller's own access check would then reject the whole plan with 403. The
+	// human passes every check, so a human-planned task still lands on its
+	// owner.
+	if slug, err := b.homeChannelForLocked(owner); err == nil && slug != "" &&
+		b.canAccessChannelLocked(createdBy, slug) {
+		return slug
+	}
+	// The creator cannot post in the owner's DM: an agent opening a task for
+	// another agent. The old fallback was the CREATOR's own DM, which parked
+	// the owner's entire working thread inside the human's private
+	// conversation with the creator (observed: the Chief of Staff's task for
+	// the Designer living in #cos__human). The creator⇄owner pair DM is the
+	// right room — both can post, and the consult markers keep it observable.
+	if pair := b.botPairDMForLocked(createdBy, owner); pair != "" {
+		return pair
+	}
+	if slug, err := b.homeChannelForLocked(createdBy); err == nil && slug != "" {
+		return slug
+	}
+	return ""
+}
+
+// shouldMintPerTaskChannel reports whether a newly created task
+// warrants a dedicated task-<id> channel.
+//
+// The product vision is "every task spins up its own channel". Two
+// internal-plumbing cases are checked FIRST and always withhold a channel,
+// even for a sub-issue — they genuinely belong in #general:
+//  1. system tasks (System==true is the Backup & Migration entry, which
+//     always owns "general").
+//  2. incident self-heals (PipelineID=="incident") — internal tooling, not
+//     user work.
+//
+// A sub-issue (ParentIssueID!="") that clears those two guards mints its OWN
+// task-<childID> channel, separate from the parent. The channel handed to a
+// sub-issue create is the creating bot's current conversation — almost
+// always the parent task's channel — so we mint regardless of whether it
+// resolved to "general". Without this, every child posts its working chatter
+// into the parent's chat and the two tasks share one timeline. A sub-issue
+// gets its own chat, just like a top-level task; it stays tied to the parent
+// via ParentIssueID, which the Issue board nests under the parent card.
+//
+// A top-level task that clears those guards mints when the resolved channel
+// is "general" OR is another task's per-task channel
+// (incomingChannelOwnedByAnotherTask). The creating bot's conversation is
+// usually inside some existing task's chat, so a new top-level Issue created
+// from there arrives carrying that task's channel; without this it would
+// silently share the other task's timeline (every new Issue piling into the
+// same chat). We leave the task in the requested channel only when it is an
+// explicit, non-per-task shared channel the caller deliberately targeted (a
+// project or bridged channel).
+//
+// Note: this used to additionally require taskLooksLikeLiveBusinessObjective
+// (a keyword heuristic). That under-delivered the vision — a real task whose
+// title lacked execution keywords ("Draft Q3 outbound sequence") stayed in
+// #general — so the heuristic was dropped (2026-06-03). The function is still
+// used elsewhere (notifications / pipeline), just not as a channel gate.
+// shouldMintPerTaskChannel reports whether a task gets its own chat channel.
+//
+// It always returns false: the office is one room. Tasks are created from
+// #general and every conversation about them stays in #general, where the whole
+// roster is present. Per-task channels fragmented that — a task channel is
+// seeded with the owner (plus Librarian), so @-mentioning any other teammate in
+// it addressed someone who was not in the room. Observed 2026-08-22: a human
+// asked "@designer do you like this?" inside task-dunde-2, whose only member was
+// app-builder; Designer answered 31s later somewhere else while App Builder
+// relayed the question in prose. The human saw a relay instead of an answer.
+//
+// Tasks themselves are unchanged: they still exist with title, description,
+// owner, and status, and the Tasks surface still lists and manages them. Only
+// the dedicated per-task room is gone.
+//
+// Kept as a function (rather than deleting the four call sites) so the decision
+// stays in one place and the callers keep their "no channel minted -> the task
+// stays in the channel it was created from" fallback, which is exactly the
+// wanted behaviour.
+func shouldMintPerTaskChannel(string, bool, *teamTask) bool {
+	return false
+}
+
+// channelOwnedByAnotherTaskLocked reports whether the given channel is some
+// other task's dedicated per-task channel (its slug is linked back to an
+// owning task via TaskID). Used by the create paths so a brand-new top-level
+// Issue minted from inside an existing task's chat spins up its own channel
+// instead of piling into that task's timeline. A brand-new task has no
+// channel of its own yet, so any per-task incoming channel is "another
+// task's". Caller MUST hold b.mu.
+func (b *Broker) channelOwnedByAnotherTaskLocked(channel string) bool {
+	ch := b.findChannelLocked(channel)
+	return ch != nil && strings.TrimSpace(ch.TaskID) != ""
+}
+
+// createPerTaskChannelLocked mints a dedicated channel for a task.
+// Slug: "task-<taskID>".  Name: task title (or slug if title is empty).
+// Members: owner (if a registered member) + actor (the creator).
+// TaskID is set on the returned channel so the UI can correlate the
+// two.  Caller MUST hold b.mu.  Returns nil if channel creation fails
+// (caller should keep the task in "general" in that case).
+func (b *Broker) createPerTaskChannelLocked(taskID, title, owner, actor string) *teamChannel {
+	slug := "task-" + taskID
+	name := strings.TrimSpace(title)
+	if name == "" {
+		name = slug
+	}
+	// Build the member list from known-registered actors only —
+	// createChannelLocked validates every entry against findMemberLocked
+	// and returns an error for unknown slugs.
+	members := make([]string, 0, 2)
+	if o := normalizeActorSlug(owner); o != "" && o != "cos" && b.findMemberLocked(o) != nil {
+		members = append(members, o)
+	}
+	// Actor may be "human", "you", "system", "cos", or a specialist
+	// slug.  Trusted senders are not in the members list so skip them;
+	// createChannelLocked will return an error for unknown slugs.
+	actorNorm := normalizeActorSlug(actor)
+	isAlreadyMember := false
+	for _, m := range members {
+		if m == actorNorm {
+			isAlreadyMember = true
+			break
+		}
+	}
+	if !isAlreadyMember && actorNorm != "" && actorNorm != "cos" &&
+		!isHumanMessageSender(actorNorm) && actorNorm != "system" &&
+		actorNorm != "hive" && b.findMemberLocked(actorNorm) != nil {
+		members = append(members, actorNorm)
+	}
+	// Seed the Librarian as a default member of every task channel (owner + CEO
+	// + Librarian — CEO has all-channel access via the reserved-slug bypass, so
+	// it isn't listed explicitly). Added only when the workspace actually has a
+	// Librarian member: new workspaces do; existing ones gain it in the Phase 6
+	// migration, so this no-ops there. Never duplicated.
+	if b.findMemberLocked(LibrarianSlug) != nil {
+		alreadyMember := false
+		for _, m := range members {
+			if m == LibrarianSlug {
+				alreadyMember = true
+				break
+			}
+		}
+		if !alreadyMember {
+			members = append(members, LibrarianSlug)
+		}
+	}
+	ch, cerr := b.createChannelLocked(channelCreateInput{
+		Slug:      slug,
+		Name:      name,
+		Members:   members,
+		CreatedBy: actorNorm,
+	})
+	if cerr != nil {
+		// The caller falls back to #general when this returns nil, so a silent
+		// failure would route the task into the shared channel and break the
+		// channel-per-task invariant with no operator signal. createChannelLocked
+		// rolls back its own ghost append on a persist failure (see
+		// broker_office_channels.go); we log so the fallback is visible.
+		log.Printf("broker: createPerTaskChannel %q for task %s failed (falling back to #general): %s", slug, taskID, cerr.Msg)
+		return nil
+	}
+	// Link channel back to its owning task so the UI can correlate.
+	ch.TaskID = taskID
+	return ch
+}

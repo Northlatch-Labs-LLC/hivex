@@ -1,0 +1,1475 @@
+/* ═══════════════════════════════════════════════════════════════
+   Hive Theme: Hive
+   Clean light theme built on the Hive.System design tokens.
+   Neutral light base, cyan/teal accent, balanced spacing.
+   No brand blue — accent from Secondary/Cyan palette.
+   ═══════════════════════════════════════════════════════════════ */
+
+html[data-theme="hive"] {
+  /* ── Hive.System Figma ramps ── */
+  --neutral-950: #1e1f1f;
+  --neutral-900: #28292a;
+  --neutral-800: #323334;
+  --neutral-700: #434647;
+  --neutral-600: #575a5c;
+  --neutral-500: #686c6e;
+  --neutral-400: #85898b;
+  --neutral-300: #aeb1b2;
+  --neutral-200: #cfd1d2;
+  --neutral-100: #e9eaeb;
+  --neutral-50: #f2f2f3;
+  --neutral-10: #f8f8f9;
+
+  --tertiary-500: #612a92;
+  --tertiary-400: #9f4dbf;
+  --tertiary-300: #cf72d9;
+  --tertiary-200: #ffb3e6;
+  --tertiary-100: #ffebfc;
+
+  --olive-500: #3f4224;
+  --olive-400: #969640;
+  --olive-300: #d4db18;
+  --olive-200: #eef679;
+  --olive-100: #f8ffdb;
+
+  --cyan-500: #069de4;
+  --cyan-400: #00ccff;
+  --cyan-300: #46f7fd;
+  --cyan-200: #a3fcff;
+  --cyan-100: #e5feff;
+
+  --success-500: #0d5935;
+  --success-400: #03a04c;
+  --success-300: #35da79;
+  --success-200: #a3ebbb;
+  --success-100: #e9fbef;
+
+  --error-500: #8c1727;
+  --error-400: #d1261a;
+  --error-300: #ff9a8f;
+  --error-200: #ffe4e0;
+  --error-100: #ffeeeb;
+
+  --warning-500: #994200;
+  --warning-400: #ce6b09;
+  --warning-300: #ffb647;
+  --warning-200: #f7deab;
+  --warning-100: #fbf5dc;
+
+  /* ── Overlays (unified) ── */
+  --overlay-soft: rgba(0, 0, 0, 0.04);
+  --overlay: rgba(0, 0, 0, 0.08);
+  --overlay-strong: rgba(0, 0, 0, 0.16);
+  --scrim: rgba(0, 0, 0, 0.5);
+  --overlay-white-soft: rgba(255, 255, 255, 0.08);
+  --overlay-white: rgba(255, 255, 255, 0.16);
+  --overlay-white-strong: rgba(255, 255, 255, 0.45);
+
+  /* ── Semantic aliases ── */
+  --bg: #ffffff;
+  --bg-warm: var(--neutral-50);
+  --bg-subtle: var(--neutral-10);
+  --bg-card: #ffffff;
+  --text: var(--neutral-900);
+  --text-secondary: var(--neutral-500);
+  /* --text-tertiary deliberately NOT restated: it moved off --neutral-400
+     for AA and now lives once in global.css. */
+  --text-disabled: var(--neutral-300);
+
+  /* Note for anyone tidying up: shadcn.css ALSO declares --accent and
+     --border on `html[data-theme="hive"]`, as HSL triplets for Tailwind
+     (`200 94% 46%`). That looks like it would win on specificity and make
+     these lines load-bearing — it does not. shadcn.css wraps its block in
+     `@layer base`, and unlayered CSS beats layered CSS whatever the
+     specificity, so global.css's plain `:root` wins either way. Verified
+     by deleting this line and re-measuring: --accent stayed #9f4dbf.
+     These two are therefore as redundant as the rest of this block. */
+  --accent: var(--tertiary-400);
+  --accent-warm: var(--tertiary-500);
+  --accent-bg: var(--tertiary-100);
+  --accent-bg-strong: rgba(159, 77, 191, 0.35);
+
+  --border: var(--neutral-100);
+  --border-light: var(--neutral-50);
+  --border-dark: var(--neutral-200);
+  --border-strong: var(--neutral-300);
+
+  --green: var(--success-400);
+  --green-dark: var(--success-500);
+  --green-bg: var(--success-100);
+
+  --red: var(--error-400);
+  --red-dark: var(--error-500);
+  --red-bg: var(--error-100);
+
+  --yellow: var(--warning-400);
+  --yellow-dark: var(--warning-500);
+  --yellow-bg: var(--warning-100);
+
+  --blue: var(--cyan-500);
+  --blue-bg: var(--cyan-100);
+
+  /* ── Typography ──
+     Deliberately NOT restated here. No theme varies the font stacks, so
+     they live once in global.css `:root` and every theme inherits them.
+     Duplicating them here would mean changing global.css silently left the
+     old stack in place for whichever themes still carried a copy. ── */
+
+  /* ── Radii ──
+     A real per-theme axis, not a restatement: hive runs a tighter scale
+     than the global default (8/12/16/20). --radius-full coincides at
+     9999px because a pill is a pill; keep it with the scale it belongs
+     to rather than splitting the block. ── */
+  --radius-sm: 4px;
+  --radius-md: 8px;
+  --radius-lg: 12px;
+  --radius-xl: 16px;
+  --radius-full: 9999px;
+
+  /* ── Sidebar ── */
+  --hive-sidebar: var(--tertiary-500);
+  --hive-sidebar-hover: var(--overlay-white);
+  --hive-sidebar-active: var(--olive-400);
+  --hive-sidebar-text: rgba(255, 255, 255, 0.72);
+  --hive-sidebar-text-active: #ffffff;
+  --hive-presence: var(--success-300);
+
+  /* ── Tertiary accent (tags, decorative) ── */
+  --purple: var(--tertiary-400);
+  --purple-bg: var(--tertiary-100);
+}
+
+/* ═══ BASE ═══ */
+html[data-theme^="hive"] body {
+  background: var(--bg);
+  font-family: var(--font-sans);
+  color: var(--text);
+}
+
+/* ═══ SCROLLBAR ═══ */
+html[data-theme^="hive"] ::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+html[data-theme^="hive"] ::-webkit-scrollbar-track {
+  background: transparent;
+}
+html[data-theme^="hive"] ::-webkit-scrollbar-thumb {
+  background: var(--border-dark);
+  border-radius: 3px;
+}
+html[data-theme^="hive"] ::-webkit-scrollbar-thumb:hover {
+  background: var(--border-dark);
+}
+
+/* ═══ SELECTION ═══ */
+html[data-theme^="hive"] ::selection {
+  background: rgba(6, 157, 228, 0.2);
+  color: var(--text);
+}
+
+/* ═══════════════════════════════════════
+   SIDEBAR
+   ═══════════════════════════════════════ */
+
+/* Snapshot of the ACTIVE theme's text ramp, taken on <html> where --text
+   still holds the theme's own value. The sidebar block below remaps --text
+   to white-on-brand for its rail; anything nested under the sidebar that is
+   NOT the rail (dialogs, wizard overlays) restores from these.
+
+   Captured on <html> deliberately: a `--text-root: var(--text)` written
+   inside the .sidebar block would resolve against that element's ALREADY
+   overridden --text and hand back white. Only an ancestor that never
+   overrides --text can hold the true value.
+
+   This resolves per theme, so hive (light), hive-shell and hive-dark each get
+   their own ink back — no palette is duplicated here, and a retune of any
+   theme's --text flows through automatically. */
+html[data-theme^="hive"] {
+  --text-root: var(--text);
+  --text-secondary-root: var(--text-secondary);
+  --text-tertiary-root: var(--text-tertiary);
+  --text-disabled-root: var(--text-disabled);
+}
+
+html[data-theme^="hive"] .sidebar {
+  background: var(--hive-sidebar);
+  border-right: 1px solid rgba(0, 0, 0, 0.12);
+  /* Layout (display/flex/overflow) lives in layout.css — the .sidebar
+     is a fixed-height flex column with header + .sidebar-scroll + usage
+     as its three rows; only .sidebar-scroll scrolls. */
+  /* Remap muted text tokens to white-on-purple overlays. Gray reads dirty
+     against the brand surface; opacity-driven white stays in-key. */
+  --text: #ffffff;
+  --text-secondary: rgba(255, 255, 255, 0.86);
+  /* 0.58 gave 4.2:1 on the purple rail at full strength, and the agent
+     status line dims further on top of it — see the idle state in
+     layout.css. 0.72 clears AA there with the dim applied. */
+  --text-tertiary: rgba(255, 255, 255, 0.72);
+  --text-disabled: rgba(255, 255, 255, 0.4);
+}
+/* Modal/wizard overlays portal-ish into the sidebar DOM and inherit the
+   white-on-purple text vars — which makes their content invisible on the
+   modal's card. The reset below puts the theme's own ink back.
+
+   It restores from --text-*-root rather than re-declaring a palette,
+   because this file is the shared BASE for the dark themes too:
+   hive-shell.css and hive-dark.css both `@import url("./hive.css")`, and the
+   sidebar selectors here are prefix matches ([data-theme^="hive"]), so they
+   apply under hive-shell and hive-dark as well.
+
+   This block used to hardcode the LIGHT palette (--neutral-900 ink), on the
+   assumption named in the old comment: "invisible on the modal's white
+   card". Under hive-shell the card is not white, it is hsl(210 5% 10%) — so
+   the reset painted #28292a ink on a #131416 card, a contrast ratio of
+   1.2:1. Every label, the "Create agent" heading, and every input
+   placeholder in the New Agent wizard were unreadable (reported
+   2026-09-03). Restoring from the root tokens is correct in all three
+   themes and cannot drift when a palette is retuned. */
+html[data-theme^="hive"] .sidebar [role="dialog"],
+html[data-theme^="hive"] .sidebar .bot-wizard-overlay,
+html[data-theme^="hive"] .sidebar .channel-wizard-overlay {
+  --text: var(--text-root);
+  --text-secondary: var(--text-secondary-root);
+  --text-tertiary: var(--text-tertiary-root);
+  --text-disabled: var(--text-disabled-root);
+}
+html[data-theme^="hive"] .sidebar .sidebar-logo {
+  color: #ffffff;
+}
+html[data-theme^="hive"] .sidebar .sidebar-section-title {
+  /* 0.55 measured 3.94:1 on the purple rail — these are the AGENTS /
+     CHANNELS / WORK section headers and the New Agent / New Channel
+     actions, so they are navigation, not decoration. */
+  color: rgba(255, 255, 255, 0.68);
+}
+html[data-theme^="hive"] .sidebar .sidebar-section-toggle:hover {
+  color: #ffffff;
+}
+html[data-theme^="hive"] .sidebar .sidebar-icon-btn {
+  color: rgba(255, 255, 255, 0.78);
+}
+html[data-theme^="hive"] .sidebar .sidebar-icon-btn:hover {
+  background: rgba(159, 77, 191, 0.5);
+  color: #ffffff;
+}
+html[data-theme^="hive"] .sidebar .sidebar-icon-btn.active {
+  background: rgba(255, 255, 255, 0.16);
+  color: #ffffff;
+}
+html[data-theme^="hive"] .sidebar .sidebar-icon-btn.active:hover {
+  background: rgba(255, 255, 255, 0.22);
+}
+html[data-theme^="hive"] .sidebar .sidebar-header {
+  border-bottom-color: rgba(255, 255, 255, 0.08);
+}
+html[data-theme^="hive"] .sidebar .sidebar-scroll-wrap.is-agents {
+  border-bottom-color: rgba(255, 255, 255, 0.08);
+}
+html[data-theme^="hive"] .sidebar .sidebar-section + .sidebar-section {
+  border-top-color: rgba(255, 255, 255, 0.08);
+}
+html[data-theme^="hive"] .sidebar .sidebar-bot-task,
+html[data-theme^="hive"] .sidebar .sidebar-bot-activity {
+  color: rgba(255, 255, 255, 0.45);
+}
+html[data-theme^="hive"] .sidebar .usage-toggle,
+html[data-theme^="hive"] .sidebar .sidebar-section-title-bar {
+  /* Match the sidebar's themed background so sticky chrome (section
+     title bars and the Usage footer) reads as pinned chrome, not a
+     white card showing through scrolling content. */
+  background: var(--hive-sidebar);
+}
+html[data-theme^="hive"] .sidebar .usage-toggle {
+  color: rgba(255, 255, 255, 0.78);
+  border-top-color: rgba(255, 255, 255, 0.08);
+}
+html[data-theme^="hive"] .sidebar .usage-toggle:hover {
+  color: #ffffff;
+  background: rgba(159, 77, 191, 0.5);
+}
+html[data-theme^="hive"] .sidebar .usage-toggle.open {
+  background: #22d3ee;
+  color: #0b3a44;
+  border-top-color: rgba(0, 0, 0, 0.08);
+}
+html[data-theme^="hive"] .sidebar .usage-toggle.open > span,
+html[data-theme^="hive"] .sidebar .usage-toggle.open > svg {
+  color: #0b3a44;
+  stroke: #0b3a44;
+}
+html[data-theme^="hive"] .sidebar .sidebar-add-btn {
+  /* 0.55 measured 3.94:1 on the purple rail; 0.68 clears AA. */
+  color: rgba(255, 255, 255, 0.68);
+}
+html[data-theme^="hive"] .sidebar .sidebar-add-btn:hover {
+  color: #ffffff;
+}
+html[data-theme^="hive"] .sidebar {
+  --sidebar-fade-color: #612a92;
+}
+html[data-theme^="hive"] .sidebar .usage-panel {
+  color: rgba(255, 255, 255, 0.78);
+}
+html[data-theme^="hive"] .sidebar .usage-table th {
+  /* 0.55 measured 3.94:1 on the purple rail; 0.68 clears AA. */
+  color: rgba(255, 255, 255, 0.68);
+  border-bottom-color: rgba(255, 255, 255, 0.12);
+}
+html[data-theme^="hive"] .sidebar .usage-table td {
+  color: rgba(255, 255, 255, 0.78);
+}
+html[data-theme^="hive"] .sidebar .usage-total {
+  color: #ffffff;
+  border-top-color: rgba(255, 255, 255, 0.12);
+}
+html[data-theme^="hive"] .sidebar .usage-total-cost {
+  color: #ffffff;
+}
+html[data-theme^="hive"] .sidebar .usage-toggle > span {
+  color: #ffffff;
+}
+html[data-theme^="hive"] .sidebar .usage-panel.open {
+  background: #22d3ee;
+  color: #0b3a44;
+}
+html[data-theme^="hive"] .sidebar .usage-panel.open .usage-table th {
+  color: rgba(11, 58, 68, 0.65);
+  border-bottom-color: rgba(11, 58, 68, 0.18);
+}
+html[data-theme^="hive"] .sidebar .usage-panel.open .usage-table td {
+  color: #0b3a44;
+}
+html[data-theme^="hive"] .sidebar .usage-panel.open .usage-total {
+  color: #0b3a44;
+  border-top-color: rgba(11, 58, 68, 0.18);
+}
+html[data-theme^="hive"] .sidebar .usage-panel.open .usage-total-cost {
+  color: #0b3a44;
+}
+html[data-theme^="hive"] .sidebar .sidebar-summary {
+  /* 0.55 measured 3.94:1 on the purple rail; 0.68 clears AA. */
+  color: rgba(255, 255, 255, 0.68);
+}
+html[data-theme^="hive"] .sidebar .sidebar-hint {
+  /* 0.55 measured 3.94:1 on the purple rail; 0.68 clears AA. */
+  color: rgba(255, 255, 255, 0.68);
+}
+html[data-theme^="hive"] .sidebar .sidebar-bot-name {
+  color: inherit;
+}
+
+/* ── Sticky header ── */
+html[data-theme^="hive"] .sidebar-header {
+  background: var(--hive-sidebar);
+  border-bottom: 1px solid var(--border);
+  padding: 12px 20px;
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  flex-shrink: 0;
+}
+html[data-theme^="hive"] .sidebar-logo {
+  font-family: var(--font-sans);
+  font-size: 17px;
+  font-weight: 800;
+  color: var(--text);
+  font-style: normal;
+  letter-spacing: -0.02em;
+  cursor: pointer;
+}
+html[data-theme^="hive"] .sidebar-header .sidebar-btn {
+  color: var(--hive-sidebar-text);
+}
+html[data-theme^="hive"] .sidebar-header .sidebar-btn:hover {
+  background: var(--hive-sidebar-hover);
+  color: var(--text);
+}
+
+/* ── Summary & hint ── */
+html[data-theme^="hive"] .sidebar-summary {
+  padding: 6px 20px 2px;
+  font-size: 11px;
+  color: var(--text-tertiary);
+}
+html[data-theme^="hive"] .sidebar-hint {
+  padding: 0 20px 6px;
+  font-size: 11px;
+}
+
+/* ── Section titles ── (layout/sizing owned by layout.css) */
+html[data-theme^="hive"] .sidebar-section-title {
+  color: var(--text-tertiary);
+  font-family: var(--font-sans);
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  cursor: pointer;
+  user-select: none;
+}
+html[data-theme^="hive"] .sidebar .sidebar-section-title:hover {
+  color: #ffffff;
+}
+
+/* ── Scrollable middle area (layout.css owns padding + overflow) ── */
+
+/* ── Sidebar items & agents (color/typography only; layout in layout.css) ── */
+html[data-theme^="hive"] .sidebar-item,
+html[data-theme^="hive"] .sidebar-agent {
+  color: var(--hive-sidebar-text);
+  font-family: var(--font-sans);
+  transition:
+    background 0.1s,
+    color 0.1s;
+}
+html[data-theme^="hive"] .sidebar-item:hover,
+html[data-theme^="hive"] .sidebar-agent:hover {
+  background: var(--hive-sidebar-hover);
+  color: var(--hive-sidebar-text-active);
+}
+html[data-theme^="hive"] .sidebar-item.active,
+html[data-theme^="hive"] .sidebar-agent.active {
+  background: var(--cyan-400);
+  color: #0b3a44;
+  font-weight: 600;
+}
+
+/* The active row flips to a LIGHT cyan with dark ink, but `color` alone does
+   not reach descendants that set their own — the agent status pill kept the
+   sidebar's white-on-purple --text-tertiary and landed at 1.48:1 on the row
+   for the agent you are currently looking at. Remap the text tokens the way
+   .sidebar does so anything inside inherits dark ink.
+   Scoped to the two themes that actually get the light row, NOT the
+   [data-theme^="hive"] prefix: hive-shell overrides this row to a translucent
+   cobalt over its dark rail and keeps light text, so dark ink there put the
+   same pill at 1.25:1 — measured, after trying the prefix first. */
+html[data-theme="hive"] .sidebar-item.active,
+html[data-theme="hive"] .sidebar-agent.active,
+html[data-theme="hive-dark"] .sidebar-item.active,
+html[data-theme="hive-dark"] .sidebar-agent.active {
+  --text: #0b3a44;
+  --text-secondary: rgba(11, 58, 68, 0.86);
+  --text-tertiary: rgba(11, 58, 68, 0.9);
+}
+
+html[data-theme^="hive"] .sidebar-item-icon {
+  font-size: 15px;
+  font-weight: 400;
+  color: inherit;
+  width: 16px;
+  height: 16px;
+  flex-shrink: 0;
+}
+html[data-theme^="hive"] .sidebar-item-emoji {
+  font-size: 15px;
+  width: 20px;
+  text-align: center;
+  flex-shrink: 0;
+}
+
+/* ── Agent row internals (layout from layout.css) ── */
+html[data-theme^="hive"] .sidebar-bot-name {
+  white-space: nowrap;
+}
+html[data-theme^="hive"] .sidebar-bot-task,
+html[data-theme^="hive"] .sidebar-bot-activity {
+  font-size: 11px;
+  color: var(--text-tertiary);
+  max-width: none;
+}
+html[data-theme^="hive"] .sidebar-bot-stream {
+  font-size: 11px;
+  color: var(--accent);
+  max-width: none;
+}
+
+/* ── Status dot ── */
+html[data-theme^="hive"] .status-dot {
+  width: 6px;
+  height: 6px;
+  flex-shrink: 0;
+  margin-left: auto;
+}
+html[data-theme^="hive"] .status-dot.active {
+  background: var(--hive-presence);
+  border: none;
+}
+/* In the purple sidebar, drop status category colors and show a single
+   presence dot (green = active, translucent white = lurking). */
+html[data-theme^="hive"] .sidebar-agent .status-dot {
+  background: rgba(255, 255, 255, 0.35);
+}
+html[data-theme^="hive"] .sidebar-agent .status-dot.active,
+html[data-theme^="hive"] .sidebar-agent .status-dot.shipping,
+html[data-theme^="hive"] .sidebar-agent .status-dot.plotting {
+  background: var(--hive-presence);
+}
+html[data-theme^="hive"] .sidebar-agent .status-dot.lurking {
+  background: rgba(255, 255, 255, 0.35);
+}
+
+/* ── DM button on agent rows ── */
+html[data-theme^="hive"] .sidebar-bot-dm-btn {
+  font-size: 10px;
+  padding: 2px 6px;
+  border-radius: var(--radius-sm);
+  border-color: var(--border);
+  margin-left: auto;
+}
+
+/* ── Thought indicator (inline, between name and dot) ── */
+html[data-theme^="hive"] .sidebar-agent:has(.thought-bubble) {
+  margin-top: 0;
+}
+@keyframes hive-thought-shimmer {
+  0% {
+    left: -50%;
+  }
+  100% {
+    left: 150%;
+  }
+}
+html[data-theme^="hive"] .thought-bubble {
+  all: unset;
+  display: block;
+  position: relative;
+  flex: 1 1 0;
+  min-width: 0;
+  font-size: 11px;
+  font-weight: 400;
+  font-family: var(--font-sans);
+  white-space: nowrap;
+  overflow: hidden;
+  pointer-events: none;
+  text-align: left;
+  color: #9b9da0;
+  opacity: 1;
+  transition: opacity 0.3s ease;
+  -webkit-mask-image: linear-gradient(
+    to right,
+    #000 0%,
+    #000 70%,
+    transparent 100%
+  );
+  mask-image: linear-gradient(to right, #000 0%, #000 70%, transparent 100%);
+}
+/* Light sweep overlay via pseudo-element */
+html[data-theme^="hive"] .thought-bubble::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: -50%;
+  width: 40%;
+  height: 100%;
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    rgba(255, 255, 255, 0.7) 50%,
+    transparent 100%
+  );
+  border: none;
+  border-radius: 0;
+  animation: hive-thought-shimmer 2s linear infinite;
+  mix-blend-mode: overlay;
+}
+html[data-theme^="hive"] .sidebar-agent:hover .thought-bubble {
+  opacity: 0;
+}
+
+/* ── Add buttons (New Agent / New Channel) ── */
+html[data-theme^="hive"] .sidebar-add-btn {
+  color: var(--text-tertiary);
+  font-size: 13px;
+  gap: 10px;
+}
+html[data-theme^="hive"] .sidebar-add-btn:hover {
+  color: var(--text-secondary);
+  background: var(--hive-sidebar-hover);
+}
+
+/* ── Header button sizes ── */
+html[data-theme^="hive"] .sidebar-btn-sm {
+  width: 32px;
+  height: 32px;
+  border-radius: var(--radius-md);
+}
+
+/* ── Sticky bottom bar (color owned by sidebar rules above) ── */
+html[data-theme^="hive"] .usage-toggle {
+  flex-shrink: 0;
+  font-size: 11px;
+}
+html[data-theme^="hive"] .usage-panel {
+  flex-shrink: 0;
+}
+
+html[data-theme^="hive"] .sidebar-bottom {
+  background: var(--hive-sidebar);
+  border-top: 1px solid var(--border);
+  padding: 10px 16px;
+  flex-shrink: 0;
+}
+html[data-theme^="hive"] .sidebar-btn {
+  color: var(--hive-sidebar-text);
+}
+
+html[data-theme^="hive"] #theme-switcher {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  color: var(--text-secondary);
+  border-radius: var(--radius-md);
+  font-family: var(--font-sans);
+  font-size: 12px;
+}
+
+/* Sidebar chevron sizing/rotation is owned by layout.css now that the
+   marker is an SVG (data-open=true|false). No theme override needed. */
+
+/* ── Unread channel ── */
+html[data-theme^="hive"] .sidebar-item.unread {
+  color: var(--hive-sidebar-text-active);
+  font-weight: 600;
+  position: relative;
+}
+html[data-theme^="hive"] .sidebar-item.unread::before {
+  content: "";
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--accent);
+  position: absolute;
+  left: 3px;
+  top: 50%;
+  transform: translateY(-50%);
+}
+
+/* ── Workspace dropdown ── */
+html[data-theme^="hive"] .workspace-dropdown {
+  position: absolute;
+  top: 100%;
+  left: 8px;
+  right: 8px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.12);
+  z-index: 1000;
+  padding: 6px 0;
+  display: none;
+  font-family: var(--font-sans);
+}
+html[data-theme^="hive"] .workspace-dropdown.open {
+  display: block;
+}
+html[data-theme^="hive"] .workspace-dropdown-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 16px;
+  color: var(--text);
+  font-size: 14px;
+  cursor: pointer;
+  border: none;
+  background: none;
+  width: 100%;
+  text-align: left;
+  font-family: var(--font-sans);
+}
+html[data-theme^="hive"] .workspace-dropdown-item:hover {
+  background: var(--accent-bg);
+  color: var(--accent);
+}
+html[data-theme^="hive"] .workspace-dropdown-item .ws-menu-icon {
+  width: 20px;
+  text-align: center;
+  flex-shrink: 0;
+  font-size: 15px;
+}
+html[data-theme^="hive"] .workspace-dropdown-sep {
+  height: 1px;
+  background: var(--border);
+  margin: 4px 0;
+}
+
+/* ── Starred channels ── */
+html[data-theme^="hive"] .sidebar-star {
+  opacity: 0;
+  cursor: pointer;
+  font-size: 13px;
+  margin-left: auto;
+  transition: opacity 0.1s;
+  color: var(--hive-sidebar-text);
+  flex-shrink: 0;
+  background: none;
+  border: none;
+  padding: 0 2px;
+  line-height: 1;
+}
+html[data-theme^="hive"] .sidebar-item:hover .sidebar-star {
+  opacity: 1;
+}
+html[data-theme^="hive"] .sidebar-star.starred {
+  opacity: 1;
+  color: var(--yellow);
+}
+
+/* ── Sidebar badge (notification count) ── */
+html[data-theme^="hive"] .sidebar-badge {
+  min-width: 18px;
+  height: 18px;
+  font-size: 10px;
+  margin-left: auto;
+}
+
+/* ── Pixel avatar alignment ── */
+html[data-theme^="hive"] .pixel-avatar-sidebar {
+  width: 24px;
+  height: 24px;
+  flex-shrink: 0;
+}
+
+/* ═══════════════════════════════════════
+   MAIN AREA
+   ═══════════════════════════════════════ */
+html[data-theme^="hive"] .main {
+  background: var(--bg);
+}
+
+/* ── Channel header ── */
+html[data-theme^="hive"] .channel-header {
+  background: var(--bg);
+  border-bottom: 1px solid var(--border);
+  backdrop-filter: none;
+  padding: 12px 24px;
+  min-height: 52px;
+}
+html[data-theme^="hive"] .channel-title {
+  font-family: var(--font-sans);
+  font-weight: 700;
+  font-size: 16px;
+  color: var(--text);
+}
+html[data-theme^="hive"] .channel-desc {
+  font-size: 13px;
+  color: var(--text-tertiary);
+}
+
+/* ── Messages ── */
+html[data-theme^="hive"] .messages {
+  background: var(--bg);
+  padding: 8px 24px;
+}
+html[data-theme^="hive"] .message {
+  padding: 10px 24px;
+  gap: 12px;
+  border-radius: var(--radius-md);
+  margin: 0 -24px;
+}
+html[data-theme^="hive"] .message:hover {
+  background: var(--bg-warm);
+}
+
+/* Avatar */
+html[data-theme^="hive"] .message-avatar {
+  width: 36px;
+  height: 36px;
+  border-radius: var(--radius-md);
+  font-size: 17px;
+  background: var(--border);
+}
+
+/* Author */
+html[data-theme^="hive"] .message-author {
+  font-family: var(--font-sans);
+  font-weight: 700;
+  font-size: 15px;
+  color: var(--text);
+}
+
+/* Message text */
+html[data-theme^="hive"] .message-text {
+  font-family: var(--font-sans);
+  font-size: 15px;
+  line-height: 1.5;
+  color: #3b3b3e;
+}
+html[data-theme^="hive"] .message-text strong {
+  color: var(--text);
+  font-weight: 600;
+}
+
+/* Links */
+html[data-theme^="hive"] .message-text a {
+  color: var(--accent);
+  text-decoration: none;
+}
+html[data-theme^="hive"] .message-text a:hover {
+  text-decoration: underline;
+}
+
+/* Inline code */
+html[data-theme^="hive"] .message-text code {
+  background: var(--accent-bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 2px 6px;
+  font-size: 13px;
+  color: var(--accent-warm);
+  font-family: var(--font-mono);
+}
+
+/* Blockquote */
+html[data-theme^="hive"] .msg-blockquote {
+  border-left-color: var(--border-dark);
+  color: var(--text-secondary);
+}
+
+/* Mentions */
+html[data-theme^="hive"] .mention {
+  background: var(--accent-bg);
+  color: var(--accent);
+  border-radius: var(--radius-sm);
+  padding: 1px 4px;
+}
+/* Composer mirror: the chip MUST use the same character metrics as the
+   textarea behind it, otherwise the caret drifts — `@pm` in the mirror
+   was rendering with 4px horizontal padding + 0.9em font size, so each
+   mention took ~10px more width than the raw text in the textarea and
+   the caret fell behind after the first tag. Background highlight only;
+   no layout-affecting properties. */
+html[data-theme^="hive"] .composer-mirror .mention {
+  display: inline;
+  padding: 0;
+  font-size: inherit;
+  line-height: inherit;
+  font-weight: inherit;
+  border-radius: 0;
+  /* Use a box-shadow inset so the visual highlight stays without
+     adding any extrinsic padding. */
+  background: var(--accent-bg);
+  color: var(--accent);
+  box-shadow: inset 0 0 0 1px var(--accent-bg);
+}
+
+/* Timestamps */
+html[data-theme^="hive"] .message-time {
+  font-family: var(--font-sans);
+  font-size: 11px;
+  color: var(--text-tertiary);
+  opacity: 1;
+}
+
+/* Badges — shape/color owned by global.css */
+
+/* System messages */
+html[data-theme^="hive"] .message-system-text {
+  font-family: var(--font-sans);
+  color: var(--text-tertiary);
+  font-size: 13px;
+}
+
+/* ── Message action bar ── */
+html[data-theme^="hive"] .message-actions {
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+  padding: 4px;
+  background: var(--bg);
+}
+html[data-theme^="hive"] .message-action-btn {
+  border-radius: var(--radius-sm);
+  color: var(--text-secondary);
+}
+html[data-theme^="hive"] .message-action-btn:hover {
+  background: var(--bg-warm);
+  color: var(--text);
+}
+
+/* ── Thread link ── */
+html[data-theme^="hive"] .message-thread-link {
+  color: var(--accent);
+  font-family: var(--font-sans);
+  font-size: 13px;
+  font-weight: 600;
+}
+html[data-theme^="hive"] .message-thread-link:hover {
+  background: var(--accent-bg);
+}
+
+/* Typing indicator */
+html[data-theme^="hive"] .typing-indicator {
+  color: var(--text-tertiary);
+  font-family: var(--font-sans);
+}
+
+/* ═══════════════════════════════════════
+   COMPOSER
+   ═══════════════════════════════════════ */
+html[data-theme^="hive"] .composer {
+  background: var(--bg);
+  border-top: none;
+  padding: 0 24px 24px;
+}
+
+html[data-theme^="hive"] .composer-inner {
+  background: var(--bg);
+  border: 1px solid var(--border-dark);
+  border-radius: var(--radius-lg);
+  padding: 8px 8px 8px 16px;
+  min-height: 36px;
+  transition: border-color 0.15s;
+}
+html[data-theme^="hive"] .composer-inner:focus-within {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px rgba(6, 157, 228, 0.25);
+}
+/* Both surfaces — textarea + mention-chip mirror — must share font metrics
+   so chip positions line up with the raw text the user is typing. */
+html[data-theme^="hive"] .composer-input,
+html[data-theme^="hive"] .composer-mirror {
+  font-family: var(--font-sans);
+  font-size: 15px;
+  color: var(--text);
+}
+html[data-theme^="hive"] .composer-input::placeholder {
+  color: var(--text-tertiary);
+}
+/* When the user has typed a recognised mention, hide the textarea's text
+   layer and render chips from the mirror. Caret remains visible via
+   caret-color so typing still works. */
+html[data-theme^="hive"] .composer-field:has(.mention) .composer-input {
+  color: transparent;
+  caret-color: var(--text);
+}
+
+/* Send button */
+html[data-theme^="hive"] .composer-send {
+  background: var(--cyan-400);
+  color: #0b3a44;
+  border-radius: var(--radius-md);
+  width: 32px;
+  height: 32px;
+  transition:
+    background 0.15s,
+    color 0.15s;
+}
+html[data-theme^="hive"] .composer-send:hover:not(:disabled) {
+  background: var(--cyan-500);
+  color: #fff;
+}
+html[data-theme^="hive"] .composer-send:disabled {
+  background: var(--bg-warm);
+  color: var(--text-tertiary);
+  opacity: 0.55;
+}
+
+/* ═══════════════════════════════════════
+   THREAD PANEL
+   ═══════════════════════════════════════ */
+html[data-theme^="hive"] .thread-panel {
+  background: var(--bg);
+  border-left: 1px solid var(--border);
+  width: 400px;
+}
+html[data-theme^="hive"] .thread-panel-header {
+  padding: 14px 24px;
+  border-bottom: 1px solid var(--border);
+}
+html[data-theme^="hive"] .thread-panel-title {
+  font-family: var(--font-sans);
+  font-weight: 700;
+  font-size: 16px;
+  color: var(--text);
+}
+html[data-theme^="hive"] .thread-panel-divider {
+  color: var(--text-tertiary);
+  font-family: var(--font-sans);
+  font-weight: 600;
+}
+html[data-theme^="hive"] .thread-panel-parent {
+  background: var(--bg);
+}
+
+/* ═══════════════════════════════════════
+   AGENT PANEL
+   ═══════════════════════════════════════ */
+html[data-theme^="hive"] .bot-panel {
+  background: var(--bg);
+  border-left: 1px solid var(--border);
+}
+html[data-theme^="hive"] .bot-panel-header {
+  background: var(--bg);
+  border-bottom: none;
+  padding: 16px 24px 8px;
+}
+html[data-theme^="hive"] .bot-panel-header span {
+  font-family: var(--font-sans);
+}
+html[data-theme^="hive"] .bot-panel-role {
+  font-weight: 400;
+  color: var(--text-tertiary);
+}
+html[data-theme^="hive"] .bot-panel-avatar {
+  border-radius: var(--radius-md);
+  background: transparent;
+}
+html[data-theme^="hive"] .bot-panel-name {
+  font-family: var(--font-sans);
+  font-weight: 700;
+  color: var(--text);
+}
+html[data-theme^="hive"] .bot-panel-section-title {
+  font-family: var(--font-sans);
+  font-weight: 600;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-tertiary);
+}
+html[data-theme^="hive"] .bot-panel-skill {
+  border-radius: var(--radius-full);
+  font-family: var(--font-sans);
+  background: var(--bg-warm);
+  color: var(--text-secondary);
+  border-color: var(--border);
+  font-size: 12px;
+}
+
+/* ═══════════════════════════════════════
+   BUTTONS
+   ═══════════════════════════════════════ */
+/* Theme restyles atoms via tokens — class behavior stays in global.css. */
+html[data-theme^="hive"] {
+  --btn-radius: var(--radius-md);
+  --btn-font-weight: 600;
+  --btn-primary-shadow: none;
+  --input-border: var(--border-dark);
+}
+
+/* ═══════════════════════════════════════
+   ONBOARDING
+   ═══════════════════════════════════════ */
+html[data-theme^="hive"] .onboarding {
+  background: var(--bg);
+}
+html[data-theme^="hive"] .dot-grid {
+  background-image: none;
+}
+html[data-theme^="hive"] .progress-dot.active {
+  background: var(--accent);
+}
+html[data-theme^="hive"] .progress-dot {
+  background: var(--border-dark);
+}
+html[data-theme^="hive"] .dict-word {
+  font-family: var(--font-sans);
+  font-style: normal;
+  font-weight: 800;
+  color: var(--text);
+}
+html[data-theme^="hive"] .welcome-tagline {
+  font-family: var(--font-sans);
+  font-style: normal;
+  font-weight: 800;
+  color: var(--text);
+}
+html[data-theme^="hive"] .tagline-gradient {
+  color: var(--accent);
+}
+html[data-theme^="hive"] .step-title {
+  font-family: var(--font-sans);
+  font-style: normal;
+  color: var(--text);
+}
+html[data-theme^="hive"] .step-desc {
+  color: var(--text-secondary);
+}
+html[data-theme^="hive"] .emoji-backdrop {
+  display: none;
+}
+html[data-theme^="hive"] .card {
+  border-radius: var(--radius-lg);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.06);
+  background: var(--bg);
+  border-color: var(--border);
+}
+/* Input restyles via tokens — geometry and state behavior stay in global.css. */
+html[data-theme^="hive"] .label {
+  font-family: var(--font-sans);
+  font-weight: 600;
+  color: var(--text);
+}
+
+/* Team cards (onboarding) */
+html[data-theme^="hive"] .team-card {
+  background: var(--bg);
+  border-color: var(--border);
+  color: var(--text);
+  border-radius: var(--radius-lg);
+}
+html[data-theme^="hive"] .team-card:hover {
+  border-color: var(--border-dark);
+}
+html[data-theme^="hive"] .team-card.selected {
+  border-color: var(--accent);
+  background: var(--accent-bg);
+}
+
+/* Size buttons (onboarding) */
+html[data-theme^="hive"] .size-btn {
+  background: var(--bg);
+  border-color: var(--border);
+  color: var(--text);
+  border-radius: var(--radius-md);
+}
+html[data-theme^="hive"] .size-btn.selected {
+  border-color: var(--accent);
+  background: var(--accent-bg);
+  color: var(--accent);
+}
+
+/* Launch screen */
+html[data-theme^="hive"] .launch-screen {
+  background: var(--bg-warm);
+}
+html[data-theme^="hive"] .launch-spinner {
+  border-color: var(--border);
+  border-top-color: var(--accent);
+}
+html[data-theme^="hive"] .launch-text {
+  font-family: var(--font-sans);
+  font-style: normal;
+  color: var(--text);
+  font-weight: 800;
+}
+html[data-theme^="hive"] .launch-sub {
+  color: var(--text-tertiary);
+}
+
+/* ═══════════════════════════════════════
+   COMMAND PALETTE
+   ═══════════════════════════════════════ */
+html[data-theme^="hive"] .cmd-palette-overlay {
+  background: rgba(0, 0, 0, 0.3);
+}
+html[data-theme^="hive"] .cmd-palette {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.15);
+  border-radius: var(--radius-lg);
+}
+html[data-theme^="hive"] .cmd-palette-input-wrap {
+  border-bottom: 1px solid var(--border);
+}
+html[data-theme^="hive"] .cmd-palette-input-wrap svg {
+  color: var(--text-tertiary);
+}
+html[data-theme^="hive"] .cmd-palette-input {
+  color: var(--text);
+}
+html[data-theme^="hive"] .cmd-palette-input::placeholder {
+  color: var(--text-tertiary);
+}
+html[data-theme^="hive"] .cmd-palette-kbd {
+  color: var(--text-tertiary);
+  background: var(--bg-warm);
+  border-color: var(--border);
+  border-radius: var(--radius-sm);
+}
+html[data-theme^="hive"] .cmd-palette-group-title {
+  color: var(--text-tertiary);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+html[data-theme^="hive"] .cmd-palette-item:hover,
+html[data-theme^="hive"] .cmd-palette-item.selected {
+  background: var(--accent-bg);
+}
+html[data-theme^="hive"] .cmd-palette-item-icon {
+  background: var(--bg-warm);
+  color: var(--text-secondary);
+  border-radius: var(--radius-md);
+}
+html[data-theme^="hive"] .cmd-palette-item-label {
+  color: var(--text);
+}
+html[data-theme^="hive"] .cmd-palette-item-desc {
+  color: var(--text-tertiary);
+}
+html[data-theme^="hive"] .cmd-palette-item-shortcut {
+  color: var(--text-tertiary);
+}
+html[data-theme^="hive"] .cmd-palette-empty {
+  color: var(--text-tertiary);
+}
+html[data-theme^="hive"] .cmd-palette-footer {
+  border-top: 1px solid var(--border);
+  color: var(--text-tertiary);
+}
+
+/* ═══════════════════════════════════════
+   TASK BOARD
+   ═══════════════════════════════════════ */
+html[data-theme^="hive"] .task-board {
+  background: var(--bg);
+}
+html[data-theme^="hive"] .task-column-header {
+  color: var(--text-tertiary);
+  border-bottom-color: var(--border);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+html[data-theme^="hive"] .task-column-count {
+  background: var(--bg-warm);
+  color: var(--text-secondary);
+  border-radius: var(--radius-full);
+}
+html[data-theme^="hive"] .task-card {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+}
+html[data-theme^="hive"] .task-card:hover {
+  border-color: var(--border-dark);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.06);
+}
+html[data-theme^="hive"] .task-card-title {
+  color: var(--text);
+}
+html[data-theme^="hive"] .task-card-meta {
+  color: var(--text-tertiary);
+}
+
+/* ═══════════════════════════════════════
+   REQUEST LIST
+   ═══════════════════════════════════════ */
+html[data-theme^="hive"] .request-list {
+  background: var(--bg);
+}
+html[data-theme^="hive"] .request-list-header {
+  color: var(--text-tertiary);
+  border-bottom-color: var(--border);
+}
+html[data-theme^="hive"] .request-item {
+  background: var(--bg);
+  border-color: var(--border);
+  border-radius: var(--radius-lg);
+}
+html[data-theme^="hive"] .request-item:hover {
+  border-color: var(--border-dark);
+}
+html[data-theme^="hive"] .request-item-from {
+  color: var(--text);
+}
+html[data-theme^="hive"] .request-kind-approval {
+  background: var(--yellow-bg);
+  color: var(--yellow);
+}
+html[data-theme^="hive"] .request-kind-confirm {
+  background: var(--accent-bg);
+  color: var(--accent);
+}
+html[data-theme^="hive"] .request-kind-secret {
+  background: var(--red-bg);
+  color: var(--red);
+}
+html[data-theme^="hive"] .request-kind-input {
+  background: var(--purple-bg);
+  color: var(--purple);
+}
+html[data-theme^="hive"] .request-item-question {
+  color: var(--text);
+}
+html[data-theme^="hive"] .request-item-timing {
+  color: var(--text-tertiary);
+}
+html[data-theme^="hive"] .request-empty {
+  color: var(--text-tertiary);
+}
+
+/* ═══════════════════════════════════════
+   RECOVERY VIEW
+   ═══════════════════════════════════════ */
+html[data-theme^="hive"] .recovery-panel {
+  background: var(--bg);
+}
+html[data-theme^="hive"] .recovery-card {
+  background: var(--bg);
+  border-color: var(--border);
+  border-radius: var(--radius-lg);
+}
+html[data-theme^="hive"] .recovery-card-title {
+  color: var(--text-tertiary);
+}
+html[data-theme^="hive"] .recovery-card-body {
+  color: var(--text-secondary);
+}
+html[data-theme^="hive"] .recovery-stat-label {
+  color: var(--text-secondary);
+}
+html[data-theme^="hive"] .recovery-stat-value {
+  color: var(--text);
+}
+html[data-theme^="hive"] .recovery-task {
+  border-bottom-color: var(--border-light);
+}
+
+/* ═══════════════════════════════════════
+   CONFIRMATION DIALOG
+   ═══════════════════════════════════════ */
+html[data-theme^="hive"] .confirm-overlay {
+  background: rgba(0, 0, 0, 0.3);
+}
+html[data-theme^="hive"] .confirm-card {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.12);
+  border-radius: var(--radius-lg);
+}
+html[data-theme^="hive"] .confirm-title {
+  color: var(--text);
+}
+html[data-theme^="hive"] .confirm-message {
+  color: var(--text-secondary);
+}
+
+/* ═══════════════════════════════════════
+   INTERVIEW / POLL DIALOG
+   ═══════════════════════════════════════ */
+html[data-theme^="hive"] .interview-overlay {
+  background: rgba(0, 0, 0, 0.3);
+}
+html[data-theme^="hive"] .interview-card {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.12);
+  border-radius: var(--radius-lg);
+}
+html[data-theme^="hive"] .interview-title {
+  color: var(--text);
+}
+html[data-theme^="hive"] .interview-question {
+  color: var(--text-secondary);
+}
+html[data-theme^="hive"] .interview-phase {
+  color: var(--text-tertiary);
+}
+html[data-theme^="hive"] .interview-option {
+  background: var(--bg);
+  border-color: var(--border);
+  color: var(--text);
+  border-radius: var(--radius-md);
+}
+html[data-theme^="hive"] .interview-option:hover {
+  border-color: var(--border-dark);
+  background: var(--bg-warm);
+}
+html[data-theme^="hive"] .interview-option.selected {
+  border-color: var(--accent);
+  background: var(--accent-bg);
+}
+html[data-theme^="hive"] .interview-option-radio {
+  border-color: var(--border-dark);
+}
+html[data-theme^="hive"] .interview-text {
+  background: var(--bg);
+  border-color: var(--border-dark);
+  color: var(--text);
+  border-radius: var(--radius-md);
+}
+html[data-theme^="hive"] .interview-text:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px rgba(6, 157, 228, 0.25);
+}
+
+/* ═══════════════════════════════════════
+   AUTOCOMPLETE
+   ═══════════════════════════════════════ */
+html[data-theme^="hive"] .autocomplete {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  box-shadow: 0 -4px 16px rgba(0, 0, 0, 0.08);
+  border-radius: var(--radius-lg);
+}
+html[data-theme^="hive"] .autocomplete-item:hover,
+html[data-theme^="hive"] .autocomplete-item.selected {
+  background: var(--accent-bg);
+}
+html[data-theme^="hive"] .autocomplete-item-label {
+  color: var(--text);
+}
+html[data-theme^="hive"] .autocomplete-item-desc {
+  color: var(--text-tertiary);
+}
+
+/* ═══════════════════════════════════════
+   DISCONNECT BANNER
+   ═══════════════════════════════════════ */
+html[data-theme^="hive"] #disconnect-banner {
+  border-radius: var(--radius-md);
+  background: var(--yellow-bg);
+  border-color: var(--yellow);
+  color: var(--text);
+}
+
+/* ═══════════════════════════════════════
+   SIDEBAR – TEAM ROW
+   ═══════════════════════════════════════ */
+html[data-theme^="hive"] .sidebar-item-team {
+  padding: 8px 16px;
+  margin-top: 6px;
+}
+html[data-theme^="hive"] .sidebar-item-team i {
+  font-size: 20px;
+  color: var(--text-secondary);
+}
+
+/* ═══════════════════════════════════════
+   SIDEBAR – FLOATING CHECKLIST
+   ═══════════════════════════════════════ */
+html[data-theme^="hive"] .sidebar-checklist-float {
+  background: color-mix(in srgb, var(--bg-warm) 85%, transparent);
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+  border-top: 1px solid var(--border);
+}
+html[data-theme^="hive"] .sidebar-checklist-float .checklist-header {
+  color: var(--text);
+  font-family: var(--font-sans);
+  font-size: 13px;
+  font-weight: 600;
+}
+html[data-theme^="hive"] .sidebar-checklist-float .sidebar-btn-close {
+  color: var(--text-tertiary);
+}
+html[data-theme^="hive"] .sidebar-checklist-float .sidebar-btn-close:hover {
+  color: var(--text);
+  background: var(--hive-sidebar-hover);
+}
+
+/* ═══════════════════════════════════════
+   SIDEBAR – THEME DROPDOWN
+   ═══════════════════════════════════════ */
+html[data-theme^="hive"] .theme-dropdown {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.1);
+  border-radius: var(--radius-lg);
+}
+html[data-theme^="hive"] .theme-dropdown-item {
+  font-family: var(--font-sans);
+  font-size: 13px;
+  color: var(--text);
+  border-radius: var(--radius-sm);
+  padding: 6px 12px;
+}
+html[data-theme^="hive"] .theme-dropdown-item:hover {
+  background: var(--bg-warm);
+}
+html[data-theme^="hive"] .theme-dropdown-item.active {
+  background: var(--accent-bg);
+  color: var(--accent);
+}

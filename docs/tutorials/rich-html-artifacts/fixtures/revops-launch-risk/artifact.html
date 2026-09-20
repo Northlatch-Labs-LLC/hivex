@@ -1,0 +1,400 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>RevOps Launch Risk Room</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --paper: #f3ecdc;
+      --paper-deep: #e7dcc8;
+      --ink: #1f1912;
+      --muted: #766b5b;
+      --ms-cobalt-950: oklch(21% .034 264.665);
+      --ms-cobalt-700: oklch(48.8% .243 264.376);
+      --ms-cobalt-600: oklch(50.58% .2886 264.84);
+      --ms-cobalt-500: oklch(63.79% .1899 269.89);
+      --ms-cobalt-400: oklch(76.12% .1218 272.4);
+      --ms-cobalt-300: oklch(83.76% .0774 273.32);
+      --ms-cobalt-100: oklch(94.22% .0275 274.66);
+      --ms-cobalt-50: oklch(97.05% .0054 274.97);
+      --draw: var(--ms-cobalt-600);
+      --draw-soft: var(--ms-cobalt-100);
+      --line: #baad96;
+      --danger: #7b4038;
+      --warn: #755a28;
+      --ok: #3f5e45;
+      font-family: Georgia, "Times New Roman", serif;
+      background: var(--paper);
+      color: var(--ink);
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background:
+        radial-gradient(circle at 18% 12%, rgba(76, 58, 35, .055) 0 1px, transparent 1.2px),
+        radial-gradient(circle at 78% 64%, rgba(76, 58, 35, .04) 0 1px, transparent 1.2px),
+        linear-gradient(90deg, rgba(255, 252, 242, .42), transparent 45%, rgba(90, 70, 44, .04)),
+        var(--paper);
+      background-size: 23px 29px, 31px 37px, auto, auto;
+    }
+    main {
+      max-width: 1200px;
+      margin: 0 auto;
+      padding: 42px 34px 70px;
+    }
+    .rule {
+      height: 10px;
+      margin: 18px 0 28px;
+      border-top: 1px dotted var(--line);
+      border-bottom: 1px dotted var(--line);
+    }
+    header {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 28px;
+      align-items: start;
+    }
+    h1 {
+      margin: 58px 0 0;
+      font-size: 34px;
+      line-height: 1.02;
+      letter-spacing: 0;
+      max-width: 620px;
+    }
+    .dek {
+      max-width: 650px;
+      margin-top: 14px;
+      color: var(--ink);
+      font-size: 17px;
+      line-height: 1.55;
+    }
+    .mono, .fig, th, button, label, .metric span, .badge, .stamp {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+      letter-spacing: 0;
+    }
+    .stamp {
+      justify-self: end;
+      font-size: 12px;
+      color: var(--muted);
+      text-align: right;
+      min-width: 210px;
+      line-height: 1.35;
+    }
+    .badge {
+      color: var(--draw);
+      font-size: 15px;
+      font-weight: 800;
+      letter-spacing: .08em;
+      text-transform: uppercase;
+    }
+    .layout {
+      display: grid;
+      grid-template-columns: minmax(0, .95fr) minmax(320px, .8fr);
+      gap: 28px;
+      align-items: start;
+    }
+    section {
+      border-top: 1px solid var(--ink);
+      padding-top: 15px;
+    }
+    h2 {
+      margin: 0 0 14px;
+      font-size: 20px;
+      line-height: 1.15;
+      letter-spacing: 0;
+    }
+    p { margin: 0; line-height: 1.52; }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 14px;
+      background: rgba(255, 255, 255, .35);
+    }
+    th {
+      text-align: left;
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 700;
+      border-bottom: 1px solid var(--ink);
+      padding: 8px 7px;
+    }
+    td {
+      border-bottom: 1px dotted var(--line);
+      padding: 10px 7px;
+      vertical-align: top;
+      line-height: 1.42;
+    }
+    tr:last-child td { border-bottom: 0; }
+    .risk { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; font-weight: 800; }
+    .risk.high { color: var(--danger); }
+    .risk.med { color: var(--warn); }
+    .risk.low { color: var(--ok); }
+    .figure {
+      position: relative;
+      margin: 18px 0;
+      padding: 18px;
+      min-height: 250px;
+      border: 1px dotted var(--line);
+      background:
+        linear-gradient(90deg, oklch(50.58% .2886 264.84 / .08) 1px, transparent 1px),
+        linear-gradient(oklch(50.58% .2886 264.84 / .08) 1px, transparent 1px),
+        var(--ms-cobalt-50);
+      background-size: 8px 8px;
+    }
+    .fig {
+      color: var(--muted);
+      font-size: 11px;
+      writing-mode: vertical-rl;
+      position: absolute;
+      top: 16px;
+      left: 8px;
+    }
+    .equation {
+      margin-top: 10px;
+      color: var(--muted);
+      font-size: 14px;
+      font-style: italic;
+      text-align: right;
+    }
+    svg {
+      display: block;
+      width: 100%;
+      height: auto;
+    }
+    .owner-load {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 10px;
+      margin-top: 14px;
+    }
+    .owner {
+      min-height: 108px;
+      border: 1px dotted var(--line);
+      background: rgba(255, 255, 255, .34);
+      padding: 11px;
+    }
+    .owner strong { display: block; margin-bottom: 8px; }
+    .bar {
+      height: 9px;
+      border: 1px solid var(--draw);
+      background: transparent;
+      overflow: hidden;
+      margin-bottom: 10px;
+    }
+    .bar span { display: block; height: 100%; background: var(--draw); }
+    .controls { display: grid; gap: 14px; }
+    .control { display: grid; gap: 7px; }
+    label {
+      font-size: 12px;
+      color: var(--muted);
+    }
+    input[type="range"] {
+      width: 100%;
+      accent-color: var(--draw);
+    }
+    .score {
+      display: grid;
+      grid-template-columns: 122px 1fr;
+      gap: 16px;
+      align-items: center;
+      margin: 20px 0;
+    }
+    .dial {
+      width: 112px;
+      height: 112px;
+      border: 1px solid var(--draw);
+      display: grid;
+      place-items: center;
+      background:
+        conic-gradient(var(--draw) var(--score, 56%), var(--ms-cobalt-100) 0);
+      color: var(--draw);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+      font-size: 32px;
+      font-weight: 800;
+    }
+    .decision {
+      border-left: 2px solid var(--draw);
+      padding-left: 14px;
+    }
+    .decision strong { display: block; margin-bottom: 6px; }
+    button {
+      border: 1px solid var(--draw);
+      background: transparent;
+      color: var(--draw);
+      min-height: 36px;
+      padding: 8px 12px;
+      font-weight: 800;
+      cursor: pointer;
+    }
+    button:hover { background: var(--draw); color: var(--paper); }
+    pre {
+      white-space: pre-wrap;
+      border: 1px dotted var(--line);
+      background: rgba(255, 255, 255, .42);
+      color: var(--ink);
+      padding: 14px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+      font-size: 13px;
+      line-height: 1.45;
+      overflow: auto;
+    }
+    @media (max-width: 850px) {
+      main { padding: 20px 16px 32px; }
+      header, .layout, .score { grid-template-columns: 1fr; }
+      .stamp { justify-self: start; text-align: left; }
+      .owner-load { grid-template-columns: 1fr; }
+      h1 { font-size: 34px; }
+      .fig { writing-mode: horizontal-tb; position: static; margin-bottom: 8px; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <div>
+        <div class="badge">hivebot ARTIFACT</div>
+        <h1>Launch Risk Room</h1>
+        <p class="dek">Compare blockers, owner load, and mitigation options before moving the GTM plan from planning into execution.</p>
+      </div>
+      <div class="stamp">
+        A hivebot manual artifact for reviewing launch readiness.<br>
+        Source: bots/revops-bot/notebook<br>
+        Trust: draft
+      </div>
+    </header>
+    <div class="rule" aria-hidden="true"></div>
+
+    <div class="layout">
+      <section>
+        <h2>Blocker Matrix</h2>
+        <table>
+          <thead>
+            <tr><th>Blocker</th><th>Owner</th><th>Risk</th><th>Mitigation</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Pricing approval</td>
+              <td>Finance</td>
+              <td class="risk high">High</td>
+              <td>Lock fallback packaging by EOD.</td>
+            </tr>
+            <tr>
+              <td>Support screenshots</td>
+              <td>Support</td>
+              <td class="risk med">Medium</td>
+              <td>Refresh the checkout playbook with new states.</td>
+            </tr>
+            <tr>
+              <td>Enterprise confidence story</td>
+              <td>Sales</td>
+              <td class="risk med">Medium</td>
+              <td>Draft the account-specific objection narrative.</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <div class="figure">
+          <div class="fig">FIG_002 [ OWNER LOAD MAP ]</div>
+          <svg viewBox="0 0 720 260" role="img" aria-label="Owner load map">
+            <g fill="none" stroke="oklch(50.58% .2886 264.84)" stroke-width="2">
+              <rect x="78" y="52" width="155" height="84"></rect>
+              <rect x="283" y="82" width="155" height="84"></rect>
+              <rect x="488" y="112" width="155" height="84"></rect>
+              <path d="M233 94 C258 94 258 124 283 124"></path>
+              <path d="M438 124 C463 124 463 154 488 154"></path>
+              <line x1="155" y1="28" x2="155" y2="52"></line>
+              <line x1="360" y1="58" x2="360" y2="82"></line>
+              <line x1="565" y1="88" x2="565" y2="112"></line>
+            </g>
+            <g fill="oklch(48.8% .243 264.376)" font-family="ui-monospace, monospace" font-size="16">
+              <text x="105" y="98">FINANCE</text>
+              <text x="310" y="128">SUPPORT</text>
+              <text x="525" y="158">SALES</text>
+              <text x="112" y="224">approval gate</text>
+              <text x="300" y="224">visual refresh</text>
+              <text x="506" y="224">buyer proof</text>
+            </g>
+          </svg>
+          <p class="equation">R = (pricing + support gap + sales gap) / 3</p>
+        </div>
+
+        <h2>Owner load</h2>
+        <div class="owner-load" aria-label="Owner load">
+          <div class="owner"><strong>Finance</strong><div class="bar"><span style="width: 78%"></span></div><p>Approval path is the launch gate.</p></div>
+          <div class="owner"><strong>Support</strong><div class="bar"><span style="width: 44%"></span></div><p>Visual refresh is bounded.</p></div>
+          <div class="owner"><strong>Sales</strong><div class="bar"><span style="width: 63%"></span></div><p>Buyer narrative still needs proof.</p></div>
+        </div>
+      </section>
+
+      <section>
+        <h2>Risk Tuning</h2>
+        <div class="controls">
+          <div class="control">
+            <label for="pricing">IN: pricing severity</label>
+            <input id="pricing" type="range" min="0" max="100" value="82">
+          </div>
+          <div class="control">
+            <label for="support">IN: support readiness</label>
+            <input id="support" type="range" min="0" max="100" value="58">
+          </div>
+          <div class="control">
+            <label for="sales">IN: sales confidence</label>
+            <input id="sales" type="range" min="0" max="100" value="64">
+          </div>
+        </div>
+        <div class="score">
+          <div id="dial" class="dial" style="--score: 68%" aria-live="polite" aria-atomic="true">68</div>
+          <div class="decision">
+            <strong id="decisionTitle" aria-live="polite">Hold for mitigation</strong>
+            <p id="decisionCopy" aria-live="polite">Launch can proceed only after pricing has an approved fallback.</p>
+          </div>
+        </div>
+        <button type="button" id="copy">Copy mitigation prompt</button>
+        <pre id="prompt">Assign Finance to close pricing fallback, Support to refresh screenshots, and Sales to prepare the enterprise confidence story.</pre>
+      </section>
+    </div>
+  </main>
+  <script>
+    const fields = ["pricing", "support", "sales"].map((id) => document.getElementById(id));
+    const dial = document.getElementById("dial");
+    const decisionTitle = document.getElementById("decisionTitle");
+    const decisionCopy = document.getElementById("decisionCopy");
+    const prompt = document.getElementById("prompt");
+    const copy = document.getElementById("copy");
+
+    function render() {
+      const pricing = Number(fields[0].value);
+      const supportGap = 100 - Number(fields[1].value);
+      const salesGap = 100 - Number(fields[2].value);
+      const score = Math.round((pricing + supportGap + salesGap) / 3);
+      dial.textContent = String(score);
+      dial.style.setProperty("--score", `${score}%`);
+      if (score >= 67) {
+        decisionTitle.textContent = "Hold for mitigation";
+        decisionCopy.textContent = "Launch needs an explicit fallback owner before the team commits.";
+      } else if (score >= 40) {
+        decisionTitle.textContent = "Launch with watchpoints";
+        decisionCopy.textContent = "Proceed only with same-day owner check-ins and a rollback message.";
+      } else {
+        decisionTitle.textContent = "Launch is ready";
+        decisionCopy.textContent = "Remaining risk is low enough for the planned launch window.";
+      }
+      prompt.textContent = `Launch risk score ${score}. Assign Finance to close pricing fallback, Support to refresh screenshots, and Sales to prepare the enterprise confidence story.`;
+    }
+
+    for (const field of fields) field.addEventListener("input", render);
+    copy.addEventListener("click", async () => {
+      try {
+        await navigator.clipboard.writeText(prompt.textContent);
+        copy.textContent = "Copied";
+      } catch {
+        copy.textContent = "Clipboard unavailable";
+      }
+      window.setTimeout(() => { copy.textContent = "Copy mitigation prompt"; }, 1200);
+    });
+    render();
+  </script>
+</body>
+</html>

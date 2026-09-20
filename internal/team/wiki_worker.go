@@ -1,0 +1,1182 @@
+package team
+
+// wiki_worker.go hosts the single-goroutine write queue for the team wiki.
+//
+// Data flow
+// =========
+//
+//	MCP handler (any goroutine)
+//	        │
+//	        │ Enqueue(ctx, req{Slug,Path,Content,Mode,Msg,ReplyCh})
+//	        ▼
+//	┌──────────────────────────┐
+//	│  wikiRequests chan (64)  │   buffered; fail-fast on full
+//	└──────────┬───────────────┘
+//	           │
+//	           ▼
+//	   worker goroutine (drain loop)
+//	           │
+//	           │ repo.Commit(slug, path, content, mode, msg)
+//	           │ repo.IndexRegen(ctx)
+//	           │ reply via req.ReplyCh
+//	           │ publishWikiEventLocked(payload)   ─► SSE "wiki:write"
+//	           │ async debounced BackupMirror      ─► ~/.hivex/wiki.bak/
+//	           ▼
+//	       next request
+//
+// Channel-serialized by design; no sync.Mutex around the hot path — the repo
+// goroutine is the only writer. Timeout is enforced per-request.
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"log"
+	"path/filepath"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
+// ErrQueueSaturated is returned by Enqueue when the buffered request channel
+// is full. Callers (MCP handlers) should surface this to the bot as
+// "wiki queue saturated, retry on next turn" — no hidden retries.
+var ErrQueueSaturated = errors.New("wiki: queue saturated, retry on next turn")
+
+// ErrWorkerStopped is returned when Enqueue is called after the worker has
+// been stopped (context cancelled).
+var ErrWorkerStopped = errors.New("wiki: worker is not running")
+
+// wikiRequestBuffer is the channel buffer size. Kept as a package-level const
+// so regression tests can assert against it without touching the struct.
+const wikiRequestBuffer = 64
+
+// wikiWriteTimeout bounds each commit+index+reply round-trip.
+const wikiWriteTimeout = 10 * time.Second
+
+// wikiBackupDebounce avoids redundant mirror copies under burst load.
+const wikiBackupDebounce = 2 * time.Second
+
+// wikiWriteEvent is the SSE payload broadcast on every successful commit.
+// No article content is included — the UI re-fetches via the read API.
+type wikiWriteEvent struct {
+	Path       string `json:"path"`
+	CommitSHA  string `json:"commit_sha"`
+	AuthorSlug string `json:"author_slug"`
+	Timestamp  string `json:"timestamp"`
+}
+
+// wikiWriteRequest carries a single write off the MCP handler goroutine onto
+// the worker. The reply channel is single-use and buffered to 1 so the
+// worker can always send without blocking even if the caller's context dies.
+type wikiWriteRequest struct {
+	Context   context.Context
+	Slug      string
+	Path      string
+	Content   string
+	Mode      string
+	CommitMsg string
+	// IsEntityFact routes the request to Repo.CommitEntityFact. Used for
+	// the v1.2 append-only fact log at team/entities/{kind}-{slug}.facts.jsonl
+	// — same serialization primitive, non-.md extension, no index regen.
+	IsEntityFact bool
+	// IsEntityGraph routes the request to Repo.CommitEntityGraph. Used for
+	// the cross-entity adjacency log at team/entities/.graph.jsonl.
+	// Same serialization primitive as IsEntityFact — non-.md extension,
+	// no wiki-index regen, no backlinks recompute.
+	IsEntityGraph bool
+	// IsPlaybookCompile routes to Repo.CommitPlaybookSkill — writes the
+	// compiled SKILL.md under team/playbooks/.compiled/{slug}/ without
+	// regenerating the catalog. v1.3 compounding-intelligence compiler.
+	IsPlaybookCompile bool
+	// IsPlaybookExecution routes to Repo.CommitPlaybookExecution — appends
+	// to team/playbooks/{slug}.executions.jsonl. Same append-only semantics
+	// as entity facts.
+	IsPlaybookExecution bool
+	// IsTeamLearning routes to Repo.CommitTeamLearnings — writes the
+	// append-only JSONL source plus a generated markdown page visible in
+	// the wiki catalog.
+	IsTeamLearning bool
+	LearningPage   string
+	// PlaybookSlug carries the source slug so the post-write hook can
+	// enqueue a follow-up recompile without re-parsing the path.
+	PlaybookSlug string
+	// IsLintReport routes to Repo.CommitLintReport — writes the daily lint
+	// report to wiki/.lint/report-YYYY-MM-DD.md. Same serialization as entity
+	// facts; no team-wiki index regen, no backlinks recompute.
+	IsLintReport bool
+	// IsFactLog routes to Repo.CommitFactLog — mutates a fact record in
+	// wiki/facts/**/*.jsonl or team/entities/*.facts.jsonl (used by lint
+	// ResolveContradiction to update supersedes/valid_until/contradicts_with).
+	IsFactLog bool
+	// IsFactLogAppend routes to Repo.AppendFactLog — append-only writes to
+	// wiki/facts/**/*.jsonl. Used by the extractor to close the substrate
+	// guarantee (§7.4): every successfully-submitted fact lands in markdown
+	// so a wipe + reconcile rebuilds to a logically-identical index.
+	IsFactLogAppend         bool
+	IsArtifact              bool
+	IsRichArtifact          bool
+	IsRichArtifactPromotion bool
+	RichArtifact            wikiRichArtifactWork
+	// IsIndexMutation is a non-git job: the worker applies the carried facts
+	// and entities directly to the WikiIndex (store + text index). Preserves
+	// the single-writer invariant required by the extractor (§11.5).
+	IsIndexMutation bool
+	// IndexFacts    carries the facts to Upsert when IsIndexMutation is true.
+	IndexFacts []TypedFact
+	// IndexEntities carries the entities to Upsert when IsIndexMutation is
+	// true. Entities are upserted BEFORE facts so fact rows always resolve
+	// against a known entity row.
+	IndexEntities []IndexEntity
+	// IsHuman routes the request to Repo.CommitHuman — optimistic
+	// concurrency via expected_sha, per-human git identity. Wikipedia-
+	// style Edit source flow. v1.5: identity is resolved from the
+	// HumanIdentityRegistry rather than being hard-coded.
+	IsHuman bool
+	// IsArchiveSweep routes WikiArchiver.Sweep through the same drain loop as
+	// ordinary wiki writes. Sweep may perform many commits, so it uses the
+	// request context directly rather than wikiWriteTimeout.
+	IsArchiveSweep bool
+	ArchiveReadLog *ReadLog
+	ArchiveMinAge  time.Duration
+	// ExpectedSHA is consulted by the human write path. Empty means the
+	// caller expects the article not to exist yet (new-article flow).
+	ExpectedSHA string
+	// HumanIdentity carries the per-human git identity used when
+	// IsHuman is true. Zero value falls back to the synthetic
+	// `human <human@hivex.local>` author.
+	HumanIdentity HumanIdentity
+	ReplyCh       chan wikiWriteResult
+}
+
+// wikiWriteResult is the worker's reply for a single request.
+type wikiWriteResult struct {
+	SHA          string
+	BytesWritten int
+	SweepResult  SweepResult
+	RichArtifact RichArtifact
+	Err          error
+}
+
+// wikiEventPublisher is the subset of Broker the worker needs. Having it as
+// an interface keeps the worker testable without spinning up an HTTP server.
+type wikiEventPublisher interface {
+	PublishWikiEvent(evt wikiWriteEvent)
+}
+
+// wikiSectionsNotifier is the optional hook the worker pokes on every
+// successful wiki write so the sections cache can debounce + recompute.
+// Kept as its own interface so wiki_worker.go doesn't take a hard
+// dependency on the sections cache (which lives in wiki_sections.go).
+type wikiSectionsNotifier interface {
+	EnqueueSectionsRefresh()
+}
+
+// noopPublisher is used when the worker runs without a broker attached
+// (tests, or --memory-backend markdown without a broker yet).
+type noopPublisher struct{}
+
+func (noopPublisher) PublishWikiEvent(wikiWriteEvent) {}
+func (noopPublisher) PublishPlaybookExecutionRecorded(PlaybookExecutionRecordedEvent) {
+}
+
+// WikiWorker owns the single goroutine that drains the write request queue.
+type WikiWorker struct {
+	repo      *Repo
+	publisher wikiEventPublisher
+	index     *WikiIndex // optional derived cache; nil means no-op
+	requests  chan wikiWriteRequest
+
+	running       atomic.Bool
+	mu            sync.Mutex // guards lastBackupAt + extractor
+	lastBackupAt  time.Time
+	backupPending atomic.Bool
+	// extractor is the optional hook fired on successful artifact commits.
+	// nil is the default — no extraction occurs until broker wires it up.
+	extractor ExtractorHook
+	// sourceCaptureHook fires off-lock (on the drain goroutine) after a
+	// successful playbook-skill compile or team-learnings commit, so the
+	// committed markdown body can be snapshotted into the immutable source
+	// layer (kind=note). nil is the default — no capture until broker wires
+	// it up. Guarded by mu, like extractor.
+	sourceCaptureHook SourceCaptureHook
+
+	// sideGoroutines tracks async helpers (e.g. auto-recompile, backup
+	// mirror) spawned from the drain loop so Stop() and WaitForIdle() can
+	// block until they finish — essential for tests on Linux where
+	// t.TempDir() cleanup otherwise races in-flight repo writes.
+	sideGoroutines sync.WaitGroup
+
+	// drainDone closes when the drain goroutine has fully exited (including
+	// its own sideGoroutines.Wait). Tests register `t.Cleanup(func() {
+	// cancel(); <-worker.Done() })` so tempdir removal is deterministic.
+	drainDone chan struct{}
+
+	// lastStandardWrite folds byte-identical consecutive standard wiki
+	// writes per path (B4 knowledge-integrity: no commit storms — "173
+	// revisions on a minutes-old article"). Keyed by rel path; only the
+	// drain goroutine touches it, so no lock is needed.
+	lastStandardWrite map[string]foldedWrite
+}
+
+// foldedWrite is the drain loop's memo of the most recent standard wiki
+// write per path, used to fold byte-identical repeats into a no-op reply.
+type foldedWrite struct {
+	Mode        string
+	ContentHash string
+	SHA         string
+}
+
+// contentHashForFold keys the B4 fold: same mode + same bytes = same write.
+func contentHashForFold(mode, content string) string {
+	sum := sha256.Sum256([]byte(mode + "\x00" + content))
+	return hex.EncodeToString(sum[:])
+}
+
+// NewWikiWorker returns a worker ready to Start. The publisher is optional;
+// when nil, events are dropped silently. The worker's index is nil — no
+// derived-cache updates occur. Use NewWikiWorkerWithIndex when an index is
+// available (production path).
+func NewWikiWorker(repo *Repo, publisher wikiEventPublisher) *WikiWorker {
+	if publisher == nil {
+		publisher = noopPublisher{}
+	}
+	return &WikiWorker{
+		repo:      repo,
+		publisher: publisher,
+		requests:  make(chan wikiWriteRequest, wikiRequestBuffer),
+		drainDone: make(chan struct{}),
+	}
+}
+
+// NewWikiWorkerWithIndex is the production constructor. It behaves identically
+// to NewWikiWorker but additionally wires up a WikiIndex so that after every
+// successful commit the worker reconciles the affected path into the derived
+// cache (SQLite+bleve in prod, in-memory for tests). The index update runs in
+// a side goroutine tracked by sideGoroutines — WaitForIdle() covers it.
+func NewWikiWorkerWithIndex(repo *Repo, publisher wikiEventPublisher, index *WikiIndex) *WikiWorker {
+	w := NewWikiWorker(repo, publisher)
+	w.index = index
+	return w
+}
+
+// Start launches the drain goroutine. Returns immediately. The worker stops
+// when ctx is cancelled.
+func (w *WikiWorker) Start(ctx context.Context) {
+	if w.running.Swap(true) {
+		return // already running
+	}
+	go w.drain(ctx)
+}
+
+// Stop is a test helper that closes the request channel so the drain loop
+// returns. Production code should cancel the context passed to Start instead.
+//
+// Ordering matters: mark as stopped → wait for any in-flight side
+// goroutines (e.g. auto-recompile helpers that take the queue) → close
+// the channel. Without the wait, a recompile goroutine can attempt to
+// send on a closed channel and panic.
+func (w *WikiWorker) Stop() {
+	if !w.running.Swap(false) {
+		return
+	}
+	w.sideGoroutines.Wait()
+	close(w.requests)
+}
+
+// Enqueue submits a write request to the worker and blocks (up to
+// wikiWriteTimeout) for the reply. Returns ErrQueueSaturated if the queue is
+// full — callers should surface this as a tool error with no hidden retry.
+func (w *WikiWorker) Enqueue(ctx context.Context, slug, path, content, mode, commitMsg string) (string, int, error) {
+	if !w.running.Load() {
+		return "", 0, ErrWorkerStopped
+	}
+	req := wikiWriteRequest{
+		Slug:      slug,
+		Path:      path,
+		Content:   content,
+		Mode:      mode,
+		CommitMsg: commitMsg,
+		ReplyCh:   make(chan wikiWriteResult, 1),
+	}
+	select {
+	case w.requests <- req:
+	default:
+		return "", 0, ErrQueueSaturated
+	}
+	waitCtx, cancel := context.WithTimeout(ctx, wikiWriteTimeout)
+	defer cancel()
+	select {
+	case result := <-req.ReplyCh:
+		return result.SHA, result.BytesWritten, result.Err
+	case <-waitCtx.Done():
+		return "", 0, fmt.Errorf("wiki: write timed out after %s", wikiWriteTimeout)
+	}
+}
+
+// drain is the single worker goroutine. It runs exactly one request at a time.
+func (w *WikiWorker) drain(ctx context.Context) {
+	defer close(w.drainDone)
+	defer w.running.Store(false)
+	// Wait for detached helpers (auto-recompile, backup mirror) before the
+	// drain goroutine returns so test harnesses that cancel the context see
+	// a quiesced worker — otherwise background writes to the repo can race
+	// t.TempDir() cleanup.
+	defer w.sideGoroutines.Wait()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case req, ok := <-w.requests:
+			if !ok {
+				return
+			}
+			w.process(ctx, req)
+		}
+	}
+}
+
+// process handles one request end-to-end: commit → index → reply → event →
+// async backup. It never panics; all errors are surfaced via req.ReplyCh.
+func (w *WikiWorker) process(ctx context.Context, req wikiWriteRequest) {
+	// Commit under a write-scoped context so a slow git exec cannot hang
+	// the whole worker forever.
+	baseCtx := ctx
+	if req.Context != nil {
+		baseCtx = req.Context
+	}
+	if req.IsArchiveSweep {
+		archiver := NewWikiArchiver(w.repo, req.ArchiveReadLog, req.ArchiveMinAge)
+		result, err := archiver.Sweep(baseCtx)
+		if err == nil || archiveSweepHasPartialResult(result) {
+			w.notifyArchived(baseCtx, result.ArchivedPaths)
+		}
+		req.ReplyCh <- wikiWriteResult{SweepResult: result, Err: err}
+		return
+	}
+	writeCtx, cancel := context.WithTimeout(baseCtx, wikiWriteTimeout)
+	defer cancel()
+
+	var (
+		sha string
+		n   int
+		err error
+	)
+	if req.IsIndexMutation {
+		// Apply index writes under the single-writer invariant. The underlying
+		// store is goroutine-safe, but routing through the worker's drain loop
+		// prevents reordering vs. commit-driven ReconcilePath calls for the
+		// same artifact/fact.
+		mutErr := w.applyIndexMutation(writeCtx, req)
+		req.ReplyCh <- wikiWriteResult{Err: mutErr}
+		return
+	}
+	if req.IsHuman {
+		// Human edits use optimistic concurrency (expected_sha) and the
+		// per-human identity resolved from the registry — req.Slug is
+		// ignored on this branch to prevent a caller from forging
+		// attribution. Zero-value HumanIdentity falls back to the
+		// synthetic `human` author inside CommitHuman.
+		sha, n, err = w.repo.CommitHuman(writeCtx, req.Path, req.Content, req.ExpectedSHA, req.CommitMsg, req.HumanIdentity)
+	} else if req.IsArtifact {
+		sha, n, err = w.repo.CommitArtifact(writeCtx, req.Slug, req.Path, req.Content, req.CommitMsg)
+	} else if req.IsRichArtifact || req.IsRichArtifactPromotion {
+		// processRichArtifactRequest may mutate the artifact (e.g. attach a
+		// freshly-derived notebook home on create) before returning it, so
+		// the worker overwrites req.RichArtifact.Artifact with the result.
+		req.RichArtifact.Artifact, sha, n, err = w.processRichArtifactRequest(writeCtx, req)
+	} else if req.IsEntityFact {
+		sha, n, err = w.repo.CommitEntityFact(writeCtx, req.Slug, req.Path, req.Content, req.CommitMsg)
+	} else if req.IsEntityGraph {
+		sha, n, err = w.repo.CommitEntityGraph(writeCtx, req.Slug, req.Content, req.CommitMsg)
+	} else if req.IsPlaybookCompile {
+		sha, n, err = w.repo.CommitPlaybookSkill(writeCtx, req.Slug, req.Path, req.Content, req.CommitMsg)
+	} else if req.IsPlaybookExecution {
+		sha, n, err = w.repo.CommitPlaybookExecution(writeCtx, req.Slug, req.Path, req.Content, req.CommitMsg)
+	} else if req.IsTeamLearning {
+		if err = writeCtx.Err(); err == nil {
+			sha, n, err = w.repo.CommitTeamLearnings(writeCtx, req.Slug, req.Path, req.Content, req.LearningPage, req.CommitMsg)
+		}
+	} else if req.IsLintReport {
+		sha, n, err = w.repo.CommitLintReport(writeCtx, req.Slug, req.Path, req.Content, req.CommitMsg)
+	} else if req.IsFactLog {
+		sha, n, err = w.repo.CommitFactLog(writeCtx, req.Slug, req.Path, req.Content, req.CommitMsg)
+	} else if req.IsFactLogAppend {
+		sha, n, err = w.repo.AppendFactLog(writeCtx, req.Slug, req.Path, req.Content, req.CommitMsg)
+	} else {
+		// B2 update-first (wiki_update_first.go): a bot create whose
+		// target directory already holds a similar-slug article is rerouted
+		// to append onto the existing file — update, never duplicate. The
+		// rerouted path/mode are written back onto req so the event fan-out
+		// and index reconcile below see the file that actually changed.
+		req.Path, req.Mode = routeBotCreateToSimilarSlug(w.repo.Root(), req.Slug, req.Path, req.Mode)
+		// B4 coalesce: a byte-identical consecutive write to the same path
+		// folds into the previous commit instead of committing again.
+		foldKey := contentHashForFold(req.Mode, req.Content)
+		if prev, ok := w.lastStandardWrite[req.Path]; ok && prev.Mode == req.Mode && prev.ContentHash == foldKey {
+			req.ReplyCh <- wikiWriteResult{SHA: prev.SHA, BytesWritten: len(req.Content)}
+			return
+		}
+		// Wiki Commit owns the full atomic unit: write article bytes, regen
+		// the catalog, stage both, commit together. That keeps the working
+		// tree clean and the index commit attributable to the same author as
+		// the article edit. No post-commit IndexRegen here.
+		sha, n, err = w.repo.Commit(writeCtx, req.Slug, req.Path, req.Content, req.Mode, req.CommitMsg)
+		if err == nil {
+			if w.lastStandardWrite == nil {
+				w.lastStandardWrite = make(map[string]foldedWrite)
+			}
+			w.lastStandardWrite[req.Path] = foldedWrite{Mode: req.Mode, ContentHash: foldKey, SHA: sha}
+		}
+	}
+	if err != nil {
+		// On ErrWikiSHAMismatch the human path returns the current HEAD
+		// SHA alongside the error so callers can surface 409 bodies
+		// without a second round trip. For all other errors `sha` is
+		// empty and carrying it is a harmless no-op.
+		req.ReplyCh <- wikiWriteResult{SHA: sha, RichArtifact: req.RichArtifact.Artifact, Err: err}
+		return
+	}
+	// Reply is sent at the end of process() so every sideGoroutines.Add(1)
+	// from the event fan-out below has landed before the caller unblocks.
+	// Tests that call WaitForIdle() right after Enqueue can then see a
+	// consistent WaitGroup counter — without this ordering, the backup
+	// mirror goroutine could still be spawning while t.TempDir() cleanup
+	// races it.
+	defer func() {
+		req.ReplyCh <- wikiWriteResult{SHA: sha, BytesWritten: n, RichArtifact: req.RichArtifact.Artifact}
+	}()
+
+	ts := time.Now().UTC().Format(time.RFC3339)
+	reconcilePath := req.Path
+	switch {
+	case req.IsArtifact:
+		// Artifact commits fire the extractor hook asynchronously. Every
+		// failure lands in the DLQ — the commit itself is already durable.
+		w.maybeRunExtractor(ctx, req.Path)
+	case req.IsRichArtifact, req.IsEntityFact:
+	case req.IsEntityGraph:
+		// Graph log appends are internal bookkeeping triggered by fact
+		// writes — no dedicated SSE event. Subscribers that care hear
+		// entity:fact_recorded + refetch the graph read API.
+	case req.IsPlaybookCompile:
+		// Compile writes are internal — no SSE event. The trigger (the
+		// source-article commit) already published wiki:write; emitting a
+		// second event for the compiled skill would double-count in the
+		// feed for callers that don't care about the hidden directory.
+		// S2 feeder 4: snapshot the compiled playbook into the source layer
+		// (kind=note). Origin/Title = playbook slug; content-hash id versions
+		// distinct compiles while folding identical recompiles to a no-op.
+		if slug := strings.TrimSpace(req.PlaybookSlug); slug != "" {
+			w.fireSourceCaptureHook(SourceCaptureJob{
+				Kind:       SourceKindNote,
+				ID:         DeriveSourceID(SourceKindNote, "", slug, req.Content),
+				Title:      slug,
+				Origin:     slug,
+				Content:    req.Content,
+				CapturedAt: time.Now().UTC(),
+			})
+		}
+	case req.IsPlaybookExecution:
+		if pbPub, ok := w.publisher.(playbookEventPublisher); ok {
+			pbPub.PublishPlaybookExecutionRecorded(PlaybookExecutionRecordedEvent{
+				Slug:       req.PlaybookSlug,
+				Path:       req.Path,
+				CommitSHA:  sha,
+				RecordedBy: req.Slug,
+				Timestamp:  ts,
+			})
+		}
+	case req.IsTeamLearning:
+		reconcilePath = TeamLearningsPagePath
+		w.publisher.PublishWikiEvent(wikiWriteEvent{
+			Path:       TeamLearningsPagePath,
+			CommitSHA:  sha,
+			AuthorSlug: req.Slug,
+			Timestamp:  ts,
+		})
+		if notifier, ok := w.publisher.(wikiSectionsNotifier); ok {
+			notifier.EnqueueSectionsRefresh()
+		}
+		// S2 feeder 4: snapshot the regenerated team-learnings page into the
+		// source layer (kind=note). The page is cumulative, so a content-hash
+		// id captures each distinct version while deduping identical writes.
+		if page := strings.TrimSpace(req.LearningPage); page != "" {
+			w.fireSourceCaptureHook(SourceCaptureJob{
+				Kind:       SourceKindNote,
+				ID:         DeriveSourceID(SourceKindNote, "", teamLearningsSourceTitle, req.LearningPage),
+				Title:      teamLearningsSourceTitle,
+				Origin:     teamLearningsSourceOrigin,
+				Content:    req.LearningPage,
+				CapturedAt: time.Now().UTC(),
+			})
+		}
+	default:
+		w.publisher.PublishWikiEvent(wikiWriteEvent{
+			Path:       req.Path,
+			CommitSHA:  sha,
+			AuthorSlug: req.Slug,
+			Timestamp:  ts,
+		})
+		// Poke the sections cache so it debounces + recomputes. Only
+		// fired on team wiki writes — notebook + entity-fact writes
+		// never change the sidebar IA.
+		if notifier, ok := w.publisher.(wikiSectionsNotifier); ok {
+			notifier.EnqueueSectionsRefresh()
+		}
+		// Auto-recompile trigger: a standard wiki write to team/playbooks/{slug}.md
+		// should kick off a compile. We do it in a side goroutine so the
+		// current request's drain slot is released before the recompile job
+		// tries to enter the queue — the queue is single-reader, so doing
+		// it inline would deadlock on a full buffer.
+		if slug, ok := PlaybookSlugFromPath(req.Path); ok {
+			w.sideGoroutines.Add(1)
+			go func(slug, authorSlug string) {
+				defer w.sideGoroutines.Done()
+				if !w.running.Load() {
+					return
+				}
+				bgCtx, cancel := context.WithTimeout(context.Background(), wikiWriteTimeout*2)
+				defer cancel()
+				if _, _, err := w.EnqueuePlaybookCompile(bgCtx, slug, authorSlug); err != nil {
+					log.Printf("playbook: auto-recompile %s failed: %v", slug, err)
+				}
+			}(slug, req.Slug)
+		}
+	}
+
+	w.maybeScheduleBackup(ctx)
+	w.maybeReconcileIndex(writeCtx, reconcilePath)
+}
+
+// maybeReconcileIndex updates the derived WikiIndex for the committed path.
+// It is a no-op when no index is wired (w.index == nil), so existing tests
+// that construct workers without an index are unaffected.
+//
+// The update runs in a tracked side goroutine so it never blocks the commit
+// reply to the caller. On error the failure is logged but does NOT propagate
+// — markdown is the source of truth; the index is a rebuildable cache (§7.4).
+func (w *WikiWorker) maybeReconcileIndex(ctx context.Context, relPath string) {
+	if w.index == nil || strings.TrimSpace(relPath) == "" {
+		return
+	}
+	w.sideGoroutines.Add(1)
+	go func() {
+		defer w.sideGoroutines.Done()
+		bgCtx, cancel := context.WithTimeout(context.Background(), wikiWriteTimeout)
+		defer cancel()
+		if err := w.index.ReconcilePath(bgCtx, relPath); err != nil {
+			log.Printf("wiki_index: reconcile %s failed: %v", relPath, err)
+		}
+	}()
+}
+
+// maybeScheduleBackup kicks off a debounced backup mirror. The copy runs in
+// its own goroutine and does NOT block the worker. If another backup is
+// already pending within wikiBackupDebounce, this call is a no-op.
+func (w *WikiWorker) maybeScheduleBackup(ctx context.Context) {
+	w.mu.Lock()
+	since := time.Since(w.lastBackupAt)
+	w.mu.Unlock()
+	if since < wikiBackupDebounce {
+		return
+	}
+	if !w.backupPending.CompareAndSwap(false, true) {
+		return
+	}
+	// Track on sideGoroutines so Stop() waits for the backup copy to finish.
+	// Without this, the copy can outlive the test's TempDir and race the
+	// filesystem cleanup, producing flaky "directory not empty" errors.
+	w.sideGoroutines.Add(1)
+	go func() {
+		defer w.sideGoroutines.Done()
+		defer w.backupPending.Store(false)
+		bgCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		_ = bgCtx // reserved for future cancellation hooks
+		if err := w.repo.BackupMirror(bgCtx); err != nil {
+			log.Printf("wiki: backup mirror failed: %v", err)
+			return
+		}
+		w.mu.Lock()
+		w.lastBackupAt = time.Now()
+		w.mu.Unlock()
+	}()
+}
+
+// QueueLength returns the current number of pending requests. Useful for
+// diagnostics and tests.
+func (w *WikiWorker) QueueLength() int {
+	return len(w.requests)
+}
+
+// WaitForIdle blocks until every detached side goroutine spawned by the
+// worker (auto-recompile, backup mirror) has finished. Tests register this
+// via t.Cleanup so t.TempDir() RemoveAll does not race in-flight background
+// writes into wiki.bak/ — the symptom is "directory not empty" or
+// "no such file or directory" cleanup errors on Linux CI.
+//
+// Safe to call after ctx cancellation: the side-goroutine WaitGroup is
+// independent of drain lifecycle.
+func (w *WikiWorker) WaitForIdle() {
+	w.sideGoroutines.Wait()
+}
+
+// Done returns a channel that closes when the drain goroutine has fully
+// exited — including its wait on side goroutines. Tests that started the
+// worker with a cancellable context should `<-worker.Done()` after the
+// cancel so drain's in-flight repo writes settle before t.TempDir()
+// removal.
+func (w *WikiWorker) Done() <-chan struct{} {
+	return w.drainDone
+}
+
+// EnqueueHuman submits a human-authored wiki write to the shared single-
+// writer queue with the legacy fallback identity. Retained for backward
+// compatibility with tests and call sites that predate v1.5's
+// per-human identity registry; prefer EnqueueHumanAs for new code.
+func (w *WikiWorker) EnqueueHuman(ctx context.Context, path, content, commitMsg, expectedSHA string) (string, int, error) {
+	return w.EnqueueHumanAs(ctx, HumanIdentity{}, path, content, commitMsg, expectedSHA)
+}
+
+// EnqueueHumanAs submits a human-authored wiki write to the shared
+// single-writer queue, stamping the commit with the supplied identity.
+// A zero-value identity falls back to the synthetic `human` author so
+// single-user installs keep working.
+//
+// The HTTP handler is already gated by the broker bearer token, so the
+// worker trusts the identity it is given — this is belt-and-braces
+// between two authenticated layers, not an anti-spoofing boundary.
+//
+// Returns ErrWikiSHAMismatch wrapped with the current HEAD SHA (in the
+// SHA return slot) when expected_sha does not match; callers pass that
+// back to the client so the 409 prompt can reload the latest content.
+func (w *WikiWorker) EnqueueHumanAs(ctx context.Context, id HumanIdentity, path, content, commitMsg, expectedSHA string) (string, int, error) {
+	if !w.running.Load() {
+		return "", 0, ErrWorkerStopped
+	}
+	slug := strings.TrimSpace(id.Slug)
+	if slug == "" {
+		slug = HumanAuthor
+	}
+	req := wikiWriteRequest{
+		Slug:          slug,
+		Path:          path,
+		Content:       content,
+		Mode:          "replace",
+		CommitMsg:     commitMsg,
+		IsHuman:       true,
+		ExpectedSHA:   expectedSHA,
+		HumanIdentity: id,
+		ReplyCh:       make(chan wikiWriteResult, 1),
+	}
+	select {
+	case w.requests <- req:
+	default:
+		return "", 0, ErrQueueSaturated
+	}
+	waitCtx, cancel := context.WithTimeout(ctx, wikiWriteTimeout)
+	defer cancel()
+	select {
+	case result := <-req.ReplyCh:
+		return result.SHA, result.BytesWritten, result.Err
+	case <-waitCtx.Done():
+		return "", 0, fmt.Errorf("wiki: human write timed out after %s", wikiWriteTimeout)
+	}
+}
+
+// EnqueueEntityFact submits a fact-log append to the shared wiki queue.
+// The path must be team/entities/{kind}-{slug}.facts.jsonl and is routed
+// to Repo.CommitEntityFact (which does NOT regen the wiki index).
+func (w *WikiWorker) EnqueueEntityFact(ctx context.Context, slug, path, content, commitMsg string) (string, int, error) {
+	if !w.running.Load() {
+		return "", 0, ErrWorkerStopped
+	}
+	req := wikiWriteRequest{
+		Slug:         slug,
+		Path:         path,
+		Content:      content,
+		Mode:         "replace",
+		CommitMsg:    commitMsg,
+		IsEntityFact: true,
+		ReplyCh:      make(chan wikiWriteResult, 1),
+	}
+	select {
+	case w.requests <- req:
+	default:
+		return "", 0, ErrQueueSaturated
+	}
+	waitCtx, cancel := context.WithTimeout(ctx, wikiWriteTimeout)
+	defer cancel()
+	select {
+	case result := <-req.ReplyCh:
+		return result.SHA, result.BytesWritten, result.Err
+	case <-waitCtx.Done():
+		return "", 0, fmt.Errorf("wiki: entity-fact write timed out after %s", wikiWriteTimeout)
+	}
+}
+
+// EnqueueEntityGraph submits a full rewrite of the cross-entity adjacency
+// log at team/entities/.graph.jsonl. Same single-writer queue as the fact
+// log; routed to Repo.CommitEntityGraph (which does NOT regen the wiki
+// index or backlinks). Caller (EntityGraph) owns append-merge semantics —
+// the worker just replaces the bytes.
+func (w *WikiWorker) EnqueueEntityGraph(ctx context.Context, slug, content, commitMsg string) (string, int, error) {
+	if !w.running.Load() {
+		return "", 0, ErrWorkerStopped
+	}
+	req := wikiWriteRequest{
+		Slug:          slug,
+		Path:          EntityGraphPath,
+		Content:       content,
+		Mode:          "replace",
+		CommitMsg:     commitMsg,
+		IsEntityGraph: true,
+		ReplyCh:       make(chan wikiWriteResult, 1),
+	}
+	select {
+	case w.requests <- req:
+	default:
+		return "", 0, ErrQueueSaturated
+	}
+	waitCtx, cancel := context.WithTimeout(ctx, wikiWriteTimeout)
+	defer cancel()
+	select {
+	case result := <-req.ReplyCh:
+		return result.SHA, result.BytesWritten, result.Err
+	case <-waitCtx.Done():
+		return "", 0, fmt.Errorf("wiki: entity-graph write timed out after %s", wikiWriteTimeout)
+	}
+}
+
+// Repo returns the underlying wiki repo — used by read-side broker handlers
+// which do not need the serialized write queue.
+func (w *WikiWorker) Repo() *Repo {
+	return w.repo
+}
+
+// ReadArticle returns the raw article bytes for a validated path. Exposed so
+// callers in other packages (notably internal/pam after extraction) can read
+// articles without importing internal/team to name *team.Repo.
+func (w *WikiWorker) ReadArticle(relPath string) ([]byte, error) {
+	return readArticle(w.repo, relPath)
+}
+
+// EnqueuePlaybookCompile runs CompilePlaybook against the current on-disk
+// source and submits the output to the queue as a compiled-skill write.
+// The commit is attributed to the archivist identity regardless of who
+// authored the source edit — the compilation is a machine artifact.
+//
+// authorSlug is the source-edit author on whose behalf compilation was
+// triggered; currently unused by the worker, kept in the signature so
+// callers (auto-recompile, /skill create, tests) can pass it along
+// without branching. When compile observability grows past "did it run"
+// (e.g. a per-trigger log line), this is where the value lands.
+func (w *WikiWorker) EnqueuePlaybookCompile(ctx context.Context, slug, authorSlug string) (string, int, error) {
+	_ = authorSlug // reserved for future observability; see docstring.
+	if !w.running.Load() {
+		return "", 0, ErrWorkerStopped
+	}
+	sourcePath := playbookSourceRel(slug)
+	relSkill, skillBytes, err := CompilePlaybook(w.repo, sourcePath)
+	if err != nil {
+		return "", 0, err
+	}
+	// Carry the in-memory bytes directly into the queue submission.
+	// Reading the file back from disk here was racy under filesystem
+	// pressure (macOS: empty buffer returned between WriteFile and
+	// ReadFile), which then failed as "content is required".
+	req := wikiWriteRequest{
+		Slug:              ArchivistAuthor,
+		Path:              relSkill,
+		Content:           string(skillBytes),
+		Mode:              "replace",
+		CommitMsg:         fmt.Sprintf("archivist: compile playbook %s", slug),
+		IsPlaybookCompile: true,
+		PlaybookSlug:      slug,
+		ReplyCh:           make(chan wikiWriteResult, 1),
+	}
+	select {
+	case w.requests <- req:
+	default:
+		return "", 0, ErrQueueSaturated
+	}
+	waitCtx, cancel := context.WithTimeout(ctx, wikiWriteTimeout)
+	defer cancel()
+	select {
+	case result := <-req.ReplyCh:
+		if result.Err == nil {
+			// Fold the compiled skill into broker skill state so the
+			// Skills surface lists it (ICP eval N9: SKILL.md on disk,
+			// "No skills yet" in the product). Safe to call from this
+			// goroutine: the drain slot was released with the reply, so
+			// the registrar's own wiki write can enter the queue. The
+			// byte-identical recompile no-op path still runs this so an
+			// office whose state predates the registrar self-heals on
+			// the next recompile.
+			if reg, ok := w.publisher.(playbookSkillRegistrar); ok {
+				reg.RegisterCompiledPlaybookSkill(slug, sourcePath, skillBytes)
+			}
+		}
+		return result.SHA, result.BytesWritten, result.Err
+	case <-waitCtx.Done():
+		return "", 0, fmt.Errorf("playbook: compile write timed out after %s", wikiWriteTimeout)
+	}
+}
+
+// EnqueuePlaybookExecution submits an execution-log append to the shared
+// queue. Used by ExecutionLog.Append; mirrors EnqueueEntityFact shape.
+func (w *WikiWorker) EnqueuePlaybookExecution(ctx context.Context, slug, path, content, commitMsg string) (string, int, error) {
+	if !w.running.Load() {
+		return "", 0, ErrWorkerStopped
+	}
+	// Extract the playbook slug from the jsonl path so the SSE event can
+	// carry it without a second parse on the subscriber side.
+	pbSlug := executionPlaybookSlug(path)
+	req := wikiWriteRequest{
+		Slug:                slug,
+		Path:                path,
+		Content:             content,
+		Mode:                "replace",
+		CommitMsg:           commitMsg,
+		IsPlaybookExecution: true,
+		PlaybookSlug:        pbSlug,
+		ReplyCh:             make(chan wikiWriteResult, 1),
+	}
+	select {
+	case w.requests <- req:
+	default:
+		return "", 0, ErrQueueSaturated
+	}
+	waitCtx, cancel := context.WithTimeout(ctx, wikiWriteTimeout)
+	defer cancel()
+	select {
+	case result := <-req.ReplyCh:
+		return result.SHA, result.BytesWritten, result.Err
+	case <-waitCtx.Done():
+		return "", 0, fmt.Errorf("playbook: execution write timed out after %s", wikiWriteTimeout)
+	}
+}
+
+// EnqueueTeamLearning submits the merged team learnings JSONL plus generated
+// markdown page to the shared wiki queue.
+func (w *WikiWorker) EnqueueTeamLearning(ctx context.Context, slug, path, jsonlContent, markdownContent, commitMsg string) (string, int, error) {
+	if !w.running.Load() {
+		return "", 0, ErrWorkerStopped
+	}
+	waitCtx, cancel := context.WithTimeout(ctx, wikiWriteTimeout)
+	defer cancel()
+	req := wikiWriteRequest{
+		Context:        waitCtx,
+		Slug:           slug,
+		Path:           path,
+		Content:        jsonlContent,
+		Mode:           "replace",
+		CommitMsg:      commitMsg,
+		IsTeamLearning: true,
+		LearningPage:   markdownContent,
+		ReplyCh:        make(chan wikiWriteResult, 1),
+	}
+	select {
+	case w.requests <- req:
+	default:
+		return "", 0, ErrQueueSaturated
+	}
+	select {
+	case result := <-req.ReplyCh:
+		return result.SHA, result.BytesWritten, result.Err
+	case <-waitCtx.Done():
+		return "", 0, fmt.Errorf("team learnings: write timed out after %s", wikiWriteTimeout)
+	}
+}
+
+// playbookSourceRel resolves the source-article path for a slug.
+func playbookSourceRel(slug string) string {
+	return "team/playbooks/" + slug + ".md"
+}
+
+// executionPlaybookSlug extracts the slug from a jsonl log path. Returns
+// "" when the shape is wrong — the caller uses that only for the SSE event
+// payload, so a blank slug is not load-bearing.
+func executionPlaybookSlug(path string) string {
+	if !executionLogPathPattern.MatchString(path) {
+		return ""
+	}
+	base := filepath.Base(path)
+	const suffix = ".executions.jsonl"
+	if strings.HasSuffix(base, suffix) {
+		return strings.TrimSuffix(base, suffix)
+	}
+	return ""
+}
+
+// EnqueueLintReport submits a lint report write to the shared wiki queue.
+// The path must be wiki/.lint/report-YYYY-MM-DD.md and is routed to
+// Repo.CommitLintReport (which does NOT regen the team-wiki index).
+func (w *WikiWorker) EnqueueLintReport(ctx context.Context, slug, path, content, commitMsg string) (string, int, error) {
+	if !w.running.Load() {
+		return "", 0, ErrWorkerStopped
+	}
+	req := wikiWriteRequest{
+		Slug:         slug,
+		Path:         path,
+		Content:      content,
+		Mode:         "replace",
+		CommitMsg:    commitMsg,
+		IsLintReport: true,
+		ReplyCh:      make(chan wikiWriteResult, 1),
+	}
+	select {
+	case w.requests <- req:
+	default:
+		return "", 0, ErrQueueSaturated
+	}
+	waitCtx, cancel := context.WithTimeout(ctx, wikiWriteTimeout)
+	defer cancel()
+	select {
+	case result := <-req.ReplyCh:
+		return result.SHA, result.BytesWritten, result.Err
+	case <-waitCtx.Done():
+		return "", 0, fmt.Errorf("wiki: lint report write timed out after %s", wikiWriteTimeout)
+	}
+}
+
+// ExtractorHook is the narrow interface the worker uses to trigger the
+// extraction loop after a successful artifact commit. Kept as an interface so
+// wiki_worker.go does not take a hard dependency on wiki_extractor.go —
+// tests can pass a fake hook that asserts ExtractFromArtifact was called.
+type ExtractorHook interface {
+	ExtractFromArtifact(ctx context.Context, artifactPath string) error
+}
+
+// SetExtractor wires an ExtractorHook onto the worker. Safe to call before
+// or after Start; the hook is only consulted inside process. Passing nil
+// disables the hook (default behaviour).
+func (w *WikiWorker) SetExtractor(e ExtractorHook) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.extractor = e
+}
+
+// SourceCaptureHook is the narrow callback the worker fires after a successful
+// playbook-skill compile or team-learnings commit. The broker wires it with a
+// closure over Broker.captureSource, so the committed markdown body lands in
+// the immutable source layer (kind=note). Kept as a func value (single call
+// shape, no interface ceremony) mirroring the ExtractorHook seam.
+//
+// The hook runs on the drain goroutine and MUST NOT block — captureSource is a
+// non-blocking buffered send, so this is safe.
+type SourceCaptureHook func(job SourceCaptureJob)
+
+// SetSourceCaptureHook wires the post-commit note-capture callback. Safe to
+// call before or after Start; guarded by mu like SetExtractor. nil disables it.
+func (w *WikiWorker) SetSourceCaptureHook(h SourceCaptureHook) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.sourceCaptureHook = h
+}
+
+// fireSourceCaptureHook invokes the note-capture callback if one is wired.
+// Called from process() on the drain goroutine after the commit lands.
+func (w *WikiWorker) fireSourceCaptureHook(job SourceCaptureJob) {
+	w.mu.Lock()
+	hook := w.sourceCaptureHook
+	w.mu.Unlock()
+	if hook == nil {
+		return
+	}
+	hook(job)
+}
+
+// maybeRunExtractor fires the extractor hook in a tracked side goroutine so
+// it never blocks the commit reply. On error the extractor is expected to
+// route the failure to the DLQ itself — see wiki_extractor.go.
+func (w *WikiWorker) maybeRunExtractor(_ context.Context, relPath string) {
+	w.mu.Lock()
+	hook := w.extractor
+	w.mu.Unlock()
+	if hook == nil {
+		return
+	}
+	w.sideGoroutines.Add(1)
+	go func() {
+		defer w.sideGoroutines.Done()
+		bgCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+		if err := hook.ExtractFromArtifact(bgCtx, relPath); err != nil {
+			log.Printf("wiki_extractor: %s: %v", relPath, err)
+		}
+	}()
+}
+
+// applyIndexMutation is the body of the IsIndexMutation branch in process.
+// Entities are written before facts so fact rows always reference a known
+// entity. Errors short-circuit so the caller sees the first failure.
+func (w *WikiWorker) applyIndexMutation(ctx context.Context, req wikiWriteRequest) error {
+	if w.index == nil {
+		return fmt.Errorf("wiki: index mutation requested but no index is attached")
+	}
+	for _, ent := range req.IndexEntities {
+		if err := w.index.store.UpsertEntity(ctx, ent); err != nil {
+			return fmt.Errorf("wiki: upsert entity %q: %w", ent.Slug, err)
+		}
+	}
+	for _, f := range req.IndexFacts {
+		if err := w.index.store.UpsertFact(ctx, f); err != nil {
+			return fmt.Errorf("wiki: upsert fact %q: %w", f.ID, err)
+		}
+		if err := w.index.text.Index(ctx, f); err != nil {
+			return fmt.Errorf("wiki: text index fact %q: %w", f.ID, err)
+		}
+	}
+	return nil
+}
+
+// EnqueueArtifact submits a raw source artifact write to the shared wiki
+// queue. The path must match wiki/artifacts/{kind}/{sha}.md. On success, the
+// worker fires the extractor hook in a side goroutine — the reply returns
+// as soon as the git commit lands; extraction is best-effort and never fails
+// the commit path.
+func (w *WikiWorker) EnqueueArtifact(ctx context.Context, slug, path, content, commitMsg string) (string, int, error) {
+	if !w.running.Load() {
+		return "", 0, ErrWorkerStopped
+	}
+	req := wikiWriteRequest{
+		Slug:       slug,
+		Path:       path,
+		Content:    content,
+		Mode:       "create",
+		CommitMsg:  commitMsg,
+		IsArtifact: true,
+		ReplyCh:    make(chan wikiWriteResult, 1),
+	}
+	select {
+	case w.requests <- req:
+	default:
+		return "", 0, ErrQueueSaturated
+	}
+	waitCtx, cancel := context.WithTimeout(ctx, wikiWriteTimeout)
+	defer cancel()
+	select {
+	case result := <-req.ReplyCh:
+		return result.SHA, result.BytesWritten, result.Err
+	case <-waitCtx.Done():
+		return "", 0, fmt.Errorf("wiki: artifact write timed out after %s", wikiWriteTimeout)
+	}
+}
+
+// SubmitFacts routes an index mutation — entities + facts — through the
+// single-writer queue. This preserves the single-writer invariant for the
+// extractor loop: bots, the resolver, and the extractor ask; only the
+// worker writes.
+//
+// Entities are upserted BEFORE facts so fact rows always resolve against a
+// known entity row. Never mutates git — this is a cache-only job that keeps
+// the index live between markdown-reconcile passes.
+func (w *WikiWorker) SubmitFacts(ctx context.Context, facts []TypedFact, entities []IndexEntity) error {
+	if !w.running.Load() {
+		return ErrWorkerStopped
+	}
+	if len(facts) == 0 && len(entities) == 0 {
+		return nil
+	}
+	req := wikiWriteRequest{
+		IsIndexMutation: true,
+		IndexFacts:      facts,
+		IndexEntities:   entities,
+		ReplyCh:         make(chan wikiWriteResult, 1),
+	}
+	select {
+	case w.requests <- req:
+	default:
+		return ErrQueueSaturated
+	}
+	waitCtx, cancel := context.WithTimeout(ctx, wikiWriteTimeout)
+	defer cancel()
+	select {
+	case result := <-req.ReplyCh:
+		return result.Err
+	case <-waitCtx.Done():
+		return fmt.Errorf("wiki: index mutation timed out after %s", wikiWriteTimeout)
+	}
+}
+
+// Index returns the derived WikiIndex attached to this worker, or nil when
+// none is wired. Read-only access is safe — the extractor uses this to
+// consult the signal index through an adapter.
+func (w *WikiWorker) Index() *WikiIndex {
+	return w.index
+}
+
+// EnqueueFactLog submits a fact-log mutation to the shared wiki queue.
+// The path must be wiki/facts/**/*.jsonl or team/entities/*.facts.jsonl.
+// Used by lint ResolveContradiction to update supersedes/valid_until/contradicts_with.
+// `content` is the FULL replacement body for the file (not a diff).
+// Prefer EnqueueFactLogAppend for the extractor append path.
+func (w *WikiWorker) EnqueueFactLog(ctx context.Context, slug, path, content, commitMsg string) (string, int, error) {
+	if !w.running.Load() {
+		return "", 0, ErrWorkerStopped
+	}
+	req := wikiWriteRequest{
+		Slug:      slug,
+		Path:      path,
+		Content:   content,
+		Mode:      "replace",
+		CommitMsg: commitMsg,
+		IsFactLog: true,
+		ReplyCh:   make(chan wikiWriteResult, 1),
+	}
+	select {
+	case w.requests <- req:
+	default:
+		return "", 0, ErrQueueSaturated
+	}
+	waitCtx, cancel := context.WithTimeout(ctx, wikiWriteTimeout)
+	defer cancel()
+	select {
+	case result := <-req.ReplyCh:
+		return result.SHA, result.BytesWritten, result.Err
+	case <-waitCtx.Done():
+		return "", 0, fmt.Errorf("wiki: fact log write timed out after %s", wikiWriteTimeout)
+	}
+}
+
+// EnqueueFactLogAppend appends JSONL content to a fact-log file via the
+// shared single-writer queue. `content` is only the new lines — the worker
+// reads the existing file, concatenates, and commits. Used by the extractor
+// to close the §7.4 substrate guarantee: every successfully-submitted fact
+// lands in markdown so a wipe + reconcile rebuilds to a logically-identical
+// index.
+//
+// The read-modify-write happens inside the worker's repo mutex (AppendFactLog),
+// so callers MUST NOT bypass the queue — that would race two appenders.
+func (w *WikiWorker) EnqueueFactLogAppend(ctx context.Context, slug, path, content, commitMsg string) (string, int, error) {
+	if !w.running.Load() {
+		return "", 0, ErrWorkerStopped
+	}
+	req := wikiWriteRequest{
+		Slug:            slug,
+		Path:            path,
+		Content:         content,
+		Mode:            "append",
+		CommitMsg:       commitMsg,
+		IsFactLogAppend: true,
+		ReplyCh:         make(chan wikiWriteResult, 1),
+	}
+	select {
+	case w.requests <- req:
+	default:
+		return "", 0, ErrQueueSaturated
+	}
+	waitCtx, cancel := context.WithTimeout(ctx, wikiWriteTimeout)
+	defer cancel()
+	select {
+	case result := <-req.ReplyCh:
+		return result.SHA, result.BytesWritten, result.Err
+	case <-waitCtx.Done():
+		return "", 0, fmt.Errorf("wiki: fact log append timed out after %s", wikiWriteTimeout)
+	}
+}

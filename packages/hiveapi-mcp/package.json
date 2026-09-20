@@ -1,0 +1,49 @@
+{
+  "name": "@hiveapi/mcp",
+  "version": "0.1.0",
+  "description": "MCP server for the HiveAPI Gateway — models, usage, entitlement verification, harness turn reporting, and admin-gated API key management over stdio.",
+  "type": "module",
+  "license": "MIT",
+  "author": "Northlatch Labs",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Northlatch-Labs-LLC/hiveapi.git"
+  },
+  "homepage": "https://github.com/Northlatch-Labs-LLC/hiveapi",
+  "bugs": {
+    "url": "https://github.com/Northlatch-Labs-LLC/hiveapi/issues"
+  },
+  "keywords": [
+    "hiveapi",
+    "hive",
+    "mcp",
+    "model-context-protocol",
+    "llm",
+    "gateway"
+  ],
+  "bin": {
+    "hiveapi-mcp": "bin/hiveapi-mcp"
+  },
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "default": "./src/index.ts"
+    }
+  },
+  "scripts": {
+    "start": "bun bin/hiveapi-mcp",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@hiveapi/client": "workspace:*",
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.4.2",
+    "typescript": "^6.0.3"
+  }
+}

@@ -1,0 +1,143 @@
+// biome-ignore-all lint/a11y/useKeyWithClickEvents: Pointer handler is paired with an existing modal, image, or routed-control keyboard path; preserving current interaction model.
+import { type ReactNode, useCallback, useEffect, useState } from "react";
+
+interface ConfirmOptions {
+  title?: string;
+  message: string;
+  /**
+   * Optional rich body rendered below `message`. Use when the disclaimer
+   * needs structure (e.g. a bulleted list of risks for the public-tunnel
+   * warning) that a plain string would otherwise force into one paragraph.
+   */
+  details?: ReactNode;
+  confirmLabel?: string;
+  cancelLabel?: string;
+  /** Red "danger" styling for destructive actions. */
+  danger?: boolean;
+  onConfirm: () => void | Promise<void>;
+  /**
+   * Called when the user dismisses the dialog WITHOUT confirming (Cancel
+   * button, Escape, or overlay click). Not called after a successful confirm.
+   * Use it to release any state the open dialog was guarding.
+   */
+  onCancel?: () => void;
+}
+
+let requestConfirm: ((opts: ConfirmOptions) => void) | null = null;
+let queuedConfirm: ConfirmOptions | null = null;
+
+/**
+ * Imperative confirm, callable from anywhere.
+ *
+ *   confirm({ message: 'Delete this?', danger: true, onConfirm: ... })
+ */
+export function confirm(opts: ConfirmOptions) {
+  if (!requestConfirm) {
+    // Host is not mounted yet. Queue the latest request so the action still
+    // requires the app modal instead of falling back to native confirm().
+    queuedConfirm = opts;
+    return;
+  }
+  requestConfirm(opts);
+}
+
+/** Mount once near the root. */
+export function ConfirmHost() {
+  const [open, setOpen] = useState(false);
+  const [opts, setOpts] = useState<ConfirmOptions | null>(null);
+  const [running, setRunning] = useState(false);
+
+  const close = useCallback(() => {
+    setOpen(false);
+    setOpts(null);
+    setRunning(false);
+  }, []);
+
+  // dismiss is close + the caller's onCancel — used for every NON-confirm exit
+  // (Cancel button, Escape, overlay click). run()'s success path uses close()
+  // directly so onCancel never fires after a confirm.
+  const dismiss = useCallback(() => {
+    opts?.onCancel?.();
+    close();
+  }, [opts, close]);
+
+  useEffect(() => {
+    requestConfirm = (o) => {
+      setOpts(o);
+      setOpen(true);
+    };
+    if (queuedConfirm) {
+      requestConfirm(queuedConfirm);
+      queuedConfirm = null;
+    }
+    return () => {
+      if (requestConfirm !== null) requestConfirm = null;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!open) return;
+    function onKey(e: KeyboardEvent) {
+      if (e.key === "Escape") dismiss();
+    }
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [open, dismiss]);
+
+  if (!(open && opts)) return null;
+
+  const run = async () => {
+    if (running) return;
+    setRunning(true);
+    try {
+      await opts.onConfirm();
+    } catch (err) {
+      // Defensive: callers are expected to handle their own errors inside
+      // onConfirm (and show a toast), but if one escapes we at least log
+      // it instead of losing it to the unconditional close() below.
+      console.error("[ConfirmDialog] onConfirm threw:", err);
+    } finally {
+      close();
+    }
+  };
+
+  return (
+    <div
+      className="confirm-overlay"
+      onClick={(e) => {
+        if (e.target === e.currentTarget) dismiss();
+      }}
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="confirm-dialog-title"
+    >
+      <div className="confirm-card card">
+        <h3 id="confirm-dialog-title" className="confirm-title">
+          {opts.title || "Are you sure?"}
+        </h3>
+        <p className="confirm-message">{opts.message}</p>
+        {opts.details ? (
+          <div className="confirm-details">{opts.details}</div>
+        ) : null}
+        <div className="confirm-actions">
+          <button
+            type="button"
+            className="btn btn-ghost btn-sm"
+            onClick={dismiss}
+            disabled={running}
+          >
+            {opts.cancelLabel || "Cancel"}
+          </button>
+          <button
+            type="button"
+            className={`btn btn-sm ${opts.danger ? "btn-danger" : "btn-primary"}`}
+            onClick={run}
+            disabled={running}
+          >
+            {running ? "Working..." : opts.confirmLabel || "Confirm"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}

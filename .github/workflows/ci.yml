@@ -1,0 +1,613 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  # Fire on every PR regardless of base branch so stacked PRs get the
+  # full suite, not just commitlint + scan.
+  pull_request:
+
+# Tighten the org default (`default_workflow_permissions: write`) — every
+# job in CI is read-only against the repo. The jobs that need to
+# upload-artifact / download-artifact rely on actions/upload-artifact's
+# self-managed temporary token and don't need write contents.
+permissions:
+  contents: read
+
+# On a PR, only the tip matters: a superseded run is wasted money, so cancel it.
+# On main, EVERY COMMIT NEEDS ITS OWN VERDICT. `github.ref` is the same string
+# for every push to main, so a shared group with cancel-in-progress meant each
+# push killed the previous run — and when pushes land faster than CI completes,
+# main accumulates commits that were never checked by anything.
+#
+# That is not a red main, it is an UNKNOWN main, which is worse: nothing gates
+# the push, and the thing meant to catch it afterwards never finishes. Observed
+# directly — 8 of 10 consecutive runs on main cancelled, 1 still running, and
+# the single run that did complete had been failing for hours without anyone
+# seeing it.
+#
+# Keying the group by SHA on main lets those runs finish alongside each other.
+concurrency:
+  group: ci-${{ github.ref }}-${{ github.ref == 'refs/heads/main' && github.sha || '' }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  web:
+    # Produces the web-dist artifact consumed by the downstream Go
+    # build/test jobs. (If `web` FAILS — e.g. a web typecheck break —
+    # consumers run and fail fast at download-artifact. That is intended:
+    # a broken web build must block the required `build` check.)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # ratchet:actions/checkout@v6
+      # Pin to full SHA: third-party action, runs on pull_request from forks
+      # and can read any GITHUB_TOKEN the workflow exposes. A @v2 re-tag
+      # would execute with CI privileges. Same SHA is reused in the web-e2e
+      # job below — keep them in sync.
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # ratchet:oven-sh/setup-bun@v2.2.0
+        with:
+          bun-version: "1.3.13"
+      - name: Install and typecheck
+        id: web-typecheck
+        working-directory: web
+        run: |
+          bun install --frozen-lockfile
+          bun run typecheck
+      - name: Run coverage
+        id: web-coverage
+        working-directory: web
+        if: ${{ steps.web-typecheck.outcome == 'success' }}
+        continue-on-error: true
+        run: bun run test:coverage
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # ratchet:actions/upload-artifact@v7
+        if: always()
+        with:
+          name: web-coverage
+          path: web/coverage
+          retention-days: 14
+          if-no-files-found: ignore
+      - name: Build web dist
+        working-directory: web
+        if: ${{ always() && steps.web-typecheck.outcome == 'success' }}
+        run: bun run build
+      - name: Bundle-size budget
+        if: ${{ always() && steps.web-typecheck.outcome == 'success' }}
+        # Forward-only ratchet against accidental bundle bloat. Warn at
+        # 950 KB, fail at 1200 KB on the JS bundle total. To raise the
+        # ceiling intentionally, edit constants in scripts/check-bundle-size.sh
+        # in the same PR. See CONTRIBUTING.md "no perf degradations" rule.
+        run: bash scripts/check-bundle-size.sh
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # ratchet:actions/upload-artifact@v7
+        if: ${{ always() && steps.web-typecheck.outcome == 'success' }}
+        with:
+          name: web-dist
+          path: web/dist
+          retention-days: 1
+          if-no-files-found: ignore
+      - name: Fail web job if coverage failed
+        if: ${{ always() && steps.web-typecheck.outcome == 'success' && steps.web-coverage.outcome == 'failure' }}
+        run: exit 1
+
+  lint:
+    runs-on: ubuntu-latest
+    # Single source of truth for govulncheck binary location. `go install`
+    # writes to $GOBIN if set (else $GOPATH/bin), so pinning GOBIN here
+    # keeps the cache path, install destination, and PATH lookup below
+    # locked to one literal — eliminates the silent-cache-miss class of
+    # bug if a future setup-go release shifts the default GOPATH.
+    env:
+      GOBIN: ${{ github.workspace }}/.gobin
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # ratchet:actions/checkout@v6
+        with:
+          # The file-size ratchet compares the current allowlist to the PR
+          # base. Keep enough history for `git merge-base HEAD origin/<base>`.
+          fetch-depth: 0
+      - name: File-size ratchet self-test
+        run: bash scripts/check-file-size-self-test.sh
+      - name: File-size budget (CONTRIBUTING.md)
+        # Warn at 800 LOC, fail at 1500 LOC unless allowlisted in
+        # scripts/file-size-allowlist.txt. The allowlist is forward-only
+        # (see CONTRIBUTING.md, docs/CODE-QUALITY.md, ADR-0001): new
+        # entries and growth of current offenders fail against the PR base.
+        # Skips generated files, tests, and documented fixture/vendor dirs.
+        run: bash scripts/check-file-size.sh
+      - name: Phantom CSS design tokens
+        # Rejects `var(--x, <literal>)` (and bare `var(--x)`) where --x is
+        # declared in no stylesheet and set by no component. An undefined
+        # custom property means the literal fallback always wins, so the
+        # value is hardcoded in every theme while reading as a token; the
+        # bare form silently drops the declaration. Covers component inline
+        # styles as well as stylesheets, and checks nested fallbacks at
+        # every level. Tokens set at runtime from JS are detected, not
+        # allowlisted. Deferred sites live in
+        # scripts/css-phantom-token-allowlist.txt with a stated reason.
+        run: bash scripts/check-css-phantom-tokens.sh
+      - name: Install ripgrep
+        # A PCRE multiline grep check below uses `rg --pcre2`. ripgrep is bundled
+        # in ubuntu-latest images today, but we install it explicitly so the
+        # check survives runner-image changes that drop preinstalled tools.
+        run: |
+          if ! command -v rg >/dev/null 2>&1; then
+            # Same apt mirror flake as the Playwright install: retry before
+            # calling lint red over a package index that failed to download.
+            for attempt in 1 2 3 4; do
+              if sudo apt-get update && sudo apt-get install -y ripgrep; then
+                break
+              fi
+              echo "ripgrep install failed (attempt $attempt); retrying in $((attempt * 20))s"
+              sleep $((attempt * 20))
+            done
+            command -v rg >/dev/null 2>&1 || { echo "ripgrep install failed after 4 attempts" >&2; exit 1; }
+          fi
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # ratchet:actions/setup-go@v6
+        id: setup-go
+        with:
+          go-version-file: go.mod
+      - name: Check VERSION sentinel
+        # internal/buildinfo/VERSION is the embedded fallback when no release
+        # ldflag is set. It MUST stay literally "dev" so contributor / source
+        # builds resolve to a dev sentinel and IsDevVersion suppresses the
+        # upgrade banner. Issue #350: a hand-edited "0.0.7.1" passed as a
+        # real semver and produced a downgrade prompt against npm latest.
+        #
+        # The two private package.json files (root + web/) must stay at
+        # "0.0.0" — they are not published, but the same hand-edit pattern
+        # that staled the VERSION file also staled both of these. Pinning
+        # to "0.0.0" matches npm/package.json's release-overwritten default
+        # and makes "anything else" a clear lint failure.
+        run: |
+          contents=$(tr -d '[:space:]' < internal/buildinfo/VERSION)
+          if [ "$contents" != "dev" ]; then
+            echo "internal/buildinfo/VERSION must be the literal 'dev', got: $contents" >&2
+            echo "Real release versions are injected via goreleaser's ldflag at build time." >&2
+            exit 1
+          fi
+          for pkg in package.json web/package.json; do
+            v=$(node -p "require('./$pkg').version")
+            if [ "$v" != "0.0.0" ]; then
+              echo "$pkg version must be \"0.0.0\" (private package, no published version), got: $v" >&2
+              echo "Hand-edited semver here was the source of issue #350; keep it as a sentinel." >&2
+              exit 1
+            fi
+          done
+      - name: Check gofmt
+        # Belt-and-braces net against the golangci-lint `gofmt` formatter (see
+        # .golangci.yml). `-s` matches that linter's simplify=true default so
+        # the two agree on "formatted". The empty-file guard keeps `gofmt -l`
+        # from reading stdin and hanging on a sparse checkout.
+        run: |
+          files=$(git ls-files '*.go')
+          if [ -z "$files" ]; then
+            exit 0
+          fi
+          unformatted=$(gofmt -s -l $files)
+          if [ -n "$unformatted" ]; then
+            echo "gofmt reports the following files need formatting:"
+            echo "$unformatted"
+            echo
+            echo "Run: gofmt -s -w \$(git ls-files '*.go')"
+            exit 1
+          fi
+      # Pin to full SHA: third-party action, runs on pull_request from forks
+      # and can read any GITHUB_TOKEN the workflow exposes. A @v9 re-tag
+      # would execute with CI privileges.
+      - uses: golangci/golangci-lint-action@1e7e51e771db61008b38414a730f564565cf7c20 # ratchet:golangci/golangci-lint-action@v9.2.0
+        with:
+          version: v2.12.2
+          args: --timeout=5m
+      - name: Cache govulncheck binary
+        # The version below is pinned, so the compiled binary at
+        # $GOBIN/govulncheck is reusable across every CI run that doesn't
+        # bump the govulncheck version. Saves ~10-15s of `go install`
+        # (download + compile) per run on warm cache.
+        id: cache-govulncheck
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # ratchet:actions/cache@v5.0.5
+        with:
+          path: ${{ env.GOBIN }}/govulncheck
+          # The Go version is part of the key: govulncheck embeds the
+          # toolchain's source-processing packages, so a binary compiled
+          # under an older Go fails with "file requires newer Go version"
+          # the moment go.mod's toolchain directive moves past it.
+          key: govulncheck-${{ runner.os }}-v1.1.4-go${{ steps.setup-go.outputs.go-version }}
+      - name: Install govulncheck
+        if: steps.cache-govulncheck.outputs.cache-hit != 'true'
+        run: go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
+      - name: Run govulncheck
+        # Catches reachable CVEs in the Go stdlib + modules. Flags us when we
+        # fall behind on a Go minor bump without having to wait for a CVE
+        # advisory to make noise. Pinned to an explicit version so a new
+        # govulncheck release cannot flip pass/fail on the same commit.
+        run: |
+          export PATH="${{ env.GOBIN }}:$PATH"
+          govulncheck ./...
+      - name: Reject /tmp/ hardcodes in production Go
+        # Windows guard: /tmp doesn't exist there, so anything bound to a
+        # literal /tmp path silently writes to C:\tmp at the drive root (or
+        # fails outright). Production code must use os.TempDir() — see the
+        # runtime-aware helpers in internal/brokeraddr/addr.go for the
+        # pattern. _test.go files are exempt (testdata fixtures often live
+        # at known paths).
+        run: |
+          set -euo pipefail
+          # The grep below excludes test files via :(exclude). The remaining
+          # `internal/brokeraddr/addr.go` hits are the runtime-gated /tmp
+          # branches that are only taken on non-Windows; those are correct.
+          # The internal/computer exclusions are paths INSIDE the remote
+          # Linux bot-computer VM/container (sent over its command API), not
+          # host paths — os.TempDir() would wrongly resolve on the host.
+          bad=$(git grep -nE '"/tmp/' -- '*.go' \
+                 ':(exclude)*_test.go' \
+                 ':(exclude)internal/brokeraddr/addr.go' \
+                 ':(exclude)internal/computer/box/bootstrap.go' \
+                 ':(exclude)internal/computer/screenshot.go' || true)
+          if [ -n "$bad" ]; then
+            echo "$bad" >&2
+            echo "" >&2
+            echo "Found /tmp hardcodes in production Go. Use os.TempDir()." >&2
+            echo "See internal/brokeraddr/addr.go for the runtime.GOOS pattern." >&2
+            exit 1
+          fi
+      - name: No new time.Sleep in tests
+        # Forward-only enforcement of CONTRIBUTING.md's "no time.Sleep
+        # in tests" rule. Existing offenders are grandfathered (would
+        # require ~80 fixes in one PR); diff-only lets the rule lock
+        # now while paced PRs migrate the existing call sites to a
+        # manualClock fixture.
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: bash scripts/check-no-new-sleeps-in-tests.sh
+      - name: Complexity ignore baseline
+        # Keep Biome complexity suppressions explicit during the migration:
+        # stale entries are reported, new ignores must update the baseline.
+        run: bash scripts/check-complexity-baseline.sh
+      - name: Reject unix-only exec.Command shapes outside tmux/tui paths
+        # Windows guard: bash/sh/chmod/ln/mkfifo/killall don't exist there.
+        # Code that needs them must be in a _unix.go file with a build tag,
+        # or guarded with runtime.GOOS at the call site. tmux is allowed
+        # because UsesTmuxRuntime() gates it; if you're calling tmux from a
+        # web-mode path, the regression is real and this should fail.
+        #
+        # Uses ripgrep with -U (multiline) + -P (PCRE) so call shapes split
+        # across lines — exec.Command(\n    "bash",\n    "-c", ...) — are
+        # caught. A previous line-oriented grep missed those. ripgrep is
+        # preinstalled on ubuntu-latest.
+        #
+        # The pattern matches both bare names ("sh", "bash", ...) AND the
+        # absolute-path variants ("/bin/sh", "/usr/bin/sh", ...). A bare-
+        # name-only pattern missed `exec.CommandContext(ctx, "/bin/sh", ...)`
+        # in internal/agent/tools.go, which compiles fine but fails at
+        # CreateProcess on Windows.
+        run: |
+          set -euo pipefail
+          bad=$(rg -nUP \
+                  --type-add='go:*.go' --type=go \
+                  --glob='!*_test.go' \
+                  'exec\.(Command|LookPath|CommandContext)\([^,)]*,?\s*"(/(?:usr/)?(?:local/)?(?:s)?bin/)?(bash|sh|chmod|ln|mkfifo|killall|pkill)"' \
+                  internal/ cmd/ || true)
+          # Allow _unix.go / _darwin.go / _linux.go files (compiled only on
+          # those platforms by Go's build constraints).
+          bad=$(echo "$bad" | grep -vE '_(unix|linux|darwin)\.go:' || true)
+          if [ -n "$bad" ]; then
+            echo "$bad" >&2
+            echo "" >&2
+            echo "Found unix-only exec.Command in cross-platform Go. Either:" >&2
+            echo "  1. Move the code into a _unix.go file with //go:build !windows, or" >&2
+            echo "  2. Guard the call site with runtime.GOOS." >&2
+            exit 1
+          fi
+
+  # Single test job. We previously fanned out one matrix leg per Go package
+  # (28 legs at peak) for nicer per-package red x's, but each leg paid
+  # ~12-15s of checkout + setup-go + download-artifact overhead for ~20-50s
+  # of actual test work — ~14 runner-minutes per CI run on overhead alone.
+  # `go test ./...` runs packages in parallel within one process up to
+  # GOMAXPROCS, so wall clock is bounded by the long-pole package
+  # (`internal/team`, ~2.5m with -race) regardless of fan-out. Collapsing
+  # gives ~80% compute reduction at no wall-clock cost. teammcp opts out
+  # of -race until its test-isolation cleanup lands; everything else gets
+  # the race detector. -timeout 15m is generous headroom over the ~3m
+  # observed locally (race instrumentation 2-3x's wall-clock).
+  go-test:
+    needs: web
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # ratchet:actions/checkout@v6
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # ratchet:actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # ratchet:actions/download-artifact@v8
+        with:
+          name: web-dist
+          path: web/dist
+      # Build hivex-test-bin so internal/workspaces.TestRuntimeHomeIsolation
+      # (the Phase-0 isolation leak test) actually runs instead of skipping.
+      # The test spawns this binary with HIVEX_RUNTIME_HOME=<tmpdir> and
+      # asserts no writes leak to $HOME/.hivex/. Without this build step, the
+      # regression safety net is dormant in CI because hivexTestBinary()
+      # falls back to looking for ./hivex-test-bin at repo root.
+      # grep-tag: PHASE0_HOMEDIR_AUDIT
+      - name: Build hivex-test-bin (for Phase-0 isolation leak test)
+        run: go build -o hivex-test-bin ./cmd/hivex
+      # `set -euo pipefail` + the empty-package guard close a fail-open
+      # path: bash does NOT propagate failures inside `$(...)`, so a
+      # transient `go list` error or a regex tweak that drops every match
+      # would otherwise degrade the step to `go test -race -timeout 15m`
+      # against the cwd package only — green CI, every subpackage silently
+      # skipped. `pipefail` surfaces the inner failure; the guard catches
+      # an empty match list.
+      #
+      # On failure: the matrix used to give one red x per failing package
+      # in the PR checks list; collapsed, both invocations swallow per-
+      # package status into a single red x. `tee` to a log file + a
+      # `grep '^FAIL'` summary at the end of the step reclaims the per-
+      # package signal in the step's own log without bringing back the
+      # matrix overhead. Logs are uploaded as an artifact on failure for
+      # offline triage.
+      - name: Tests with race detector (everything except teammcp)
+        run: |
+          set -euo pipefail
+          pkgs=$(go list ./... | grep -vE '/internal/teammcp($|/)')
+          if [ -z "$pkgs" ]; then
+            echo "no packages matched — refusing to run an empty go test suite" >&2
+            exit 1
+          fi
+          set +e
+          go test -race -timeout 15m $pkgs 2>&1 | tee go-test-race.log
+          status=${PIPESTATUS[0]}
+          set -e
+          if [ "$status" -ne 0 ]; then
+            echo "::group::Failing packages (race suite)"
+            grep -E '^(FAIL|--- FAIL)' go-test-race.log || echo "(no FAIL lines parsed; see full log above)"
+            echo "::endgroup::"
+            exit "$status"
+          fi
+      - name: Tests without race (internal/teammcp)
+        run: |
+          set -euo pipefail
+          pkgs=$(go list ./... | grep -E '/internal/teammcp($|/)')
+          if [ -z "$pkgs" ]; then
+            echo "no packages matched — refusing to run an empty go test suite" >&2
+            exit 1
+          fi
+          set +e
+          go test -timeout 15m $pkgs 2>&1 | tee go-test-teammcp.log
+          status=${PIPESTATUS[0]}
+          set -e
+          if [ "$status" -ne 0 ]; then
+            echo "::group::Failing packages (teammcp suite)"
+            grep -E '^(FAIL|--- FAIL)' go-test-teammcp.log || echo "(no FAIL lines parsed; see full log above)"
+            echo "::endgroup::"
+            exit "$status"
+          fi
+      - name: Upload go test logs on failure
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # ratchet:actions/upload-artifact@v7
+        with:
+          name: go-test-logs
+          path: |
+            go-test-race.log
+            go-test-teammcp.log
+          retention-days: 7
+          if-no-files-found: ignore
+
+  # Cross-platform compile gate. Catches the class of regression where a
+  # `golang.org/x/sys/unix` import or a stray `//go:build !windows` constraint
+  # slips into the main path and breaks Windows/macOS without anyone noticing
+  # until release time. `release-build` exists but only verifies what
+  # goreleaser's `goos:` happens to enumerate; if a future PR drops `windows`
+
+  vet:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # ratchet:actions/checkout@v6
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # ratchet:actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: Vet
+        run: go vet ./...
+
+  build:
+    needs: web
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # ratchet:actions/checkout@v6
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # ratchet:actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # ratchet:actions/download-artifact@v8
+        with:
+          name: web-dist
+          path: web/dist
+      - run: go build -o hivex ./cmd/hivex
+      - name: Smoke test binary
+        run: |
+          ./hivex --version
+          ./hivex --help-all > /dev/null
+      - name: Cross-compile windows/amd64
+        # The one compile target no other lane covers: darwin is the daily
+        # local build, linux is every other CI job. Catches a
+        # `golang.org/x/sys/unix` import or stray `//go:build !windows`
+        # slipping into the main path. `./...` (not just ./cmd/hivex) so an
+        # internal/ package picking up a unix-only import blocks here.
+        env:
+          GOOS: windows
+          GOARCH: amd64
+          CGO_ENABLED: "0"
+        run: go build ./...
+
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # ratchet:actions/checkout@v6
+      - name: Run shellcheck
+        run: |
+          sudo apt-get install -y shellcheck
+          shellcheck scripts/*.sh testdata/vhs/*.sh
+
+  web-e2e:
+    # Playwright smoke against the real web UI. Guards the class of regression
+    # we kept shipping (React render crashes that only surface in a browser
+    # — e.g. "No QueryClient set", Minified React error #31 on first agent
+    # click) by booting hivex, loading /, and walking the happy path.
+    needs: web
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # ratchet:actions/checkout@v6
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # ratchet:actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      # Pin to full SHA: third-party action, runs on every PR. A @v2 re-tag
+      # would exec with CI privileges — see the awalsh128 pin above for the
+      # same pattern.
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # ratchet:oven-sh/setup-bun@v2.2.0
+        with:
+          bun-version: "1.3.13"
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # ratchet:actions/download-artifact@v8
+        with:
+          name: web-dist
+          path: web/dist
+      - name: Build hivex
+        run: go build -o hivex ./cmd/hivex
+      - name: Install e2e deps
+        working-directory: web/e2e
+        run: bun install --frozen-lockfile
+      - name: Cache Playwright browsers
+        id: cache-playwright
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # ratchet:actions/cache@v5.0.5
+        with:
+          path: ~/.cache/ms-playwright
+          # Key on the resolved @playwright/test version via bun.lock so a
+          # bump invalidates.
+          key: playwright-${{ runner.os }}-${{ hashFiles('web/e2e/bun.lock') }}
+      - name: Install Playwright chromium
+        working-directory: web/e2e
+        # --with-deps installs the OS-level shared libs chromium needs on
+        # ubuntu-latest even when the cached browser binary is restored.
+        # --with-deps runs apt-get on the runner; Ubuntu mirrors on GitHub's
+        # runners intermittently fail with "Some index files failed to
+        # download" (three red mains in a row on 2026-09-09 with no code
+        # change). Retry a few times before calling the job red.
+        run: |
+          for attempt in 1 2 3 4; do
+            if bunx playwright install --with-deps chromium; then
+              exit 0
+            fi
+            echo "playwright install failed (attempt $attempt); retrying in $((attempt * 20))s"
+            sleep $((attempt * 20))
+          done
+          echo "playwright install failed after 4 attempts" >&2
+          exit 1
+      - name: Install claude CLI stub
+        # hivex's PreflightWeb hard-requires `claude` on PATH (see
+        # internal/team/launcher.go — PreflightWeb). These smoke tests don't
+        # send messages to agents, so a no-op stub that LookPath can find is
+        # enough to get past preflight and boot the web UI.
+        run: |
+          sudo tee /usr/local/bin/claude >/dev/null <<'SH'
+          #!/bin/sh
+          # Smoke-test stub. Present only to satisfy exec.LookPath("claude").
+          echo "stub claude $*" >&2
+          exit 0
+          SH
+          sudo chmod +x /usr/local/bin/claude
+      # The legacy two-phase split (Wizard then Shell) was removed in the
+      # onboarding-into-office redesign: the 9-step modal wizard is gone,
+      # replaced by a single pre-pick screen plus an in-Shell CEO DM. The
+      # PrePickScreen + in-office onboarding surfaces are covered by Vitest
+      # + RTL unit/integration tests in the npm-tests job; this e2e job
+      # now boots hivex once in the seeded state for the shell suite.
+      - name: Seed onboarding state + start hivex for shell tests
+        run: |
+          mkdir -p "$HOME/.hivex"
+          cat > "$HOME/.hivex/onboarded.json" <<'JSON'
+          {"version":1,"completed_at":"2026-01-01T00:00:00Z","company_name":"e2e-ci"}
+          JSON
+          ./hivex --no-open --broker-port 7890 --web-port 7891 --no-hive </dev/null > hivex.log 2>&1 &
+          echo $! > hivex.pid
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:7891/onboarding/state -o /dev/null; then
+              echo "hivex ready (shell) after ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "hivex failed to become ready (shell)" >&2
+          cat hivex.log >&2
+          exit 1
+      - name: Run Playwright shell suite
+        working-directory: web/e2e
+        env:
+          HIVEX_E2E_BASE_URL: http://localhost:7891
+        run: |
+          # This list used to name 11 specs. SEVEN did not exist: six were
+          # deleted in the operator-only pivot (5027ec625) and one earlier.
+          # Playwright treats a positional arg as a FILTER, and a filter that
+          # matches no file contributes no tests, no warning, exit 0 -- so the
+          # job ran 4 specs while appearing to run 11.
+          #
+          # A list naming files that do not exist is worse than no list: it
+          # reads as coverage. The guard below makes that state impossible to
+          # re-enter, because a phantom entry now fails the job by name
+          # instead of quietly shrinking the suite.
+          SPECS="
+            tests/smoke.spec.ts
+            tests/app-routes.spec.ts
+            tests/route-matrix.spec.ts
+            tests/route-regressions.spec.ts
+          "
+          missing=0
+          for spec in $SPECS; do
+            if [ ! -f "$spec" ]; then
+              echo "::error::listed spec does not exist: $spec" >&2
+              missing=1
+            fi
+          done
+          [ "$missing" -eq 0 ] || exit 1
+          # shellcheck disable=SC2086
+          bunx playwright test $SPECS
+      - name: Stop hivex (shell phase)
+        if: always()
+        run: |
+          if [ -f hivex.pid ]; then
+            kill "$(cat hivex.pid)" 2>/dev/null || true
+          fi
+      - name: Upload Playwright report on failure
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # ratchet:actions/upload-artifact@v7
+        with:
+          name: playwright-report
+          path: web/e2e/playwright-report
+          retention-days: 7
+      - name: Upload hivex logs on failure
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # ratchet:actions/upload-artifact@v7
+        with:
+          name: hivex-e2e-logs
+          path: |
+            hivex.log
+          retention-days: 7
+          if-no-files-found: ignore
+
+
+  # Pure-function tests for the npm wrapper's `process.platform === "win32"`
+  # branches (archiveExtension, binaryFilename, archiveName, etc). These
+  # branches are only exercised in the wild on actual Windows machines, so
+  # without a unit test a refactor that drops `.zip`/`.exe` handling regresses
+  # silently. Runs in <2s; no real network or filesystem.
+  npm-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # ratchet:actions/checkout@v6
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # ratchet:oven-sh/setup-bun@v2.2.0
+        with:
+          bun-version: "1.3.13"
+      - name: Run npm wrapper tests
+        working-directory: npm
+        run: bun test
+
+  # Real Windows runner smoke. Catches behavioral regressions that compile
+  # cleanly but exit silently on first launch — the class of bug the
+  # isPiped() fall-through fix (commit 9efaa3b3) addresses. windows-latest
+  # bills at 2x Linux minutes; ~3 min wall clock = ~$0.008/PR. Worth it
+  # because the regression vectors here are invisible to Linux/Mac CI.

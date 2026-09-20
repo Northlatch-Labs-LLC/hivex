@@ -1,0 +1,798 @@
+package team
+
+// Tests for the extracted notificationContextBuilder type. Written test-
+// first against the surface in PLAN.md §C3 before the type exists, so the
+// first run is a compile failure by design.
+//
+// The existing TestBuildNotificationContext / TestBuildMessageWorkPacket /
+// TestResponseInstructionForTarget* tests in launcher_test.go remain the
+// behavior baseline (they reach this surface via &Launcher{...}). The new
+// tests below exercise the type directly with stub broker callbacks so the
+// new file lands above the 85% per-file gate without depending on a
+// real Broker fixture.
+
+import (
+	"strings"
+	"testing"
+
+	"github.com/Northlatch-Labs-LLC/hivex/internal/bot"
+	"github.com/Northlatch-Labs-LLC/hivex/internal/channel"
+)
+
+func newTestNotifyContextBuilder(t *testing.T, opts ...func(*notificationContextBuilder)) *notificationContextBuilder {
+	t.Helper()
+	tg := fixtureTargeter(t, []officeMember{
+		{Slug: "cos", BuiltIn: true, Name: "CEO"},
+		{Slug: "eng", Name: "Engineer"},
+	})
+	b := &notificationContextBuilder{
+		targeter:        tg,
+		channelMessages: func(string) []channelMessage { return nil },
+		channelTasks:    func(string) []teamTask { return nil },
+		allTasks:        func() []teamTask { return nil },
+		channelStore:    func() *channel.Store { return nil },
+		scoreTaskCandidate: func(msg channelMessage, task teamTask) float64 {
+			// Default: only direct ID/owner matches, no fuzzy scoring.
+			return 0
+		},
+		activeHeadlessBots: func(string) map[string]struct{} { return nil },
+	}
+	for _, opt := range opts {
+		opt(b)
+	}
+	return b
+}
+
+func TestNotificationContext_TruncateHelper(t *testing.T) {
+	if got := truncate("hello", 100); got != "hello" {
+		t.Errorf("truncate short string should be passthrough; got %q", got)
+	}
+	if got := truncate("abcdefghij", 5); got != "abcde..." {
+		t.Errorf("truncate(10char, 5) = %q, want abcde...", got)
+	}
+	if got := truncate("", 5); got != "" {
+		t.Errorf("truncate empty = %q, want empty", got)
+	}
+}
+
+func TestNotificationContext_ExtractTaskFileTargets(t *testing.T) {
+	cases := []struct {
+		text string
+		want []string
+	}{
+		{"Update `web/src/App.tsx` and `internal/team/launcher.go`", []string{"web/src/App.tsx", "internal/team/launcher.go"}},
+		{"This has no backticks", nil},
+		{"Backticks but no path/dot: `notarealpath`", nil},
+		{"Dot only: `script.sh`", []string{"script.sh"}},
+		{"Slash only: `pkg/foo`", []string{"pkg/foo"}},
+		{"Five `a.x` `b.x` `c.x` `d.x` `e.x` should cap at four", []string{"a.x", "b.x", "c.x", "d.x"}},
+		{"Duplicate `a.x` `a.x` `b.x` dedups", []string{"a.x", "b.x"}},
+		{"  Empty `` `b.x`", []string{"b.x"}},
+	}
+	for _, tc := range cases {
+		got := extractTaskFileTargets(tc.text)
+		if !equalStringSlices(got, tc.want) {
+			t.Errorf("extractTaskFileTargets(%q) = %v, want %v", tc.text, got, tc.want)
+		}
+	}
+}
+
+func TestNotificationContext_HumanizeNotificationType(t *testing.T) {
+	cases := map[string]string{
+		"context_alert":   "Context alert",
+		"daily_digest":    "Daily digest",
+		"meeting_summary": "Meeting summary",
+		"task_reminder":   "Task reminder",
+		"task_assigned":   "Task assigned",
+		"":                "",
+		"snake_case_kind": "Snake Case Kind",
+		"single":          "Single",
+	}
+	for kind, want := range cases {
+		if got := humanizeNotificationType(kind); got != want {
+			t.Errorf("humanizeNotificationType(%q) = %q, want %q", kind, got, want)
+		}
+	}
+}
+
+func TestNotificationContext_ContextEmptyWhenNoMessages(t *testing.T) {
+	b := newTestNotifyContextBuilder(t)
+	if got := b.NotificationContext("", "general", "", "", 5); got != "" {
+		t.Errorf("expected empty context when no messages, got %q", got)
+	}
+}
+
+func TestNotificationContext_FiltersSystemAndStatus(t *testing.T) {
+	msgs := []channelMessage{
+		{ID: "1", From: "you", Content: "human says hi"},
+		{ID: "2", From: "system", Content: "system bookkeeping"},
+		{ID: "3", From: "cos", Content: "[STATUS] working"},
+		{ID: "4", From: "cos", Content: "real reply"},
+	}
+	b := newTestNotifyContextBuilder(t, func(b *notificationContextBuilder) {
+		b.channelMessages = func(string) []channelMessage { return msgs }
+	})
+	got := b.NotificationContext("", "general", "", "", 10)
+	if !strings.Contains(got, "human says hi") {
+		t.Errorf("expected human msg included; got %q", got)
+	}
+	if !strings.Contains(got, "real reply") {
+		t.Errorf("expected real cos reply included; got %q", got)
+	}
+	for _, banned := range []string{"system bookkeeping", "STATUS"} {
+		if strings.Contains(got, banned) {
+			t.Errorf("expected %q filtered out, got %q", banned, got)
+		}
+	}
+}
+
+func TestNotificationContext_ExcludesTrigger(t *testing.T) {
+	msgs := []channelMessage{
+		{ID: "1", From: "you", Content: "earlier"},
+		{ID: "trigger", From: "you", Content: "the trigger msg"},
+		{ID: "2", From: "cos", Content: "later"},
+	}
+	b := newTestNotifyContextBuilder(t, func(b *notificationContextBuilder) {
+		b.channelMessages = func(string) []channelMessage { return msgs }
+	})
+	got := b.NotificationContext("", "general", "trigger", "", 10)
+	if strings.Contains(got, "the trigger msg") {
+		t.Errorf("trigger msg should be excluded; got %q", got)
+	}
+}
+
+func TestNotificationContext_ThreadScoped_AnchorsAtRoot(t *testing.T) {
+	msgs := []channelMessage{
+		{ID: "ROOT", From: "you", Content: "original ask"},
+		{ID: "off1", From: "you", Content: "unrelated chatter"},
+		{ID: "child1", From: "cos", Content: "delegating", ReplyTo: "ROOT"},
+		{ID: "grand", From: "eng", Content: "working on it", ReplyTo: "child1"},
+	}
+	b := newTestNotifyContextBuilder(t, func(b *notificationContextBuilder) {
+		b.channelMessages = func(string) []channelMessage { return msgs }
+	})
+	got := b.NotificationContext("", "general", "", "ROOT", 10)
+	if !strings.Contains(got, "original ask") {
+		t.Errorf("thread-scoped context should anchor at root; got %q", got)
+	}
+	if !strings.Contains(got, "working on it") {
+		t.Errorf("thread-scoped context should include grandchild; got %q", got)
+	}
+	if strings.Contains(got, "unrelated chatter") {
+		t.Errorf("thread-scoped context must not include off-thread msg; got %q", got)
+	}
+}
+
+func TestNotificationContext_DefaultChannelGeneral(t *testing.T) {
+	captured := ""
+	b := newTestNotifyContextBuilder(t, func(b *notificationContextBuilder) {
+		b.channelMessages = func(channel string) []channelMessage {
+			captured = channel
+			return nil
+		}
+	})
+	_ = b.NotificationContext("", " ", "", "", 5)
+	if captured != "general" {
+		t.Errorf("empty channel should default to general; got %q", captured)
+	}
+}
+
+func TestNotificationContext_UltimateThreadRoot_WalksReplyChain(t *testing.T) {
+	msgs := []channelMessage{
+		{ID: "ROOT", From: "you", Content: "original"},
+		{ID: "A", From: "cos", Content: "delegating", ReplyTo: "ROOT"},
+		{ID: "B", From: "eng", Content: "ack", ReplyTo: "A"},
+	}
+	b := newTestNotifyContextBuilder(t, func(b *notificationContextBuilder) {
+		b.channelMessages = func(string) []channelMessage { return msgs }
+	})
+	if got := b.UltimateThreadRoot("general", "B"); got != "ROOT" {
+		t.Errorf("UltimateThreadRoot = %q, want ROOT", got)
+	}
+	if got := b.UltimateThreadRoot("general", ""); got != "" {
+		t.Errorf("UltimateThreadRoot(empty) should be empty")
+	}
+}
+
+func TestNotificationContext_UltimateThreadRoot_StopsOnCycle(t *testing.T) {
+	// Pathological case: depth cap (8) protects against cycles.
+	msgs := []channelMessage{
+		{ID: "A", ReplyTo: "B"},
+		{ID: "B", ReplyTo: "A"},
+	}
+	b := newTestNotifyContextBuilder(t, func(b *notificationContextBuilder) {
+		b.channelMessages = func(string) []channelMessage { return msgs }
+	})
+	got := b.UltimateThreadRoot("general", "A")
+	if got != "A" && got != "B" {
+		t.Errorf("UltimateThreadRoot in cycle should return one of the cycle nodes; got %q", got)
+	}
+}
+
+func TestNotificationContext_ThreadMessageIDs_BFS(t *testing.T) {
+	msgs := []channelMessage{
+		{ID: "R"},
+		{ID: "A", ReplyTo: "R"},
+		{ID: "B", ReplyTo: "R"},
+		{ID: "AA", ReplyTo: "A"},
+		{ID: "off", ReplyTo: "elsewhere"},
+	}
+	b := newTestNotifyContextBuilder(t, func(b *notificationContextBuilder) {
+		b.channelMessages = func(string) []channelMessage { return msgs }
+	})
+	got := b.ThreadMessageIDs("general", "R")
+	for _, want := range []string{"R", "A", "B", "AA"} {
+		if _, ok := got[want]; !ok {
+			t.Errorf("ThreadMessageIDs missing %q; got %v", want, got)
+		}
+	}
+	if _, ok := got["off"]; ok {
+		t.Errorf("ThreadMessageIDs should not include off-thread node; got %v", got)
+	}
+}
+
+func TestNotificationContext_TaskNotificationContext_LeadGetsAllChannels(t *testing.T) {
+	all := []teamTask{
+		{ID: "t1", Channel: "general", Title: "general task", Owner: "cos", status: "in_progress", UpdatedAt: "2026-01-01T00:00:00Z"},
+		{ID: "t2", Channel: "engineering", Title: "eng task", Owner: "cos", status: "in_progress", UpdatedAt: "2026-04-01T00:00:00Z"},
+	}
+	b := newTestNotifyContextBuilder(t, func(b *notificationContextBuilder) {
+		b.allTasks = func() []teamTask { return all }
+		b.channelTasks = func(string) []teamTask { return nil }
+	})
+	got := b.TaskNotificationContext("", "cos", 5)
+	if !strings.Contains(got, "general task") {
+		t.Errorf("expected general task in lead context: %q", got)
+	}
+	if !strings.Contains(got, "eng task") {
+		t.Errorf("expected eng task in lead context: %q", got)
+	}
+	// Most-recently-updated first (by UpdatedAt desc).
+	idxEng := strings.Index(got, "eng task")
+	idxGen := strings.Index(got, "general task")
+	if idxEng > idxGen {
+		t.Errorf("expected eng task (UpdatedAt 200) before general task (UpdatedAt 100); got eng=%d gen=%d", idxEng, idxGen)
+	}
+}
+
+func TestNotificationContext_TaskNotificationContext_LeadEmptyShowsCreateNextOwnedHint(t *testing.T) {
+	b := newTestNotifyContextBuilder(t, func(b *notificationContextBuilder) {
+		b.allTasks = func() []teamTask { return nil }
+	})
+	got := b.TaskNotificationContext("", "cos", 5)
+	if got != "" {
+		// When there are no tasks at all, the function returns empty (no
+		// "Active tasks" header). Verify that's still the contract.
+		if strings.Contains(got, "Active tasks") {
+			t.Errorf("expected empty when no tasks; got %q", got)
+		}
+	}
+}
+
+func TestNotificationContext_TaskNotificationContext_LeadAlertsOnReviewBacklog(t *testing.T) {
+	tasks := []teamTask{
+		{ID: "t1", Title: "ready 1", Owner: "eng", status: "review", UpdatedAt: "2026-01-01T00:00:00Z"},
+		{ID: "t2", Title: "ready 2", Owner: "eng", status: "in_progress", reviewState: "ready_for_review", UpdatedAt: "2026-04-01T00:00:00Z"},
+		{ID: "t3", Title: "active", Owner: "eng", status: "in_progress", UpdatedAt: "2025-12-01T00:00:00Z"},
+	}
+	b := newTestNotifyContextBuilder(t, func(b *notificationContextBuilder) {
+		b.allTasks = func() []teamTask { return tasks }
+		b.channelTasks = func(string) []teamTask { return nil }
+	})
+	got := b.TaskNotificationContext("", "cos", 5)
+	if !strings.Contains(got, "2 task(s) are waiting in review") {
+		t.Errorf("expected review-backlog hint with count 2; got %q", got)
+	}
+}
+
+func TestNotificationContext_TaskNotificationContext_NonLeadOnlyOwnedTasks(t *testing.T) {
+	tasks := []teamTask{
+		{ID: "t1", Channel: "general", Title: "mine", Owner: "eng", status: "in_progress"},
+		{ID: "t2", Channel: "general", Title: "theirs", Owner: "cos", status: "in_progress"},
+	}
+	b := newTestNotifyContextBuilder(t, func(b *notificationContextBuilder) {
+		b.channelTasks = func(string) []teamTask { return tasks }
+	})
+	got := b.TaskNotificationContext("general", "eng", 5)
+	if !strings.Contains(got, "mine") {
+		t.Errorf("expected own task: %q", got)
+	}
+	if strings.Contains(got, "theirs") {
+		t.Errorf("non-lead should only see their own owned tasks first; got %q", got)
+	}
+}
+
+func TestNotificationContext_RelevantTaskForTarget_ThreadIDMatch(t *testing.T) {
+	tasks := []teamTask{
+		{ID: "t1", Owner: "eng", status: "in_progress", ThreadID: "msg-123"},
+	}
+	b := newTestNotifyContextBuilder(t, func(b *notificationContextBuilder) {
+		b.allTasks = func() []teamTask { return tasks }
+	})
+	got, ok := b.RelevantTaskForTarget(channelMessage{ID: "msg-123"}, "eng")
+	if !ok || got.ID != "t1" {
+		t.Fatalf("expected t1 by ThreadID match; got (%v, %v)", got, ok)
+	}
+}
+
+func TestNotificationContext_RelevantTaskForTarget_FallsBackToScore(t *testing.T) {
+	tasks := []teamTask{
+		{ID: "t-low", Owner: "eng", status: "in_progress"},
+		{ID: "t-high", Owner: "eng", status: "in_progress"},
+	}
+	b := newTestNotifyContextBuilder(t, func(b *notificationContextBuilder) {
+		b.allTasks = func() []teamTask { return tasks }
+		b.scoreTaskCandidate = func(msg channelMessage, task teamTask) float64 {
+			if task.ID == "t-high" {
+				return 0.99
+			}
+			return 0.30
+		}
+	})
+	got, ok := b.RelevantTaskForTarget(channelMessage{ID: "msg-x"}, "eng")
+	if !ok || got.ID != "t-high" {
+		t.Fatalf("expected highest-scoring owned task; got (%v, %v)", got, ok)
+	}
+}
+
+func TestNotificationContext_RelevantTaskForTarget_SkipsDoneAndOtherOwners(t *testing.T) {
+	tasks := []teamTask{
+		{ID: "done", Owner: "eng", status: "done"},
+		{ID: "ot", Owner: "fe", status: "in_progress"},
+	}
+	b := newTestNotifyContextBuilder(t, func(b *notificationContextBuilder) {
+		b.allTasks = func() []teamTask { return tasks }
+		b.scoreTaskCandidate = func(channelMessage, teamTask) float64 { return 0.99 }
+	})
+	if _, ok := b.RelevantTaskForTarget(channelMessage{}, "eng"); ok {
+		t.Errorf("done tasks must not match")
+	}
+}
+
+// Regression: a deep reply (msg → parent → root, with task anchored on
+// root) must still resolve to the task. Pre-fix, RelevantTaskForTarget
+// only walked one hop via msg.ReplyTo, so anything past depth 2 missed.
+func TestNotificationContext_RelevantTaskForTarget_DeepReplyResolvesViaUltimateRoot(t *testing.T) {
+	msgs := []channelMessage{
+		{ID: "root", Channel: "general", From: "you"},
+		{ID: "mid", Channel: "general", From: "cos", ReplyTo: "root"},
+		{ID: "leaf", Channel: "general", From: "you", ReplyTo: "mid"},
+	}
+	tasks := []teamTask{
+		{ID: "t1", Owner: "eng", status: "in_progress", ThreadID: "root"},
+	}
+	b := newTestNotifyContextBuilder(t, func(b *notificationContextBuilder) {
+		b.channelMessages = func(string) []channelMessage { return msgs }
+		b.allTasks = func() []teamTask { return tasks }
+	})
+	// Trigger is the leaf; its ReplyTo is "mid" (not "root"). Without the
+	// fix, threadRoot would be "mid" and ThreadID="root" would not match.
+	got, ok := b.RelevantTaskForTarget(channelMessage{ID: "leaf", Channel: "general", ReplyTo: "mid"}, "eng")
+	if !ok || got.ID != "t1" {
+		t.Fatalf("expected t1 to match via ultimate thread root; got (%v, %v)", got, ok)
+	}
+}
+
+func TestNotificationContext_ResponseInstruction_LeadFromHumanGetsKickoffGuidance(t *testing.T) {
+	b := newTestNotifyContextBuilder(t)
+	got := b.ResponseInstructionForTarget(channelMessage{From: "you", Channel: "general", Content: "build it"}, "cos")
+	if !strings.Contains(got, "first engineering task itself must be a single smallest runnable feature slice") {
+		t.Errorf("lead-from-human instruction should require runnable slice; got %q", got)
+	}
+}
+
+func TestNotificationContext_ResponseInstruction_LeadFromSpecialistGetsApprovalGuidance(t *testing.T) {
+	b := newTestNotifyContextBuilder(t)
+	got := b.ResponseInstructionForTarget(channelMessage{From: "eng", Channel: "general", Content: "done"}, "cos")
+	if !strings.Contains(got, "specialist just finished a lane") {
+		t.Errorf("lead-from-specialist instruction should mention specialist finishing; got %q", got)
+	}
+}
+
+func TestNotificationContext_ResponseInstruction_DMTriggersDirectGuidance(t *testing.T) {
+	b := newTestNotifyContextBuilder(t)
+	got := b.ResponseInstructionForTarget(channelMessage{Channel: "dm-eng"}, "eng")
+	if !strings.Contains(got, "direct expertise") && !strings.Contains(got, "messaging you directly in a DM") {
+		t.Errorf("expected DM-direct guidance; got %q", got)
+	}
+}
+
+func TestNotificationContext_ResponseInstruction_TaggedTriggersTaggedGuidance(t *testing.T) {
+	b := newTestNotifyContextBuilder(t)
+	got := b.ResponseInstructionForTarget(channelMessage{Channel: "general", Tagged: []string{"eng"}}, "eng")
+	if !strings.Contains(got, "directly tagged") {
+		t.Errorf("expected tagged guidance; got %q", got)
+	}
+}
+
+func TestNotificationContext_ResponseInstruction_UntaggedNonOwnerInvitedToChimeIn(t *testing.T) {
+	b := newTestNotifyContextBuilder(t)
+	got := b.ResponseInstructionForTarget(channelMessage{Channel: "general"}, "eng")
+	if !strings.Contains(got, "brushes your domain") || !strings.Contains(got, "Skip the turn only if") {
+		t.Errorf("expected the substantive chime-in default for untagged non-owner; got %q", got)
+	}
+}
+
+func TestNotificationContext_BuildMessageWorkPacket_BasicShape(t *testing.T) {
+	b := newTestNotifyContextBuilder(t)
+	got := b.BuildMessageWorkPacket(channelMessage{ID: "m1", Channel: "general", From: "you"}, "eng")
+	for _, want := range []string{"Work packet:", "Thread: #general reply_to m1"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("missing %q in packet:\n%s", want, got)
+		}
+	}
+}
+
+func TestNotificationContext_BuildMessageWorkPacket_DMPreambleAdded(t *testing.T) {
+	b := newTestNotifyContextBuilder(t)
+	got := b.BuildMessageWorkPacket(channelMessage{ID: "m1", Channel: "dm-eng", From: "you"}, "eng")
+	if !strings.Contains(got, "DIRECT MESSAGE") {
+		t.Errorf("expected DM preamble; got %q", got)
+	}
+}
+
+func TestNotificationContext_BuildMessageWorkPacket_LeadAlreadyActiveLineSorted(t *testing.T) {
+	b := newTestNotifyContextBuilder(t, func(b *notificationContextBuilder) {
+		b.activeHeadlessBots = func(except string) map[string]struct{} {
+			return map[string]struct{}{"eng": {}, "fe": {}}
+		}
+		// Targeter must say "cos" is the lead.
+		b.targeter = fixtureTargeter(t, []officeMember{
+			{Slug: "cos", BuiltIn: true, Name: "CEO"},
+			{Slug: "eng"},
+			{Slug: "fe"},
+		})
+	})
+	got := b.BuildMessageWorkPacket(channelMessage{ID: "m", Channel: "general", From: "you"}, "cos")
+	if !strings.Contains(got, "Already active in this thread") {
+		t.Fatalf("expected already-active line for lead; got %q", got)
+	}
+	// Sorted alphabetical: @eng before @fe.
+	idxEng := strings.Index(got, "@eng")
+	idxFe := strings.Index(got, "@fe")
+	if idxEng < 0 || idxFe < 0 || idxEng > idxFe {
+		t.Errorf("expected @eng before @fe in active list; got eng=%d fe=%d", idxEng, idxFe)
+	}
+}
+
+func TestNotificationContext_BuildTaskExecutionPacket_LocalWorktreeAddsCutLineAndAuditGuards(t *testing.T) {
+	b := newTestNotifyContextBuilder(t)
+	task := teamTask{
+		ID:            "t1",
+		Title:         "build feature",
+		status:        "in_progress",
+		ExecutionMode: "local_worktree",
+		WorktreePath:  "/tmp/worktree",
+	}
+	got := b.BuildTaskExecutionPacket("eng", officeActionLog{Actor: "cos", Kind: "task_assigned"}, task, "kickoff")
+	for _, want := range []string{
+		"Working directory: \"/tmp/worktree\"",
+		"local_worktree build task",
+		"do NOT start with `rg --files`",
+		"stay inside the assigned working_directory",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("missing %q in packet:\n%s", want, got)
+		}
+	}
+}
+
+// TestNotificationContext_BuildTaskExecutionPacket_LeadGetsDecomposeBranch is
+// the Phase 3 behavioral fix: when the LEAD (cos) executes an owned task, the
+// packet tells it to decompose-and-delegate (create owned sub-tasks under this
+// task, reuse existing specialists, new bots need human approval) rather than
+// only doing the work itself. A specialist must NOT get that lead block.
+func TestNotificationContext_BuildTaskExecutionPacket_LeadGetsDecomposeBranch(t *testing.T) {
+	b := newTestNotifyContextBuilder(t)
+	task := teamTask{
+		ID:            "OFFICE-7",
+		Title:         "launch the referral program",
+		status:        "in_progress",
+		ExecutionMode: "office",
+	}
+
+	lead := b.BuildTaskExecutionPacket("cos", officeActionLog{Actor: "cos", Kind: "task_assigned"}, task, "kickoff")
+	for _, want := range []string{
+		"Lead execution rule: you are the coordinator",
+		"parent_issue_id=OFFICE-7",
+		"REUSE the existing specialist",
+		"creating a new bot ALWAYS requires explicit human approval",
+		"complete the parent only after the children are done",
+	} {
+		if !strings.Contains(lead, want) {
+			t.Errorf("lead packet missing %q in:\n%s", want, lead)
+		}
+	}
+
+	specialist := b.BuildTaskExecutionPacket("eng", officeActionLog{Actor: "cos", Kind: "task_assigned"}, task, "kickoff")
+	if strings.Contains(specialist, "Lead execution rule") {
+		t.Errorf("specialist packet must NOT contain the lead decompose block:\n%s", specialist)
+	}
+}
+
+func TestNotificationContext_BuildTaskExecutionPacket_NamesFileTargetsFromTitleAndDetails(t *testing.T) {
+	b := newTestNotifyContextBuilder(t)
+	task := teamTask{
+		ID:      "t1",
+		Title:   "Update `web/src/App.tsx`",
+		Details: "Also touch `internal/team/launcher.go`",
+		status:  "in_progress",
+	}
+	got := b.BuildTaskExecutionPacket("eng", officeActionLog{Actor: "cos"}, task, "kickoff")
+	if !strings.Contains(got, "Named file targets: web/src/App.tsx, internal/team/launcher.go") {
+		t.Errorf("expected named file targets line; got %q", got)
+	}
+}
+
+func TestNotificationContext_TaskNotificationContent_HumanizedHeader(t *testing.T) {
+	b := newTestNotifyContextBuilder(t)
+	got := b.TaskNotificationContent(officeActionLog{Kind: "task_unblocked"}, teamTask{
+		ID:      "t1",
+		Channel: "general",
+		Title:   "go",
+		Owner:   "eng",
+		status:  "in_progress",
+	})
+	if !strings.Contains(got, "Task unblocked") {
+		t.Errorf("expected unblocked verb; got %q", got)
+	}
+	if !strings.Contains(got, "@eng") {
+		t.Errorf("expected owner mention; got %q", got)
+	}
+}
+
+// Sanity-check that the launcher wires the builder up correctly so existing
+// dispatch paths see the same answers as the type does in isolation.
+func TestLauncher_NotifyContextWiringDelegates(t *testing.T) {
+	b := &Broker{tasks: []teamTask{
+		{ID: "t1", Channel: "general", Title: "thing", Owner: "cos", status: "in_progress"},
+	}}
+	l := &Launcher{
+		broker: b,
+		pack: &bot.PackDefinition{
+			LeadSlug: "cos",
+			Bots: []bot.BotConfig{
+				{Slug: "cos", Name: "CEO"},
+				{Slug: "eng", Name: "Engineer"},
+			},
+		},
+	}
+	got := l.buildTaskNotificationContext("general", "cos", 5)
+	if !strings.Contains(got, "thing") {
+		t.Errorf("expected cos task in context: %q", got)
+	}
+}
+
+// TestNotificationContext_PreReviewFilter asserts the fundamental
+// contract from the multi-bot control loop redundancy analysis:
+// a pre-merge channel message stamped with SourceTaskID is HIDDEN
+// from bots who are not the task owner or a reviewer, but VISIBLE
+// to the owner + each reviewer + the broker token (empty recipient).
+// Once the source task merges, the message becomes visible to all.
+func TestNotificationContext_PreReviewFilter(t *testing.T) {
+	t.Parallel()
+	preReviewTask := teamTask{
+		ID:             "task-A",
+		Channel:        "general",
+		Title:          "do thing",
+		Owner:          "tess",
+		Reviewers:      []string{"miles", "nico"},
+		LifecycleState: LifecycleStateReview,
+	}
+	mergedTask := teamTask{
+		ID:             "task-B",
+		Channel:        "general",
+		Title:          "shipped thing",
+		Owner:          "tess",
+		Reviewers:      []string{"miles"},
+		LifecycleState: LifecycleStateApproved,
+	}
+	preMsg := channelMessage{
+		ID:           "m1",
+		From:         "tess",
+		Channel:      "general",
+		Content:      "WIP: just added the new endpoint, will write tests",
+		Timestamp:    "2026-05-11T09:00:00Z",
+		SourceTaskID: "task-A",
+		Tagged:       []string{},
+	}
+	mergedMsg := channelMessage{
+		ID:           "m2",
+		From:         "tess",
+		Channel:      "general",
+		Content:      "Shipped: endpoint deployed",
+		Timestamp:    "2026-05-11T10:00:00Z",
+		SourceTaskID: "task-B",
+		Tagged:       []string{},
+	}
+	bareMsg := channelMessage{
+		ID:        "m3",
+		From:      "tess",
+		Channel:   "general",
+		Content:   "general comment unrelated to any task",
+		Timestamp: "2026-05-11T10:30:00Z",
+		Tagged:    []string{},
+	}
+
+	b := newTestNotifyContextBuilder(t, func(b *notificationContextBuilder) {
+		b.channelMessages = func(string) []channelMessage {
+			return []channelMessage{preMsg, mergedMsg, bareMsg}
+		}
+		b.taskByID = func(id string) *teamTask {
+			switch id {
+			case "task-A":
+				return &preReviewTask
+			case "task-B":
+				return &mergedTask
+			}
+			return nil
+		}
+	})
+
+	// Recipient "wren" is NOT on task-A; pre-review message must be hidden.
+	got := b.NotificationContext("wren", "general", "", "", 10)
+	if strings.Contains(got, "WIP: just added") {
+		t.Errorf("pre-review message leaked to non-reviewer wren:\n%s", got)
+	}
+	if !strings.Contains(got, "Shipped: endpoint deployed") {
+		t.Errorf("merged-task message hidden from non-reviewer wren:\n%s", got)
+	}
+	if !strings.Contains(got, "general comment unrelated") {
+		t.Errorf("bare message (no SourceTaskID) hidden:\n%s", got)
+	}
+
+	// Recipient "miles" IS a reviewer on task-A; pre-review visible.
+	got = b.NotificationContext("miles", "general", "", "", 10)
+	if !strings.Contains(got, "WIP: just added") {
+		t.Errorf("pre-review message hidden from reviewer miles:\n%s", got)
+	}
+
+	// Recipient "tess" IS the owner; pre-review visible.
+	got = b.NotificationContext("tess", "general", "", "", 10)
+	if !strings.Contains(got, "WIP: just added") {
+		t.Errorf("pre-review message hidden from owner tess:\n%s", got)
+	}
+
+	// Empty recipient (broker/owner token style) bypasses the filter.
+	got = b.NotificationContext("", "general", "", "", 10)
+	if !strings.Contains(got, "WIP: just added") {
+		t.Errorf("empty recipient should bypass filter, message hidden:\n%s", got)
+	}
+}
+
+// TestNotificationContext_BuildTaskExecutionPacket_LongMoneyTitleFullInPacket
+// is the regression guard for the live $61k→"$6…" data corruption (ICP-eval
+// v2 [00:00]/[00:10]): a lane briefed a $61k account as $6k because the
+// execution packet rendered the title through a 120-char display clip.
+// Titles are part of the work contract — the owner's packet must carry the
+// full amount even when it sits past the old clip boundary.
+func TestNotificationContext_BuildTaskExecutionPacket_LongMoneyTitleFullInPacket(t *testing.T) {
+	b := newTestNotifyContextBuilder(t)
+	title := "Renew the Corti Labs contract before the Q4 board review and make sure the two unresolved support escalations are handled escalation-first in every touch ($61,000 ARR at risk)"
+	if len(title) <= 120 {
+		t.Fatalf("fixture title must exceed the old 120-char clip; got %d chars", len(title))
+	}
+	task := teamTask{ID: "t1", Title: title, Owner: "eng", status: "in_progress"}
+
+	packet := b.BuildTaskExecutionPacket("eng", officeActionLog{Actor: "cos"}, task, "kickoff")
+	if !strings.Contains(packet, "$61,000") {
+		t.Errorf("owner's execution packet must carry the full money-bearing title; got:\n%s", packet)
+	}
+
+	// The message-packet active-task line is bot-facing too.
+	msg := channelMessage{ID: "m1", From: "you", Channel: "general", Content: "status?"}
+	msgPacket, _ := func() (string, []string) {
+		bb := newTestNotifyContextBuilder(t, func(nb *notificationContextBuilder) {
+			nb.allTasks = func() []teamTask { return []teamTask{task} }
+			nb.scoreTaskCandidate = func(channelMessage, teamTask) float64 { return 1 }
+		})
+		return bb.BuildMessageWorkPacketWithContext(msg, "eng")
+	}()
+	if !strings.Contains(msgPacket, "$61,000") {
+		t.Errorf("message packet's active-task line must carry the full title; got:\n%s", msgPacket)
+	}
+}
+
+// TestNotificationContext_RetrievedContext_HitsAndNoHits pins the mandatory
+// task-start retrieval block (anti-fabrication fix family #2): with wiki
+// hits the packet lists title + path and the manifest carries wiki:<path>;
+// with none the packet states exactly what was searched, so a false "no
+// data in the wiki" claim is impossible to make honestly.
+func TestNotificationContext_RetrievedContext_HitsAndNoHits(t *testing.T) {
+	task := teamTask{
+		ID: "t1", Title: "Prepare the Acme Corp QBR one-pager",
+		Details: "Use the account brief and renewal playbook.",
+		Owner:   "eng", status: "in_progress",
+	}
+
+	withHits := newTestNotifyContextBuilder(t, func(nb *notificationContextBuilder) {
+		nb.searchWikiArticles = func(terms []string, limit int) []wikiArticleHit {
+			if len(terms) == 0 || limit <= 0 {
+				t.Fatalf("searchWikiArticles called with empty terms or non-positive limit")
+			}
+			return []wikiArticleHit{{Path: "team/accounts/acme-corp.md", Title: "Acme Corp — renewal brief"}}
+		}
+	})
+	packet, contextUsed := withHits.BuildTaskExecutionPacketWithContext("eng", officeActionLog{Actor: "cos"}, task, "kickoff")
+	for _, want := range []string{
+		"RETRIEVED CONTEXT",
+		"Acme Corp — renewal brief — wiki:team/accounts/acme-corp.md",
+		"searched for: prepare acme corp",
+	} {
+		if !strings.Contains(packet, want) {
+			t.Errorf("packet missing retrieved-context fragment %q in:\n%s", want, packet)
+		}
+	}
+	foundManifest := false
+	for _, item := range contextUsed {
+		if item == "wiki:team/accounts/acme-corp.md" {
+			foundManifest = true
+		}
+	}
+	if !foundManifest {
+		t.Errorf("wiki hit must ride context_used; got %v", contextUsed)
+	}
+
+	noHits := newTestNotifyContextBuilder(t, func(nb *notificationContextBuilder) {
+		nb.searchWikiArticles = func([]string, int) []wikiArticleHit { return nil }
+	})
+	empty := noHits.BuildTaskExecutionPacket("eng", officeActionLog{Actor: "cos"}, task, "kickoff")
+	if !strings.Contains(empty, "(searched the wiki for:") || !strings.Contains(empty, "no hits") {
+		t.Errorf("no-hit packet must carry the explicit searched-no-hits line; got:\n%s", empty)
+	}
+
+	// No searcher wired (bare fixtures, markdown memory off) → no block.
+	bare := newTestNotifyContextBuilder(t)
+	plain := bare.BuildTaskExecutionPacket("eng", officeActionLog{Actor: "cos"}, task, "kickoff")
+	if strings.Contains(plain, "RETRIEVED CONTEXT") {
+		t.Errorf("packet must omit the block when no wiki searcher is wired:\n%s", plain)
+	}
+}
+
+// TestNotificationContext_HumanNoteLeadsPacketAndConsumes pins the stop-order
+// surface (ICP-eval v2 [00:50]): the pending human note leads the owner's
+// packet, the build consumes it via the callback, and non-owners neither see
+// nor consume it.
+func TestNotificationContext_HumanNoteLeadsPacketAndConsumes(t *testing.T) {
+	consumed := []string{}
+	b := newTestNotifyContextBuilder(t, func(nb *notificationContextBuilder) {
+		nb.consumeTaskHumanNote = func(taskID string) { consumed = append(consumed, taskID) }
+	})
+	task := teamTask{
+		ID: "t1", Title: "Draft the outreach sequence", Owner: "eng", status: "in_progress",
+		HumanNotePending: &TaskHumanNote{From: "human", Body: "Stop — read the real brief first.", At: "2026-06-10T00:00:00Z", Halt: true},
+	}
+
+	packet := b.BuildTaskExecutionPacket("eng", officeActionLog{Actor: "cos"}, task, "continue")
+	if !strings.HasPrefix(packet, "HUMAN POSTED WHILE YOU WORKED") {
+		t.Errorf("owner packet must LEAD with the human note; got head %q", truncate(packet, 80))
+	}
+	if !strings.Contains(packet, "Stop — read the real brief first.") {
+		t.Errorf("packet missing the note body:\n%s", packet)
+	}
+	if !strings.Contains(packet, "STOP order") {
+		t.Errorf("halt note must name the stop order:\n%s", packet)
+	}
+	// V3-N6: a Stop is a pause, never a revert license — the v3 live run
+	// answered a Stop with `git checkout HEAD` and destroyed the session's
+	// deliverable. The halt block must carry the do-not-revert contract.
+	if !strings.Contains(packet, "Do NOT discard or revert any work. Report state and wait.") {
+		t.Errorf("halt note must carry the do-not-revert instruction:\n%s", packet)
+	}
+	if !strings.Contains(packet, "explicit human instruction to revert") {
+		t.Errorf("halt note must require an explicit human instruction before any revert:\n%s", packet)
+	}
+	if len(consumed) != 1 || consumed[0] != "t1" {
+		t.Errorf("owner packet build must consume the note exactly once; got %v", consumed)
+	}
+
+	// Non-owner build: no note, no consumption.
+	consumed = nil
+	other := b.BuildTaskExecutionPacket("cos", officeActionLog{Actor: "cos"}, task, "fyi")
+	if strings.Contains(other, "HUMAN POSTED WHILE YOU WORKED") {
+		t.Errorf("non-owner packet must not render the note:\n%s", other)
+	}
+	if len(consumed) != 0 {
+		t.Errorf("non-owner packet build must not consume; got %v", consumed)
+	}
+}

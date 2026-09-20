@@ -1,0 +1,107 @@
+name: Auto Release
+
+on:
+  push:
+    branches: [main]
+    # Team wiki imports live in-repo but should not cut a new CLI/npm release.
+    # Ignore pushes that only touch the generated wiki payload.
+    paths-ignore:
+      - "index/**"
+      - "team/**"
+  # Manual escape hatch: cut a release without a [release] commit marker.
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  # Needed to dispatch the Release workflow after pushing the tag. Without
+  # this, gh workflow run returns HTTP 403.
+  actions: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    # Opt-in releases: a push to main cuts a release ONLY when its tip
+    # commit message contains the literal marker [release]. This replaced
+    # release-on-every-push, which produced ~8-9 npm/CLI releases a day
+    # (v0.194 → v0.210 in three days) and the matching Release-workflow
+    # spend. Put [release] on the squash-merge commit / PR title when a
+    # change should ship; routine commits accumulate on main untagged.
+    # workflow_dispatch runs bypass the marker for manual releases.
+    # The if: expression is evaluated by GitHub, not a shell — no injection risk.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      contains(github.event.head_commit.message, '[release]')
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # ratchet:actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Refuse auto-release from a non-app tree
+        run: |
+          missing=0
+          for path in go.mod cmd/hivex/main.go npm/package.json; do
+            if [ ! -e "$path" ]; then
+              echo "::error::missing ${path}; refusing to tag this tree"
+              missing=1
+            fi
+          done
+          test "$missing" -eq 0
+
+      - name: Get latest tag
+        id: latest
+        run: |
+          TAG=$(git tag --sort=-v:refname | grep '^v' | head -1)
+          echo "tag=${TAG:-v0.0.0}" >> "$GITHUB_OUTPUT"
+
+      - name: Bump version
+        id: bump
+        run: |
+          CURRENT="${{ steps.latest.outputs.tag }}"
+          CURRENT="${CURRENT#v}"
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
+
+          # Check all commits since last tag for bump signals
+          COMMITS=$(git log "${{ steps.latest.outputs.tag }}..HEAD" --pretty=format:"%s" 2>/dev/null || git log --pretty=format:"%s")
+
+          if echo "$COMMITS" | grep -qiE '^feat(\(|:)'; then
+            MINOR=$((MINOR + 1))
+            PATCH=0
+          else
+            PATCH=$((PATCH + 1))
+          fi
+
+          NEW="v${MAJOR}.${MINOR}.${PATCH}"
+          echo "version=$NEW" >> "$GITHUB_OUTPUT"
+          echo "Bumping ${{ steps.latest.outputs.tag }} -> $NEW"
+
+      - name: Create tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "${{ steps.bump.outputs.version }}" -m "Release ${{ steps.bump.outputs.version }}"
+          git push origin "${{ steps.bump.outputs.version }}"
+
+      - name: Dispatch Release workflow at the new tag
+        # Tag pushes made with GITHUB_TOKEN do not fire other workflows, so
+        # the Release workflow's `on: push: tags` trigger never activates for
+        # auto-created tags. workflow_dispatch is the documented exception —
+        # gh triggers it explicitly and passes --ref so Release runs at the
+        # newly-created tag (goreleaser reads GITHUB_REF = refs/tags/<tag>).
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.bump.outputs.version }}
+        run: |
+          gh workflow run release.yml --ref "$VERSION"
+
+      - name: Dispatch desktop-release workflow at the new tag
+        # Same GITHUB_TOKEN limitation as the Release dispatch above: a tag pushed
+        # with GITHUB_TOKEN never fires desktop-release.yml's `on: push: tags`, so
+        # dispatch it explicitly. Every product release then also builds + attaches
+        # the signed desktop apps. --ref points the run at the new tag (so its
+        # github.ref_name is the v* tag → draft:false → append to the release);
+        # the bare version is passed as the stamping input.
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.bump.outputs.version }}
+        run: |
+          gh workflow run desktop-release.yml --ref "$VERSION" -f version="${VERSION#v}"

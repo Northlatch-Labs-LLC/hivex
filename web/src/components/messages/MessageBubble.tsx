@@ -1,0 +1,598 @@
+import { type ReactNode, useMemo } from "react";
+import ReactMarkdown from "react-markdown";
+
+import type { Message } from "../../api/client";
+import { toggleReaction } from "../../api/client";
+import { useDefaultHarness } from "../../hooks/useConfig";
+import { useOfficeMembers } from "../../hooks/useMembers";
+import { useMessages } from "../../hooks/useMessages";
+import { formatTime } from "../../lib/format";
+import { resolveHarness } from "../../lib/harness";
+import { renderMentions } from "../../lib/mentions";
+import {
+  messageMarkdownComponents,
+  messageRemarkPlugins,
+} from "../../lib/messageMarkdown";
+import {
+  extractRichArtifactIds,
+  stripStandaloneRichArtifactReferenceLines,
+} from "../../lib/richArtifactReferences";
+import { useChannelSlug, useCurrentTaskId } from "../../routes/useCurrentRoute";
+import { useAppStore } from "../../stores/app";
+import { HarnessBadge } from "../ui/HarnessBadge";
+import { PixelAvatar } from "../ui/PixelAvatar";
+import { showNotice } from "../ui/Toast";
+import {
+  ArtifactSkeleton,
+  useArtifactSkeletonTrigger,
+} from "./ArtifactSkeleton";
+import {
+  ConsultRelayMarker,
+  parseConsultRelayPayload,
+} from "./cards/ConsultRelayMarker";
+import {
+  HumanRequestCard,
+  parseHumanRequestRaisedPayload,
+} from "./cards/HumanRequestCard";
+import {
+  parseSystemAuthErrorPayload,
+  SystemErrorCard,
+} from "./cards/SystemErrorCard";
+import {
+  parseTaskCommentPayload,
+  TaskCommentCard,
+} from "./cards/TaskCommentCard";
+import {
+  parseTaskCreatedPayload,
+  TaskCreatedCard,
+} from "./cards/TaskCreatedCard";
+import {
+  parseTaskLifecyclePayload,
+  TaskLifecycleCard,
+} from "./cards/TaskLifecycleCard";
+import {
+  parseWikiArticleCreatedPayload,
+  WikiArticleCreatedCard,
+} from "./cards/WikiArticleCreatedCard";
+import MessageArtifactReferences from "./MessageArtifactReferences";
+
+interface MessageBubbleProps {
+  message: Message;
+  grouped?: boolean;
+  /** Direct reply to a top-level channel message — renders indented under the parent. */
+  isReply?: boolean;
+  /** Count of direct replies to this message. Shows an "N replies" affordance. */
+  replyCount?: number;
+  /** Open the thread panel for this message. Shown as a hover action when provided. */
+  onOpenThread?: (id: string) => void;
+  /** Reply-to-this-reply inside the thread panel. Shown as a hover action when provided. */
+  onQuoteReply?: (message: Message) => void;
+  /** Copy a permalink to this message. Shown as a hover action when provided. */
+  onCopyLink?: (id: string) => void;
+  /**
+   * Channel this bubble belongs to. Required on surfaces that are NOT a
+   * `/channels/$slug` route — e.g. the task-detail chat (`/tasks/$id`), where
+   * `useChannelSlug()` returns null and would otherwise fall back to "general",
+   * sending reactions and the artifact-skeleton probe to the wrong channel.
+   * Omit on the channel route to keep deriving it from the URL.
+   */
+  channel?: string;
+}
+
+// biome-ignore lint/complexity/noExcessiveCognitiveComplexity: Existing cognitive complexity is baselined for a focused follow-up refactor.
+export function MessageBubble({
+  message,
+  grouped = false,
+  isReply = false,
+  replyCount = 0,
+  onOpenThread,
+  onQuoteReply,
+  onCopyLink,
+  channel,
+}: MessageBubbleProps) {
+  const routeChannel = useChannelSlug();
+  // A bubble's channel comes from the MESSAGE it renders before it comes from
+  // the URL, and never from a "general" default. The old
+  // `channel ?? routeChannel ?? "general"` is two bugs: `??` is nullish, so an
+  // empty string passed through, and the tail sent reactions to #general from
+  // any surface where useChannelSlug() is null — which already happened once
+  // on the task-detail chat (see TaskChannelChat's comment). message.channel
+  // is a required field, so this is also strictly more correct than the URL.
+  const currentChannel =
+    channel?.trim() || message.channel?.trim() || routeChannel?.trim() || "";
+  // When the chat is rendered inside a task-detail route, this is that
+  // task's id. Task-pointer cards (created / lifecycle) use it to detect a
+  // self-reference: a card pointing at the very task you are already viewing
+  // would "Open →" nowhere, so we suppress or de-link it (see the card
+  // dispatch below). Null on every non-task-detail surface.
+  const currentTaskId = useCurrentTaskId();
+  const { data: members = [] } = useOfficeMembers();
+  const setActiveBotSlug = useAppStore((s) => s.setActiveBotSlug);
+  const isHuman =
+    message.from === "you" ||
+    message.from === "human" ||
+    message.from.startsWith("human:");
+  // A bare "human" sender is the person at this keyboard (onboarding seeds
+  // and single-person offices post as "human"); only "human:<slug>" names a
+  // different team member.
+  const isLocalUser = message.from === "you" || message.from === "human";
+  const teamMemberDisplayName =
+    isHuman && !isLocalUser
+      ? message.from.startsWith("human:")
+        ? message.from.slice("human:".length).replace(/-/g, " ") ||
+          "team member"
+        : "Human"
+      : null;
+  const agent = members.find((m) => m.slug === message.from);
+  // A sender that is neither the human nor anyone on the roster is not an
+  // bot, and must not be dressed as one.
+  //
+  // The broker posts a handful of messages as "system" (a delivery landing, an
+  // onboarding welcome, a runtime error). Because the check above only asks
+  // "is this the human?", every one of them fell through to the bot branch
+  // and rendered as a colleague: a generated pixel face, an author line reading
+  // literally "system", and a button opening a bot profile panel for an
+  // bot that does not exist. The office appeared to contain a teammate
+  // nobody hired.
+  //
+  // Those senders are being removed at the source, but this is the safety net:
+  // whatever the broker sends, the UI must never invent a teammate out of an
+  // unknown slug.
+  const isSyntheticSender = !(isHuman || agent);
+  const isRosterBot = !isHuman && Boolean(agent);
+  const defaultHarness = useDefaultHarness();
+  const harness = isRosterBot
+    ? resolveHarness(agent?.provider, defaultHarness)
+    : null;
+
+  const reactions = message.reactions
+    ? Array.isArray(message.reactions)
+      ? (message.reactions as Array<{ emoji: string; count?: number }>)
+      : Object.entries(message.reactions).map(([emoji, users]) => ({
+          emoji,
+          count: Array.isArray(users) ? users.length : 1,
+        }))
+    : [];
+
+  // SECURITY: bot messages render through ReactMarkdown with a remark and
+  // components pipeline (../../lib/messageMarkdown). ReactMarkdown's default
+  // urlTransform strips javascript:/vbscript:/data: URIs; the anchor renderer
+  // adds a second-layer scheme allowlist. The legacy regex-based formatMarkdown
+  // path that used the React unsafe-HTML prop has been removed (it had been
+  // independently hardened on main via isSafeUrl(), but the lib swap is more
+  // durable: react-markdown is a battle-tested mdast pipeline, and the
+  // dedicated XSS test file web/src/lib/messageMarkdown.test.tsx (23 tests)
+  // covers javascript:/data:/vbscript:, image src, GFM autolinks, and raw
+  // HTML. Local-LLM bot content (mlx-lm, ollama, exo) flows through the
+  // same path so the XSS posture applies uniformly. Human input takes the
+  // safe ReactNode path via renderMentions.
+  const messageText = message.content || "";
+  const richArtifactIds = useMemo(
+    () => extractRichArtifactIds(messageText),
+    [messageText],
+  );
+  const renderedText = useMemo(
+    () => stripStandaloneRichArtifactReferenceLines(messageText),
+    [messageText],
+  );
+
+  // Turn human text like "@pm when are you free?" into mention chips for
+  // registered bot slugs. Non-bot @-references stay plain text. The
+  // memo keys on content + the slug list so rapid renders don't re-parse.
+  const knownSlugs = useMemo(() => members.map((m) => m.slug), [members]);
+  const humanRendered = useMemo(
+    () => (isHuman ? renderMentions(renderedText, knownSlugs) : null),
+    [isHuman, renderedText, knownSlugs],
+  );
+
+  // Skeletal loader between "gist" message and the eventual visual-artifact
+  // card. Only candidates: bot-authored top-level messages (not replies,
+  // not humans). We subscribe to the channel feed + a coarse ticker so the
+  // skeleton ages out (60s window) without waiting for the next refetch.
+  const skeletonCandidate = !(
+    isHuman ||
+    isReply ||
+    message.content?.startsWith("[STATUS]")
+  );
+  // Always call hooks (rules of hooks). When the candidate is not eligible,
+  // `useArtifactSkeletonTrigger` short-circuits to `false` and skips its own
+  // ticker, so this is also cheap.
+  const { data: channelMessages = [] } = useMessages(currentChannel);
+  const showArtifactSkeleton = useArtifactSkeletonTrigger({
+    enabled: skeletonCandidate,
+    message,
+    channelMessages,
+    members,
+  });
+
+  // Status messages — compact
+  if (message.content?.startsWith("[STATUS]")) {
+    const statusText = message.content.replace(/^\[STATUS\]\s*/, "");
+    return <div className="message-status animate-fade">{statusText}</div>;
+  }
+
+  // Consult relay: your bot messaged another bot, or heard back. Rendered
+  // as a centered divider, never as a bubble — it has no author, because
+  // nobody said it. Derived server-side from the real bot-to-bot message
+  // (internal/team/broker_consult_relay.go), so it cannot be faked by a bot
+  // claiming a consult it never had.
+  // Seed markers for the bots (which operation was synthesized, and the
+  // run-it-for-real contract) are context for the bot, not conversation.
+  // They stay in the channel history the bot reads and never render as
+  // an "Office" speaker.
+  if (
+    message.kind === "synthesized_blueprint" ||
+    message.kind === "from_scratch_contract"
+  ) {
+    return null;
+  }
+  if (message.kind === "consult_relay") {
+    return (
+      <ConsultRelayMarker payload={parseConsultRelayPayload(message.payload)} />
+    );
+  }
+
+  // Issue #933: system-authored auth-failure card. Renders OUTSIDE the
+  // standard message-bubble container so it's visually distinct from
+  // bot chat — banner-style with a sign-in CTA rather than an avatar +
+  // speech bubble. The broker emits these in place of the legacy
+  // agent_issue bubble when a provider returns "Not logged in".
+  if (message.kind === "system_auth_error") {
+    const payload = parseSystemAuthErrorPayload(message.payload);
+    return <SystemErrorCard payload={payload} />;
+  }
+
+  // System-authored issue card. Broker emits one per team_task
+  // action=create with task_type=issue. Renders OUTSIDE the standard
+  // message-bubble so it visually reads as a system event, not an
+  // bot line — same pattern as SystemErrorCard.
+  if (message.kind === "issue_created") {
+    const payload = parseTaskCreatedPayload(message.payload);
+    // Suppress the card entirely when it points at the task whose channel
+    // is already on screen — the "Open →" would just reload this page, so
+    // it reads as a dead card. Show it only when it points elsewhere
+    // (e.g. a sub-task created from this conversation).
+    if (payload.task_id && payload.task_id === currentTaskId) return null;
+    return <TaskCreatedCard payload={payload} />;
+  }
+
+  // PR-style Issue comment card. Broker emits one per
+  // POST /tasks/{id}/comment with a brief instructional content the
+  // bot loop wakes on; the card body shows the actual comment as a
+  // distinct chat surface so the human's question on the Issue does
+  // not look like a free-form chat ask.
+  if (message.kind === "issue_comment") {
+    const payload = parseTaskCommentPayload(message.payload);
+    return <TaskCommentCard payload={payload} />;
+  }
+
+  // Lifecycle transition cards (Drafting→Running, →Done, etc). Broker
+  // emits one whenever an Issue's lifecycle state changes in a way the
+  // human should see. Same surface treatment as TaskCreatedCard.
+  if (message.kind === "issue_lifecycle") {
+    const payload = parseTaskLifecyclePayload(message.payload);
+    // Same task as the channel on screen → still surface the transition
+    // (useful inline history) but render it inert: no "Open →", not
+    // clickable. Pointing at a different task keeps the openable card.
+    const sameTask = Boolean(
+      payload.task_id && payload.task_id === currentTaskId,
+    );
+    return <TaskLifecycleCard payload={payload} sameTask={sameTask} />;
+  }
+
+  // A bot's blocking ask, rendered as an interactive card in the thread —
+  // the options as real buttons, answered in place. Rendered OUTSIDE the
+  // standard message-bubble so it carries no author row: the wire message is
+  // sent by "system" (so it cannot wake other bots) and a byline would print
+  // a phantom "Office" speaker. The card names the real asker instead.
+  if (message.kind === "human_request_raised") {
+    const payload = parseHumanRequestRaisedPayload(message.payload);
+    return (
+      <HumanRequestCard payload={payload} fallbackText={message.content} />
+    );
+  }
+
+  // Wiki surface card. Broker emits this in #general when a new wiki
+  // article is created; the card is a clickable banner that routes to
+  // the underlying wiki article.
+  if (message.kind === "wiki_article_created") {
+    const payload = parseWikiArticleCreatedPayload(message.payload);
+    return <WikiArticleCreatedCard payload={payload} />;
+  }
+
+  return (
+    <div
+      className={`message animate-fade${grouped ? " message-grouped" : ""}${isReply ? " message-reply" : ""}`}
+      data-msg-id={message.id}
+      // Precise author selectors so e2e specs can filter without parsing
+      // textContent. `data-author-kind` is "human" | "bot"; `data-author-slug`
+      // carries the raw `from` (e.g. "you", "human", or a bot slug like "planner").
+      data-author-kind={
+        isHuman ? "human" : isSyntheticSender ? "system" : "agent"
+      }
+      data-author-slug={message.from}
+    >
+      {/* Avatar */}
+      {isRosterBot ? (
+        <button
+          type="button"
+          className="message-avatar avatar-with-harness message-avatar-btn"
+          data-bot-slug={message.from}
+          aria-label={`Open bot panel for ${agent?.name || message.from}`}
+          onClick={() => setActiveBotSlug(message.from)}
+        >
+          <PixelAvatar slug={message.from} size={24} />
+          {harness ? (
+            <HarnessBadge
+              kind={harness}
+              size={14}
+              className="harness-badge-on-avatar"
+            />
+          ) : null}
+        </button>
+      ) : (
+        <div
+          className="message-avatar"
+          style={{
+            background: "var(--bg-warm)",
+            color: "var(--text-secondary)",
+            fontSize: 12,
+            fontWeight: 600,
+          }}
+        >
+          {isSyntheticSender
+            ? null
+            : isLocalUser
+              ? "You"
+              : teamMemberDisplayName
+                ? teamMemberDisplayName.slice(0, 1).toUpperCase()
+                : null}
+        </div>
+      )}
+
+      {/* Content */}
+      <div className="message-content">
+        {/* Header */}
+        <div className="message-header">
+          {isRosterBot ? (
+            <button
+              type="button"
+              className="message-author message-author-btn"
+              data-bot-slug={message.from}
+              aria-label={`Open bot panel for ${agent?.name || message.from}`}
+              onClick={() => setActiveBotSlug(message.from)}
+            >
+              {agent?.name || message.from}
+            </button>
+          ) : (
+            <span className="message-author">
+              {isSyntheticSender
+                ? "Office"
+                : isLocalUser
+                  ? "You"
+                  : teamMemberDisplayName || agent?.name || message.from}
+            </span>
+          )}
+          {isHuman ? (
+            <span className="badge badge-neutral">human</span>
+          ) : agent?.role ? (
+            <span className="badge badge-green">{agent.role}</span>
+          ) : null}
+          <span className="message-time" title={message.timestamp}>
+            {formatTime(message.timestamp)}
+          </span>
+        </div>
+
+        {/* Text — humans render mention chips via safe ReactNode children;
+            bot messages render through ReactMarkdown (no raw HTML). */}
+        <MessageBodyText
+          isHuman={isHuman}
+          renderedText={renderedText}
+          humanRendered={humanRendered}
+        />
+
+        {/* Rich-artifact reference card, or the drafting skeleton while the
+            real card is still being produced. Rendered INSIDE .message-content
+            (not as a sibling of .message) so the skeleton aligns horizontally
+            with the eventual MessageArtifactReferences card instead of jumping
+            in from the feed edge when the real artifact lands. The skeleton
+            only shows when there's no real artifact reference yet. */}
+        {richArtifactIds.length > 0 ? (
+          <MessageArtifactReferences artifactIds={richArtifactIds} />
+        ) : showArtifactSkeleton ? (
+          <ArtifactSkeleton />
+        ) : null}
+
+        {/* Reactions */}
+        {reactions.length > 0 && (
+          <div className="message-reactions">
+            {reactions.map((r) => (
+              <button
+                type="button"
+                key={r.emoji}
+                className="reaction-pill"
+                onClick={() => {
+                  // No channel means no room to react in. Say so rather than
+                  // posting the reaction into whatever #general resolves to.
+                  if (!currentChannel) {
+                    showNotice(
+                      "This message has no channel, so the reaction has nowhere to go.",
+                      "error",
+                    );
+                    return;
+                  }
+                  toggleReaction(message.id, r.emoji, currentChannel).catch(
+                    (e: Error) =>
+                      showNotice(`Reaction failed: ${e.message}`, "error"),
+                  );
+                }}
+              >
+                <span>{r.emoji}</span>
+                <span className="reaction-pill-count">{r.count ?? 1}</span>
+              </button>
+            ))}
+          </div>
+        )}
+
+        {/* Thread summary — shown under a parent that has replies. Clicking
+            opens the thread panel where the full chain is browsable. */}
+        {replyCount > 0 && onOpenThread && (
+          <button
+            type="button"
+            className="inline-thread-toggle"
+            onClick={() => onOpenThread(message.id)}
+            title="Open thread"
+          >
+            <svg
+              aria-hidden="true"
+              focusable="false"
+              width="12"
+              height="12"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            >
+              <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
+            </svg>
+            {replyCount} {replyCount === 1 ? "reply" : "replies"}
+          </button>
+        )}
+      </div>
+
+      <MessageHoverActions
+        message={message}
+        onOpenThread={onOpenThread}
+        onQuoteReply={onQuoteReply}
+        onCopyLink={onCopyLink}
+      />
+    </div>
+  );
+}
+
+function MessageBodyText({
+  isHuman,
+  renderedText,
+  humanRendered,
+}: {
+  isHuman: boolean;
+  renderedText: string;
+  humanRendered: ReactNode;
+}) {
+  if (!renderedText) return null;
+  if (isHuman) return <div className="message-text">{humanRendered}</div>;
+  return (
+    <div className="message-text">
+      <ReactMarkdown
+        remarkPlugins={messageRemarkPlugins}
+        components={messageMarkdownComponents}
+        skipHtml={true}
+      >
+        {renderedText}
+      </ReactMarkdown>
+    </div>
+  );
+}
+
+/**
+ * Hover toolbar (reply-in-thread / quote / copy-link). Absolutely positioned
+ * so it doesn't shift the bubble layout. Extracted from MessageBubble so the
+ * parent component stays under the function-length lint budget.
+ */
+function MessageHoverActions({
+  message,
+  onOpenThread,
+  onQuoteReply,
+  onCopyLink,
+}: {
+  message: Message;
+  onOpenThread?: (id: string) => void;
+  onQuoteReply?: (message: Message) => void;
+  onCopyLink?: (id: string) => void;
+}) {
+  if (!(onOpenThread || onQuoteReply || onCopyLink)) return null;
+  return (
+    <div
+      className="message-hover-actions"
+      role="toolbar"
+      aria-label="Message actions"
+    >
+      {onOpenThread ? (
+        <button
+          type="button"
+          className="message-hover-btn"
+          onClick={() => onOpenThread(message.id)}
+          title="Reply in thread"
+          aria-label="Reply in thread"
+        >
+          <svg
+            aria-hidden="true"
+            focusable="false"
+            width="14"
+            height="14"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+          >
+            <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
+          </svg>
+        </button>
+      ) : null}
+      {onQuoteReply ? (
+        <button
+          type="button"
+          className="message-hover-btn"
+          onClick={() => onQuoteReply(message)}
+          title="Quote-reply"
+          aria-label="Quote-reply"
+        >
+          <svg
+            aria-hidden="true"
+            focusable="false"
+            width="14"
+            height="14"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+          >
+            <path d="M3 21v-5a5 5 0 0 1 5-5h13" />
+            <path d="m16 16-5-5 5-5" />
+          </svg>
+        </button>
+      ) : null}
+      {onCopyLink ? (
+        <button
+          type="button"
+          className="message-hover-btn"
+          onClick={() => onCopyLink(message.id)}
+          title="Copy link"
+          aria-label="Copy link"
+        >
+          <svg
+            aria-hidden="true"
+            focusable="false"
+            width="14"
+            height="14"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+          >
+            <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71" />
+            <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.72-1.71" />
+          </svg>
+        </button>
+      ) : null}
+    </div>
+  );
+}

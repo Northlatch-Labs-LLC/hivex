@@ -1,0 +1,530 @@
+# AI_RULES — building a hivebot App
+
+These rules are the contract for any App Builder work on this project. Read them
+before editing and keep them satisfied; the publish step (`register_app`) and the
+sealed sandbox enforce most of them, so breaking one means a broken or rejected
+app.
+
+## Stack (do not swap)
+
+hivebot Apps are **refine apps**. The stack is fixed:
+
+- **React 19 + TypeScript**, built with **Vite + `vite-plugin-singlefile`** into
+  ONE self-contained `index.html`.
+- **[refine](https://refine.dev) (`@refinedev/core`)** — the headless data layer.
+  Every read/write goes through refine's data hooks, backed by a `dataProvider`
+  that talks to the hivebot bridge (never HTTP).
+- **[Mantine](https://mantine.dev) (`@mantine/core` + `@mantine/hooks`)** — the UI
+  kit. Use Mantine components (`Table`, `Badge`, `Button`, `TextInput`, `Select`,
+  `Card`, `Group`, `Stack`, `Title`, `Text`, …) for everything visual. Do NOT add
+  Tailwind, another UI kit, an icon font, or a second CSS framework.
+- **`@refinedev/react-table` + `@tanstack/react-table`** — the data-grid hook
+  (`useTable`) that gives sorting / filtering / pagination for free.
+
+Why this stack and not a heavier one: refine + Mantine builds to a single
+self-contained file (~200 KB gzip) that runs in the sealed iframe. Ant Design
+(`@refinedev/antd`) does NOT fit — it bundles to ~445 KB gzip — so it is not
+available here. Stay on Mantine.
+
+## How the providers are wired (don't break this shape)
+
+`src/main.tsx` mounts the providers. Keep this structure even if you rewrite the
+file:
+
+```tsx
+import "@mantine/core/styles.css";              // inlined into the single file
+import { MantineProvider } from "@mantine/core";
+import { Refine } from "@refinedev/core";
+import { bridgeDataProvider } from "./bridgeDataProvider";
+
+<MantineProvider forceColorScheme="dark">        // apps render on the dark operator surface
+  <Refine
+    dataProvider={bridgeDataProvider}            // routes data through the bridge
+    resources={[{ name: "tasks" }, { name: "members" }, { name: "emails" }]}
+    options={{ disableTelemetry: true, warnWhenUnsavedChanges: false }}
+  >
+    <App />
+  </Refine>
+</MantineProvider>
+```
+
+- **`forceColorScheme="dark"`** is required — the app renders on the operator's
+  muted-dark surface so it blends into the hivebot shell (not a white card on a
+  dark surface). Pinning the scheme also sidesteps Mantine's `localStorage`
+  color manager, which the sealed sandbox blocks. Don't remove it, don't switch
+  it to light.
+- **Use REAL data through the bridge** — the data hooks (`useList`/`useTable` on
+  `tasks`/`members`/`emails`, or `getEmails`/`getTasks`/`getOfficeMembers`) read
+  the signed-in user's actual office data. Do NOT hardcode mock/sample/fixture
+  rows when a real bridge source exists for what you are building. If the app
+  needs a data source that has NO bridge resource (e.g. "expenses"), surface a
+  short empty state naming what to connect rather than silently inventing fake
+  data.
+- **NO `routerProvider`** — the sandbox has no app-owned URL. A hivebot App is one
+  screen; you don't need a router. `useTable` defaults to `syncWithLocation:
+  false`, so table state lives in React, not the URL.
+- **NO `authProvider`** — the bridge runs as the signed-in user; the app holds no
+  token. Don't invent login flows or API keys.
+- **NO `notificationProvider` / `liveProvider` / `accessControlProvider`** — all
+  optional; some touch storage or sockets the sandbox blocks. Use plain Mantine
+  state for toasts.
+
+## Declaring resources and reading data
+
+A **resource** is a named dataset. `bridgeDataProvider` maps resource names to
+bridge calls:
+
+| Resource name        | Bridge call               | Notes                                  |
+| -------------------- | ------------------------- | -------------------------------------- |
+| `"tasks"`            | `getTasks()`              | ALL office tasks, every channel        |
+| `"members"`          | `getOfficeMembers()`      | the office roster                      |
+| `"emails"`           | `getEmails({limit:50})`   | read-only Gmail; empty if not connected|
+| any integration name | `callIntegration(...)`    | pass `meta:{ platform, action, params }`|
+
+Declare the resources you use in `<Refine resources={[…]}>`, then read them with
+refine hooks. **Never call `fetch` and never re-implement the data layer.**
+
+**Use refine, or don't mount it.** If your app reads/writes workspace data, route
+it through refine hooks (`useTable` / `useList` / `useOne` / `useCreate`) — that is
+why `<Refine>` + `bridgeDataProvider` are wired. Do NOT mount `<Refine>` and then
+ignore it by calling the bridge directly — a wired-but-unused data layer is dead
+weight and an AI tell. Conversely, if your app ONLY uses `ai()` + `createTask`
+(e.g. a paste-input tool with no workspace resources), you may drop `<Refine>`
+entirely and keep just `MantineProvider` — don't carry an unused provider.
+
+### A sortable / filterable / paginated grid — `useTable`
+
+This is the main pattern. `src/App.tsx` is a complete worked example over
+`"tasks"`. Copy its shape:
+
+```tsx
+import { useTable } from "@refinedev/react-table";
+import { type ColumnDef, flexRender } from "@tanstack/react-table";
+import { Table, Badge } from "@mantine/core";
+
+const columns: ColumnDef<MyRow>[] = [
+  { id: "title", accessorKey: "title", header: "Title" },
+  { id: "status", accessorKey: "status", header: "Status",
+    cell: ({ getValue }) => <Badge>{String(getValue())}</Badge> },
+];
+
+function Grid() {
+  const { reactTable, refineCore } = useTable<MyRow>({
+    columns,
+    refineCoreProps: { resource: "tasks", syncWithLocation: false,
+                       pagination: { pageSize: 10 } },
+  });
+  // refineCore.tableQuery.{isLoading,error,data}  → loading / error / empty states
+  // reactTable.getHeaderGroups() / getRowModel()  → render into <Table>
+  // reactTable.previousPage() / nextPage() / getCanNextPage() → pagination
+  // header.column.getToggleSortingHandler()       → click-to-sort
+}
+```
+
+The `useTable` return is `{ reactTable, refineCore }`:
+
+- **`reactTable`** is the TanStack Table instance — `getHeaderGroups()`,
+  `getRowModel()`, `getState().pagination`, `nextPage()`, sorting handlers.
+- **`refineCore`** is refine state — `tableQuery.isLoading`, `tableQuery.error`,
+  `tableQuery.data?.total`, plus `setFilters` / `setSorters` for server-driven
+  filtering.
+
+**NEVER memoize on the `reactTable` instance.** The instance is a STABLE
+reference — it never changes identity when data arrives — so
+`useMemo(() => reactTable.getRowModel().rows.filter(...), [reactTable, ...])`
+computes once against an EMPTY table and never recomputes: your counts update
+(they derive from `tableQuery.data`) while the list renders "no rows" forever.
+This shipped as a live bug. Read `getRowModel()` during render, or derive rows
+from `tableQuery.data` and depend on that:
+
+```tsx
+// WRONG — frozen on the empty initial table:
+const rows = useMemo(() => reactTable.getRowModel().rows.filter(f), [reactTable, f]);
+// RIGHT — recomputes when the data actually changes:
+const data = tableQuery.data?.data ?? [];
+const rows = useMemo(() => data.filter(f), [data, f]);
+```
+
+### A simple list — `useList`
+
+```tsx
+import { useList } from "@refinedev/core";
+const { data, isLoading } = useList({ resource: "members" });
+// data?.data is the array; render with Mantine
+```
+
+### A single record — `useOne` / `useShow`
+
+```tsx
+import { useOne } from "@refinedev/core";
+const { data } = useOne({ resource: "tasks", id: someId });
+```
+
+### Creating a task — `useForm` / `useCreate` (the ONE write)
+
+The only workspace write is creating an office task. The host shows the human a
+confirmation first, then creates it. Wire it to a button — never fire on load.
+
+```tsx
+import { useCreate } from "@refinedev/core";
+const { mutate, isLoading } = useCreate();
+// on click:
+mutate({ resource: "tasks", values: { title, details } });
+```
+
+`create` on any resource other than `"tasks"`, and any `update` / `delete`, throw
+loudly — apps are read-mostly by design. Don't try to work around this.
+
+## Integrations and AI
+
+- **Integration-backed apps.** `listIntegrations()` lists the user's connected
+  tools and their READ actions. To read an integration as a refine resource, pass
+  `meta`: `useList({ resource: "slack-msgs", meta: { platform: "slack", action:
+  "SLACK_FETCH_MESSAGES", params: {…} } })`. A READ action returns its result; a
+  MUTATING action is never executed by the app — the broker raises a human
+  approval card and the list comes back empty here. You can also call
+  `callIntegration(platform, action, params)` directly from `hivex-bridge.ts`.
+- **MANDATE — poll every `needs_approval` to resolution.** When
+  `callIntegration()` returns `{ status: "needs_approval", request_id }`, the
+  action has NOT run — a human still has to approve the card. The app
+  **MUST poll** `getActionStatus(request_id)` (e.g. every 5 seconds while the
+  tab is open) and reflect the outcome in its UI: the row resolves to
+  approved/posted on `"approved"` and to rejected on `"rejected"`, then polling
+  STOPS. A row must NEVER stay "Awaiting" forever after the human decided.
+  Minimal worked example:
+
+  ```tsx
+  import { callIntegration, getActionStatus } from "./hivex-bridge";
+
+  const res = await callIntegration("slack", "SLACK_SEND_MESSAGE", params);
+  if (res.status === "needs_approval" && res.request_id) {
+    setRow({ state: "awaiting" }); // show "Awaiting approval"
+    // hivex-allow: poll — approval status must resolve promptly after the human decides
+    const poll = window.setInterval(async () => {
+      const { state } = await getActionStatus(res.request_id!);
+      if (state === "approved" || state === "rejected") {
+        window.clearInterval(poll); // stop once resolved — never poll forever
+        setRow({ state }); // reflect approved/posted or rejected in the UI
+      }
+    }, 5_000);
+    // Also clear the interval on unmount (useEffect cleanup).
+  }
+  ```
+
+  The `// hivex-allow: poll` annotation is REQUIRED on this interval: Hard Rule 8
+  rejects sub-30s polling at publish, and this bounded, self-stopping approval
+  poll is the sanctioned exception — copy the annotation with the interval.
+- **AI-powered apps.** `ai(prompt, input?, { json? })` runs a bounded one-shot LLM
+  step over data you already fetched through the bridge (summarize / score /
+  classify). It is read-only reasoning, not a network call. With `{ json: true }`
+  you get a parsed object. If no provider is configured you get
+  `{ error: "ai_unavailable" }` — render a fallback.
+- **File download / export.** A raw `<a download>` or programmatic anchor click
+  does NOT work in the sandbox (opaque origin → the browser ignores `download`
+  and the click becomes a blocked navigation). To let the user save data (CSV,
+  JSON, …), call `download({ filename, content, mime })` from `hivex-bridge.ts` —
+  the host saves the bytes from its own trusted origin. Wire it to a button,
+  never fire it on load. For binary, base64-encode and pass `encoding:"base64"`.
+
+## The app's database — own your data model
+
+Every hivebot App has a small, real, PERSISTED database of its own (per app,
+server-side, via `db` in `hivex-bridge.ts`). This is how an app OWNS the model it
+manages instead of recomputing it from scratch on every mount — and it is exactly
+what the **Data tab** shows. Reach for it the moment your app DERIVES or CURATES
+something from a source read: an urgency score, a one-line summary, a group + its
+count, an action item, a normalized row. The pattern is **derive ONCE, persist,
+render from the DB**:
+
+1. **Define your tables** — the entities the app manages and their typed columns,
+   INCLUDING the computed fields, not just the raw source fields.
+   **One row per RECORD — never one aggregate row holding JSON-encoded
+   arrays.** If your model is "the findings of the last audit", the table is
+   `findings` with one row per finding (kind, record id, title, status,
+   found_at), plus at most a tiny meta/summary table for scalars. A single
+   `latest` row with columns like `no_owner: "[{...},{...}]"` is the
+   load-bearing anti-pattern: the Data tab and CSV export become unreadable,
+   `db.upsert` can no longer dedupe re-runs per record, and downstream tools
+   cannot query individual findings. Stringified JSON in a cell is a smell —
+   if you are about to `JSON.stringify` into a column, you almost always want
+   another table.
+2. **On first load, derive once and persist** — fetch the real source
+   (`getEmails` / `getTasks` / `callIntegration`), compute your model, and write it
+   with `db.defineTable` + `db.upsert`. Pass a stable `key` column so a re-run
+   REPLACES rows instead of duplicating them.
+3. **Render from the DB** — read with `db.query(name)` / `db.all()` and render
+   that. On later mounts read the DB FIRST; only re-derive when the initialized
+   marker is missing or the human hits Refresh. Track "already derived" with an
+   EXPLICIT marker (a tiny meta table or sentinel row), NOT `rows.length` — a
+   valid empty derive (zero urgent emails is a real answer) would otherwise
+   re-fetch on every mount. This is also how you satisfy hard rule 8 (don't
+   recompute on every mount) — the DB is your cache of record.
+
+```tsx
+import { db, getEmails, ai } from "./hivex-bridge";
+
+const TABLE = "Emails";
+const META = "Meta"; // one sentinel row marks "the derive already ran"
+
+async function ensureModel() {
+  // Already derived? Render straight from the DB — do NOT recompute. The check
+  // is the explicit marker, not rows.length, so an empty model still counts.
+  const meta = await db.query(META).catch(() => null);
+  if (meta?.table.rows.some((r) => r.key === "initialized")) {
+    const existing = await db.query(TABLE).catch(() => null);
+    if (existing) return { state: "ready", table: existing.table } as const;
+  }
+
+  // EVERY db.* call can reject (transport failure, server-side bounds) — not
+  // just db.query — so the WHOLE derive/write block is guarded. A failure
+  // becomes a designed error state with a Retry, never a blank screen.
+  try {
+    await db.defineTable(TABLE, [
+      { name: "id", type: "string" },
+      { name: "sender", type: "string" },
+      { name: "subject", type: "string" },
+      { name: "urgency", type: "number" }, // COMPUTED — not in the raw source
+      { name: "summary", type: "string" }, // COMPUTED via ai()
+    ]);
+    await db.defineTable(META, [{ name: "key", type: "string" }]);
+
+    const { connected, emails } = await getEmails({ limit: 25 });
+    if (!connected) return { state: "connect" } as const; // render a connect-state
+
+    const rows = await Promise.all(
+      emails.map(async (e) => ({
+        id: e.id,
+        sender: e.fromName || e.from,
+        subject: e.subject,
+        urgency: 0, // compute from labels/snippet
+        summary: (await ai(`One line: ${e.snippet}`).catch(() => ({}))).text ?? "",
+      })),
+    );
+    const { table } = await db.upsert(TABLE, rows, "id"); // key "id" = dedup on re-run
+    await db.upsert(META, [{ key: "initialized" }], "key"); // mark ONLY after the write
+    return { state: "ready", table } as const;
+  } catch {
+    return { state: "error" } as const; // degraded state — offer a Retry
+  }
+}
+```
+
+- The DB is DETERMINISTIC storage, not a query engine — v1 is tables, typed
+  columns, upsert-by-key, and read. No server-side joins or filters; filter and
+  sort in React after `db.query`.
+- Writes are gated + bounded server-side (table / column / row caps). Every `db.*`
+  call REJECTS on a transport failure, so await in try/catch, exactly like the
+  other bridge helpers.
+- A pure pass-through app with NO derived data (it lists a live source verbatim)
+  does not need the DB — read the source and render. Use the DB the moment you
+  COMPUTE or CURATE something worth keeping and showing in the Data tab.
+
+## Hard rules
+
+1. **Self-contained output.** `bun run build` must emit ONE `dist/index.html`
+   with all JS and CSS inlined (Mantine's CSS included). No external scripts,
+   stylesheets, fonts, or images. No `@import`. Images must be inline
+   `data:`/`blob:` URLs.
+2. **No direct network.** The app runs in a sealed sandbox: opaque origin (so NO
+   `localStorage` / `sessionStorage` / cookies) and CSP `connect-src 'none'` (so
+   NO `fetch` / `XMLHttpRequest` / `WebSocket`). Reach ALL data through refine's
+   hooks (backed by `bridgeDataProvider`) or the `hivex-bridge.ts` helpers
+   directly. Never persist to storage; keep state in React.
+3. **No secrets, no auth.** The app never holds a token; the bridge uses the
+   signed-in user's session. No `authProvider`, no API keys, no login flows.
+4. **One screen, no router.** A hivebot App is a single focused tool. Don't add a
+   `routerProvider`, server code, a database, or build steps beyond Vite.
+5. **Protected files — use, don't rewrite.**
+   - `src/hivex-bridge.ts` — the only channel out of the sandbox. Its helpers
+     (`callBroker`, `getTasks`, `getOfficeMembers`, `createTask`,
+     `callIntegration`, `getActionStatus`, `listIntegrations`, `ai`,
+     `getEmails`, `download`, and the `db` store) are already correct (e.g.
+     `getTasks()` returns ALL channels, not just "general"). Import and call
+     them as-is.
+   - `src/bridgeDataProvider.ts` — refine's `DataProvider` over the bridge. Import
+     `bridgeDataProvider`; do NOT reimplement it. Add a resource by extending its
+     `readers` map or passing `meta:{platform,action}` for an integration.
+   - `vite.config.ts` singlefile setup and the `hivex-app` / `hivex-host` message
+     shape must match the hivebot host — don't touch them.
+
+   You MAY freely rewrite `src/App.tsx` (your tool) and `src/main.tsx` (provider
+   wiring) — but keep the provider shape above.
+6. **Request only what you need.** Fetch lean payloads. `getEmails()` already
+   asks the broker for metadata + snippet only (`verbose:false`,
+   `include_payload:false`) — it returns kilobytes, not megabytes — so use its
+   `snippet`, and do NOT re-fetch full message bodies with a heavier action. For
+   `callIntegration()`, pass params that bound the result (a `limit`, a query, a
+   lean/metadata flag). Don't rely on the platform to trim your data: the broker
+   passes the integration result through and ERRORS on an oversized read rather
+   than truncating it, so an over-fetch comes back as a failure, not shrunk data.
+7. **Handle failures gracefully.** Every bridge call — `getEmails()`,
+   `callIntegration()`, `ai()` — can fail or return an error/empty result. Wrap
+   each in `try`/`catch` (or `.catch`) AND check the typed outcome before using
+   it: `getEmails()` returns `{ connected, emails, error? }` (never throws on a
+   normal error); `callIntegration()` returns `{ connected, status, result?,
+   error? }`; `ai()` returns `{ text?, object?, error? }` (e.g.
+   `"ai_unavailable"`). Render a real connect-state / error-state / empty-state.
+   NEVER run an unguarded `JSON.parse` on a bridge reply and never let a bad
+   response crash the app into a white screen. If you make MORE THAN ONE `ai()`
+   call (a multi-step pipeline), guard EVERY call — check `ai_unavailable` / a
+   generic `error` / a malformed `object` after each one, not just the first.
+8. **Don't refetch on every focus — this is ENFORCED.** Load once on mount;
+   refresh only on an explicit user action (a Refresh button) or a deliberate
+   schedule (a timer with a COMPUTED delay, e.g. a daily 9am refresh). Do NOT
+   re-run work — a Gmail fetch, an `ai()` summary, any pipeline — from a
+   `visibilitychange` or window-`focus`/`blur`/`pageshow` listener, and do NOT
+   `setInterval` faster than 30s. The human switches browser tabs constantly, so a
+   focus-triggered refresh reloads the whole app every time they come back and a
+   tight poll hammers integration rate limits and LLM tokens. **The publish step
+   rejects these patterns** (`register_app` returns a `file:line` violation list
+   from the efficiency harness) — fix them and republish. refine's data layer
+   already sets `refetchOnWindowFocus: false`; match that in any hand-rolled
+   fetch/effect. If the HUMAN explicitly asked for focus-triggered refresh or a
+   fast live cadence, record that on the offending line with
+   `// hivex-allow: focus-refresh — <what the human asked for>` (or
+   `// hivex-allow: poll — …`) — the only way to ship it. Separately, the broker
+   meters `ai()` and integration reads PER-APP (per-minute + per-day), so an app
+   that slips through still cannot burn the workspace's budget.
+
+## Design
+
+These rules keep the app correct. **`DESIGN.md` keeps it from looking AI-generated
+— read it, hold its bar, and run its pre-ship checklist before `register_app`.** A
+hivebot App is a fixed-kit, single-screen Mantine tool on white; the design bar is
+"make THAT feel crafted," not "add things the sandbox forbids." **ENFORCED — the
+publish step rejects an app that:** (a) does not render inside `MantineProvider` /
+import `@mantine/core` (build on the kit, don't hand-roll a CSS system); (b) ships
+**default-themed Mantine** — a missing or no-op `createTheme` (override it: ≥2 of
+primaryColor / defaultRadius / spacing / headings / fontFamily); or (c) renders a
+**list as a pile of `<Card>`s** (`.map(...)` producing `<Card>` — use a `<Table>`
+or rows instead). In short:
+
+1. **Set a real theme.** Override Mantine once in `main.tsx` via `createTheme` —
+   `primaryColor`, one `defaultRadius`, a heading scale, a tightened `spacing`
+   scale. Never ship default-themed Mantine; it is the #1 AI tell. (Keep
+   `forceColorScheme="dark"` and the provider shape above — only `theme` is yours.)
+2. **Hierarchy is type, not boxes.** One real `<Title>`, then `fw`/`size`/`c="dimmed"`
+   for rank — three tiers, not five font sizes. Monospace numbers and IDs.
+3. **Earn the card.** A pile of identical `<Card>`s is a tell — use a `<Table>` or
+   divider-separated `<Stack>` rows for lists; cards only for standalone objects.
+4. **One accent, with meaning.** Restrained neutral surface + one accent ≤10% of
+   pixels; status colors mean status (`variant="light"` badges). No gradients,
+   glassmorphism, colored card backgrounds, or decorative motion.
+5. **Compose with intent.** Use the theme spacing scale (not raw px), vary rhythm,
+   and use an asymmetric `Group`/`Grid` split when content has a primary + secondary
+   region instead of a reflexive centered column.
+6. **Real copy, real states.** Name the actual thing (no "Dashboard"/"Welcome"
+   placeholders); designed empty / loading / error / not-connected states, every one.
+
+## Style
+
+- Use Mantine components and props (`c="dimmed"`, `fw`, `size`, `variant`) for
+  hierarchy; reach into `src/styles.css` only for page-level layout.
+- Real empty / loading / error / not-connected states — the worked example shows
+  all four. An integration app must render a connect-state when `connected` is
+  false, not an error.
+- camelCase variables, PascalCase components, `is/has/should` booleans.
+
+## Build & publish
+
+Build errors are ground truth. **Run the verify gate before you publish** and do
+NOT call `register_app` until it passes clean. If it fails, read the reported
+`file:line:col` errors, fix them, and run the gate again — up to ~2 rounds. If it
+still fails, report the blocker instead of publishing a broken app.
+
+```bash
+bun install
+bun run verify         # GATE: tsc --noEmit && vite build — must pass before publish
+bun run build          # produces dist/index.html (single file)
+# then call register_app with:
+#   html_path   = ABSOLUTE path to dist/index.html  (broker reads the bundle)
+#   source_path = ABSOLUTE path to this project root (broker copies the whole
+#                 tree minus node_modules/dist, so the saved source always builds)
+# Do NOT paste the minified bundle and do NOT hand-list files — both drop data.
+```
+
+## Live-preview tooling (do not remove)
+
+`src/hivex-inspector.ts` and the `data-hivex-source` stamping in `vite.config.ts`
+power the live preview's **select to edit** and runtime-error surfacing. They are
+dev-only — `vite.config.ts` injects the inspector and the production single-file
+build strips all of it — so leave both in place. You may freely rewrite
+`src/main.tsx`; the inspector loads via `index.html`, not the entry file.
+
+## Integration copy — point at the host, not invented surfaces
+
+When an integration is not connected, say so plainly and stop. The HOST
+renders the connect affordance (a banner with a real Connect button above
+your app). NEVER invent navigation like "Settings → Integrations" — those
+surfaces are the host's, they move, and wrong directions strand the
+operator. Good: "Gmail is not connected yet — use the Connect button
+above." Bad: "Connect Gmail in Settings → Integrations."
+
+## After a mutating action, the UI reflects it immediately
+
+When a button mutates state (approve, escalate, archive, send), update the
+affected row/counters in the same interaction — optimistic update or refetch,
+either works. An operator who clicks "Escalate" and still sees PENDING with
+the same button assumes the click failed and clicks again. Every action's
+outcome must be visible where the operator is looking, immediately.
+
+## Bridge action failures are told, never swallowed
+
+`createTask`, `integration`, and other bridge calls can be refused (a
+confirmation is already pending), cancelled, or time out. NEVER swallow the
+rejection in an empty catch: tell the operator what happened where they are
+looking ("The confirmation was still open — finish it and try again", "That
+did not go through — try again"), and leave the row/state unchanged so the
+retry is obvious. A silent failure reads as a broken button.
+
+## Data provenance is sacred — no invented DATA rows
+
+Every persisted **data** row must trace to a bridge source (integration, office
+data) or something the operator typed. NEVER seed placeholder records ("Engineer
+1" … "Engineer 6", sample deals) into a data table — placeholders are
+indistinguishable from facts and poison every number computed from them. When a
+source is empty, render the honest empty state and let the operator add the
+first real record. If the workspace itself is the only data (no integration
+connected), never persist AI analysis OF THE WORKSPACE'S OWN SCAFFOLDING (your
+build task is not a deal).
+
+The one legitimate non-source row is the **derive marker** (the `Meta` /
+`initialized` sentinel in the useTable pattern above): it is app-owned CONTROL
+state, not data, and it never appears in a data table or a computed number. Use
+it exactly as shown — a `rows.length` check cannot tell "never derived" from
+"derived, and the honest answer was zero rows", so the explicit marker is
+required. That is the ONLY sentinel allowed; it is not a license for placeholder
+data.
+
+## Every user-triggered write gets visible feedback
+
+Use `@mantine/notifications` (already a dependency — mount `<Notifications />`
+once in main.tsx) or an inline status line: saving, saved, failed. A silent
+`.catch(() => {})` on a user-triggered write is forbidden — if the write can
+fail, the operator hears about it where they clicked.
+
+## Post-submit copy must describe surfaces that exist
+
+The host shell has NO "inbox", no task board, and no notifications center —
+its only surfaces are this app's tabs and the bot chat panel. After a
+successful `create_task` or approval-style submit, never write "check your
+inbox" or point at any surface you have not seen in the host. The honest
+line is: "Submitted — the team picked it up. You will be pinged in the bot
+chat when it needs your sign-off." Copy that sends the operator hunting for
+a page that does not exist reads as a bug even when the write succeeded.
+
+## No half-built tabs, and reach every control by keyboard
+
+Every tab, section, and button you render must be fully wired. NEVER ship a
+tab that shows "Coming soon", a placeholder, or an empty shell you did not
+intend as an honest empty state — if a surface is not built, do not render its
+tab. A dead tab reads as a broken app even when the rest works.
+
+Accessibility minimums (they are also how the operator's keyboard and the
+live-preview inspector reach your UI):
+- Every icon-only button gets an `aria-label` naming its action.
+- Every input has a visible `<label>` or an `aria-label`.
+- Every action is reachable and triggerable by keyboard (a clickable `<div>`
+  is not — use `<button>`).
+- Status reads as more than color: pair a color with text or a shape (use
+  `src/statusColor.ts` for the color, and always render the status word too).

@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="300" viewBox="0 0 880 300">
+<title>Hivex — Agentic Orchestration Harness</title>
+<defs>
+  <linearGradient id="gHex" x1="0" y1="0" x2="1" y2="1">
+    <stop offset="0" stop-color="#D97F0F"/>
+    <stop offset="1" stop-color="#9C5606"/>
+  </linearGradient>
+  <linearGradient id="gX" x1="0" y1="0" x2="1" y2="1">
+    <stop offset="0" stop-color="#E8940F"/>
+    <stop offset="1" stop-color="#A65E07"/>
+  </linearGradient>
+  <radialGradient id="gHalo">
+    <stop offset="0" stop-color="#E39A3B" stop-opacity="0.15"/>
+    <stop offset="1" stop-color="#E39A3B" stop-opacity="0"/>
+  </radialGradient>
+</defs>
+<g transform="translate(2 22) scale(0.5)"><path d="M461 256 L358.5 433.54 L153.5 433.54 L51 256 L153.5 78.46 L358.5 78.46 Z" fill="none" stroke="#C98B2E" stroke-opacity="0.1" stroke-width="3"/>
+  <path d="M256 108 L384.17 182 L384.17 330 L256 404 L127.83 330 L127.83 182 Z" fill="none" stroke="#C97A1A" stroke-opacity="0.08" stroke-width="30" stroke-linejoin="round"/>
+  <path d="M256 108 L384.17 182 L384.17 330 L256 404 L127.83 330 L127.83 182 Z" fill="none" stroke="url(#gHex)" stroke-width="14" stroke-linejoin="round"/>
+  <path d="M256 138 L256 374" stroke="#B97A2A" stroke-opacity="0.55" stroke-width="9" stroke-linecap="round"/>
+  <path d="M153.81 197 L358.19 315 M358.19 197 L153.81 315" stroke="#C97A1A" stroke-opacity="0.1" stroke-width="36" stroke-linecap="round" fill="none"/>
+  <path d="M153.81 197 L358.19 315 M358.19 197 L153.81 315" stroke="url(#gX)" stroke-width="18" stroke-linecap="round" fill="none"/>
+  <circle cx="358.19" cy="315" r="15" fill="url(#gHex)"/>
+  <circle cx="153.81" cy="315" r="15" fill="url(#gHex)"/>
+  <circle cx="153.81" cy="197" r="15" fill="url(#gHex)"/>
+  <circle cx="358.19" cy="197" r="15" fill="url(#gHex)"/>
+  <circle cx="256" cy="138" r="11" fill="none" stroke="#B97A2A" stroke-width="5"/>
+  <circle cx="256" cy="374" r="11" fill="none" stroke="#B97A2A" stroke-width="5"/>
+  <circle cx="312.21" cy="288.45" r="5" fill="#A66A12" stroke="none" opacity="0.9"/>
+  <circle cx="199.79" cy="288.45" r="5" fill="#A66A12" stroke="none" opacity="0.9"/>
+  <circle cx="199.79" cy="223.55" r="5" fill="#A66A12" stroke="none" opacity="0.9"/>
+  <circle cx="312.21" cy="223.55" r="5" fill="#A66A12" stroke="none" opacity="0.9"/>
+  <circle cx="256" cy="256" r="70" fill="url(#gHalo)"/>
+  <circle cx="256" cy="256" r="32" fill="none" stroke="#C98B2E" stroke-width="5"/>
+  <circle cx="256" cy="256" r="18" fill="url(#gX)"/>
+  <circle cx="256" cy="256" r="8.5" fill="#FBEFD4"/></g>
+  <g transform="translate(290 75) scale(1.5)"><path d="M8 8 V92 M52 8 V92 M8 50 H52 M93 8 V92 M134 8 L158 92 L182 8 M224 8 V92 M224 8 H262 M224 50 H254 M224 92 H262 M304 8 L352 92 M352 8 L304 92" fill="none" stroke="#241A0E" stroke-width="16" stroke-linecap="round" stroke-linejoin="round"/></g>
+  <text x="291" y="266" font-family="'Avenir Next','Helvetica Neue',Helvetica,Arial,sans-serif" font-size="24" font-weight="600" letter-spacing="4.3" fill="#8A6B3B" textLength="536" lengthAdjust="spacing">AGENTIC ORCHESTRATION HARNESS</text>
+</svg>

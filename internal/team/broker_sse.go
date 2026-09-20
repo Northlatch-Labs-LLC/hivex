@@ -1,0 +1,370 @@
+package team
+
+import (
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"strings"
+	"time"
+)
+
+// Server-Sent Events: per-broker fanout (handleEvents) and per-bot
+// stdout streaming (handleBotStream). Plus the tool-call audit channel
+// (handleBotToolEvent) which writes into the per-bot stream.
+//
+// SSE wire shape:
+//   - Content-Type: text/event-stream
+//   - 15s heartbeat as a comment line ": ping" — keeps proxies alive
+//     without producing an event the client has to handle.
+//   - Cancellation: r.Context().Done() — every loop checks it first.
+
+func (b *Broker) handleEvents(w http.ResponseWriter, r *http.Request) {
+	actor, ok := b.requestActorFromRequest(r)
+	if !ok {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+	r = requestWithActor(r, actor)
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+
+	messages, unsubscribeMessages := b.SubscribeMessages(256)
+	defer unsubscribeMessages()
+	actions, unsubscribeActions := b.SubscribeActions(256)
+	defer unsubscribeActions()
+	activity, unsubscribeActivity := b.SubscribeActivity(256)
+	defer unsubscribeActivity()
+	officeChanges, unsubscribeOffice := b.SubscribeOfficeChanges(64)
+	defer unsubscribeOffice()
+	wikiEvents, unsubscribeWiki := b.SubscribeWikiEvents(64)
+	defer unsubscribeWiki()
+	entityEvents, unsubscribeEntity := b.SubscribeEntityBriefEvents(64)
+	defer unsubscribeEntity()
+	factEvents, unsubscribeFacts := b.SubscribeEntityFactEvents(64)
+	defer unsubscribeFacts()
+	sectionsEvents, unsubscribeSections := b.SubscribeWikiSectionsUpdated(16)
+	defer unsubscribeSections()
+	categoriesEvents, unsubscribeCategories := b.SubscribeWikiCategoriesUpdated(16)
+	defer unsubscribeCategories()
+	playbookEvents, unsubscribePlaybook := b.SubscribePlaybookExecutionEvents(64)
+	defer unsubscribePlaybook()
+	playbookSynthEvents, unsubscribePlaybookSynth := b.SubscribePlaybookSynthesizedEvents(64)
+	defer unsubscribePlaybookSynth()
+	pamStarted, pamDone, pamFailed, unsubscribePam := b.SubscribePamActionEvents(64)
+	defer unsubscribePam()
+	governorEvents, unsubscribeGovernor := b.SubscribeGovernor(16)
+	defer unsubscribeGovernor()
+	computerEvents, unsubscribeComputer := b.computers().subscribe(64)
+	defer unsubscribeComputer()
+
+	// revoked is closed immediately when the human session is revoked.
+	// For broker-bearer actors it is nil (select on nil blocks forever — no-op).
+	revoked := b.humanSessionRevokeCh(actor.SessionID)
+
+	writeEvent := func(name string, payload any) error {
+		select {
+		case <-revoked:
+			return fmt.Errorf("human session revoked")
+		default:
+		}
+		data, err := json.Marshal(payload)
+		if err != nil {
+			return err
+		}
+		if _, err := fmt.Fprintf(w, "event: %s\ndata: %s\n\n", name, data); err != nil {
+			return err
+		}
+		flusher.Flush()
+		return nil
+	}
+
+	if err := writeEvent("ready", map[string]string{"status": "ok"}); err != nil {
+		return
+	}
+
+	heartbeat := time.NewTicker(15 * time.Second)
+	defer heartbeat.Stop()
+
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case <-revoked:
+			return
+		case msg, ok := <-messages:
+			if !ok || writeEvent("message", map[string]any{"message": msg}) != nil {
+				return
+			}
+		case action, ok := <-actions:
+			if !ok || writeEvent("action", map[string]any{"action": action}) != nil {
+				return
+			}
+		case snapshot, ok := <-activity:
+			if !ok || writeEvent("activity", map[string]any{"activity": snapshot}) != nil {
+				return
+			}
+		case evt, ok := <-officeChanges:
+			if !ok || writeEvent("office_changed", evt) != nil {
+				return
+			}
+		case evt, ok := <-wikiEvents:
+			if !ok || writeEvent("wiki:write", evt) != nil {
+				return
+			}
+		case evt, ok := <-entityEvents:
+			if !ok || writeEvent("entity:brief_synthesized", evt) != nil {
+				return
+			}
+		case evt, ok := <-factEvents:
+			if !ok || writeEvent("entity:fact_recorded", evt) != nil {
+				return
+			}
+		case evt, ok := <-sectionsEvents:
+			if !ok || writeEvent(wikiSectionsEventName, evt) != nil {
+				return
+			}
+		case evt, ok := <-categoriesEvents:
+			if !ok || writeEvent(wikiCategoriesEventName, evt) != nil {
+				return
+			}
+		case evt, ok := <-playbookEvents:
+			if !ok || writeEvent("playbook:execution_recorded", evt) != nil {
+				return
+			}
+		case evt, ok := <-playbookSynthEvents:
+			if !ok || writeEvent("playbook:synthesized", evt) != nil {
+				return
+			}
+		case evt, ok := <-pamStarted:
+			if !ok || writeEvent("pam:action_started", evt) != nil {
+				return
+			}
+		case evt, ok := <-pamDone:
+			if !ok || writeEvent("pam:action_done", evt) != nil {
+				return
+			}
+		case evt, ok := <-pamFailed:
+			if !ok || writeEvent("pam:action_failed", evt) != nil {
+				return
+			}
+		case evt, ok := <-computerEvents:
+			if !ok {
+				return
+			}
+			if err := writeEvent("computer", evt); err != nil {
+				return
+			}
+		case evt, ok := <-governorEvents:
+			if !ok || writeEvent("governor", evt) != nil {
+				return
+			}
+		case <-heartbeat.C:
+			if _, err := fmt.Fprintf(w, ": ping\n\n"); err != nil {
+				return
+			}
+			flusher.Flush()
+		}
+	}
+}
+
+// handleBotToolEvent appends a tool-call log line to the bot's stream so
+// the per-bot activity panel shows which MCP tool was invoked with what
+// arguments. Without this, the stream only shows raw pane-captured stdout —
+// useless for bots whose work happens entirely through MCP tool calls.
+//
+// Body: {"slug":"cos","phase":"call|result|error","tool":"team_broadcast","args":"...","result":"...","error":"..."}
+// Phase is informational; all fields but slug are optional.
+func (b *Broker) handleBotToolEvent(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var body struct {
+		Slug   string `json:"slug"`
+		Phase  string `json:"phase,omitempty"`
+		Tool   string `json:"tool,omitempty"`
+		Args   string `json:"args,omitempty"`
+		Result string `json:"result,omitempty"`
+		Error  string `json:"error,omitempty"`
+		TaskID string `json:"task_id,omitempty"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "invalid json", http.StatusBadRequest)
+		return
+	}
+	slug := strings.TrimSpace(body.Slug)
+	if slug == "" {
+		http.Error(w, "missing slug", http.StatusBadRequest)
+		return
+	}
+	stream := b.BotStream(slug)
+	if stream != nil {
+		line := formatBotToolEvent(body.Phase, body.Tool, body.Args, body.Result, body.Error)
+		if line != "" {
+			taskID := strings.TrimSpace(body.TaskID)
+			if taskID == "" {
+				b.mu.Lock()
+				taskID = b.activeTaskIDForBotLocked(slug)
+				b.mu.Unlock()
+			}
+			stream.PushTask(taskID, line+"\n")
+		}
+	}
+
+	w.WriteHeader(http.StatusOK)
+}
+
+// formatBotToolEvent renders one structured audit record for the per-bot
+// stream. SSE data lines must stay single-line; JSON encoding preserves exact
+// arguments/results while escaping embedded newlines.
+func formatBotToolEvent(phase, tool, args, result, errStr string) string {
+	tool = strings.TrimSpace(tool)
+	phase = strings.TrimSpace(phase)
+	if phase == "" {
+		phase = "tool"
+	}
+	if tool == "" {
+		return ""
+	}
+	payload := map[string]any{
+		"type":  "mcp_tool_event",
+		"phase": phase,
+		"tool":  tool,
+	}
+	if args != "" {
+		payload["arguments"] = decodeToolEventField(args)
+	}
+	if result != "" {
+		payload["result"] = decodeToolEventField(result)
+	}
+	if errStr != "" {
+		payload["error"] = decodeToolEventField(errStr)
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return ""
+	}
+	return string(data)
+}
+
+func decodeToolEventField(raw string) any {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	var decoded any
+	if err := json.Unmarshal([]byte(raw), &decoded); err == nil {
+		return decoded
+	}
+	return raw
+}
+
+// handleBotStream serves a per-bot stdout SSE stream.
+// Recent lines are replayed as initial history, then new lines are pushed live.
+// Path: /bot-stream/{slug}?task={taskID}
+//
+// When ?task= is supplied the stream is scoped to that task: history replay
+// uses the per-task buffer and live subscription only emits lines tagged with
+// the matching taskID. Omit ?task= to subscribe to the bot's full stream.
+func (b *Broker) handleBotStream(w http.ResponseWriter, r *http.Request) {
+	slug := strings.TrimPrefix(r.URL.Path, "/agent-stream/")
+	if slug == "" {
+		http.Error(w, "missing bot slug", http.StatusBadRequest)
+		return
+	}
+	taskID := strings.TrimSpace(r.URL.Query().Get("task"))
+	b.streamBotTaskSSE(w, r, slug, taskID)
+}
+
+// streamBotTaskSSE writes a bot's live HeadlessEvent stream as SSE,
+// optionally scoped to a single task. Shared by the raw /bot-stream/{slug}
+// endpoint and the app-scoped GET /apps/{id}/activity, which resolves an app's
+// backing app-builder run and streams it WITHOUT exposing the task id to the
+// client — the App is the only identifier the operator surface ever sees.
+func (b *Broker) streamBotTaskSSE(w http.ResponseWriter, r *http.Request, slug, taskID string) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+
+	stream := b.BotStream(slug)
+	if stream == nil {
+		http.Error(w, "bot stream not found", http.StatusNotFound)
+		return
+	}
+
+	// Replay recent history so the client sees context immediately. When a
+	// task scope is provided we replay + subscribe atomically so live events
+	// arriving between snapshot and subscribe aren't dropped.
+	var history []string
+	var lines <-chan string
+	var unsubscribe func()
+	if taskID != "" {
+		history, lines, unsubscribe = stream.subscribeTaskWithRecent(taskID)
+	} else {
+		history = stream.recent()
+		lines, unsubscribe = stream.subscribe()
+	}
+	defer unsubscribe()
+	for _, line := range history {
+		if _, err := fmt.Fprintf(w, "data: %s\n\n", line); err != nil {
+			return
+		}
+	}
+	// Replay-end boundary marker. The frontend listens for this named SSE
+	// event to flip its `phase` ref from "replay" to "live" so behaviors
+	// keyed on parsed events (e.g. closing the EventSource on a HeadlessEvent
+	// idle) only fire for live entries — replayed idle from the history
+	// buffer must NOT silently kill the connection. Default `data:` lines
+	// (both history and live) continue to land on `onmessage` so existing
+	// consumers keep working without any code change.
+	if _, err := fmt.Fprintf(w, "event: replay-end\ndata: {}\n\n"); err != nil {
+		return
+	}
+	// If no history, also send a connected marker so the client knows the
+	// stream is live. Kept after the replay-end boundary so its ordering
+	// relative to real entries is unambiguous.
+	if len(history) == 0 {
+		if _, err := fmt.Fprintf(w, "data: [connected]\n\n"); err != nil {
+			return
+		}
+	}
+	flusher.Flush()
+
+	heartbeat := time.NewTicker(15 * time.Second)
+	defer heartbeat.Stop()
+
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case line, ok := <-lines:
+			if !ok {
+				return
+			}
+			if _, err := fmt.Fprintf(w, "data: %s\n\n", line); err != nil {
+				return
+			}
+			flusher.Flush()
+		case <-heartbeat.C:
+			if _, err := fmt.Fprintf(w, ": ping\n\n"); err != nil {
+				return
+			}
+			flusher.Flush()
+		}
+	}
+}

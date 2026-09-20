@@ -1,0 +1,1105 @@
+package team
+
+import (
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/Northlatch-Labs-LLC/hivex/internal/emoji"
+)
+
+func (b *Broker) handleMessages(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodPost:
+		b.handlePostMessage(w, r)
+	case http.MethodGet:
+		b.handleGetMessages(w, r)
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+// handleAutomationNotifications ingests an externally-produced automation
+// message into a channel. The default sender slug is "hive": it is the Hive
+// automation identity for broker-authored notices. Messages written by older
+// builds under a legacy sender keep their stored identity — nothing here
+// rewrites history, and nothing here talks to any external service.
+func (b *Broker) handleAutomationNotifications(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var body struct {
+		Channel     string   `json:"channel"`
+		EventID     string   `json:"event_id"`
+		Title       string   `json:"title"`
+		Content     string   `json:"content"`
+		Tagged      []string `json:"tagged"`
+		ReplyTo     string   `json:"reply_to"`
+		Source      string   `json:"source"`
+		SourceLabel string   `json:"source_label"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "invalid json", http.StatusBadRequest)
+		return
+	}
+
+	msg, duplicate, err := b.PostAutomationMessage("hive", body.Channel, body.Title, body.Content, body.EventID, body.Source, body.SourceLabel, body.Tagged, body.ReplyTo)
+	if err != nil {
+		http.Error(w, "failed to persist broker state", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"id":        msg.ID,
+		"duplicate": duplicate,
+	})
+}
+
+func (b *Broker) handlePostMessage(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		From    string   `json:"from"`
+		Channel string   `json:"channel"`
+		Kind    string   `json:"kind"`
+		Title   string   `json:"title"`
+		Content string   `json:"content"`
+		Tagged  []string `json:"tagged"`
+		ReplyTo string   `json:"reply_to"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "invalid json", http.StatusBadRequest)
+		return
+	}
+	if actor, ok := requestActorFromContext(r.Context()); ok && actor.Kind == requestActorKindHuman {
+		body.From = humanMessageSender(actor.Slug)
+	}
+
+	b.mu.Lock()
+	// The blocking-request chat gate is CHANNEL-scoped: a pending approval
+	// in task A's channel parks chat there until answered, but the human
+	// keeps talking everywhere else. The old office-wide 409 meant one
+	// buried card silenced the whole office (v3 fix family #2).
+	if firstBlockingRequestInChannel(b.requests, body.Channel) != nil {
+		b.mu.Unlock()
+		http.Error(w, "request pending in this channel; answer required before chat resumes here", http.StatusConflict)
+		return
+	}
+
+	b.counter++
+	// Raw emptiness first: normalizeChannelSlug("") is "general", so a missing
+	// channel used to be silently laundered into the shared room. Resolve a real
+	// home instead — while #general is enabled this still answers "general", so
+	// today is unchanged; once it is off this is the bot's DM, or a refusal.
+	//
+	// homeChannelForLocked is the correct variant HERE specifically: b.mu is
+	// held at this point. The other variant would
+	// take the lock again and deadlock.
+	channel := ""
+	if raw := strings.TrimSpace(body.Channel); raw != "" {
+		channel = normalizeChannelSlug(raw)
+	}
+	if channel == "" {
+		home, err := b.homeChannelForLocked(body.From)
+		if err != nil {
+			http.Error(w, `channel is required: there is no default room to fall back to. Name a channel, or set a member slug so the message can go to that agent's DM.`, http.StatusBadRequest)
+			return
+		}
+		channel = home
+	}
+	// Auto-create DM conversations on first message (like Slack's conversations.open)
+	if b.findChannelLocked(channel) == nil {
+		if IsDMSlug(channel) {
+			if dm := b.ensureDMConversationLocked(channel); dm != nil {
+				channel = dm.Slug
+			}
+		} else if b.channelStore != nil {
+			if _, ok := b.channelStore.GetBySlug(channel); !ok {
+				b.mu.Unlock()
+				http.Error(w, "channel not found", http.StatusNotFound)
+				return
+			}
+		} else {
+			b.mu.Unlock()
+			http.Error(w, "channel not found", http.StatusNotFound)
+			return
+		}
+		// DM auto-create can fail (returns nil); the channelStore branch
+		// only validates registration, not local presence. Re-check before
+		// proceeding so we never post into a non-existent channel.
+		if b.findChannelLocked(channel) == nil {
+			b.mu.Unlock()
+			http.Error(w, "channel not found", http.StatusNotFound)
+			return
+		}
+	}
+	if !b.canAccessChannelLocked(body.From, channel) {
+		b.mu.Unlock()
+		http.Error(w, "channel access denied", http.StatusForbidden)
+		return
+	}
+	// Bot↔bot DMs are writable only by their two members; the human
+	// observes through the consult markers' read-only thread view.
+	if reason := b.guardBotDMPostLocked(channel, body.From); reason != "" {
+		b.mu.Unlock()
+		http.Error(w, reason, http.StatusForbidden)
+		return
+	}
+	// Auto-promote @slug mentions in the body into the tagged array. If a
+	// user or bot typed `@pm`, treat it as a tag — `extractMentionedSlugs`
+	// already restricts to registered bot slugs, so conversational use of
+	// an @ that doesn't match a bot is untouched. Previously this ran for
+	// bot posts only, on the theory that humans might want @ to be merely
+	// conversational. In practice humans expect every @bot to notify, and
+	// the web composer does not always commit typed @-text into an explicit
+	// tag chip.
+	//
+	// Senders allowed to auto-promote: empty / "you" / "human" (humans) and
+	// any registered bot slug. Everything else — "system", "hive", future
+	// synthetic senders — is excluded by default so automation posts do not
+	// accidentally wake bots on every @-reference they quote.
+	//
+	// Exception: when the human explicitly tags the lead (CEO), do not
+	// auto-promote OTHER bots mentioned in the body. Example:
+	// "@cos ask @reviewer to ..." — the human's intent is for CEO to route,
+	// not for the broker to fan out in parallel. Without this guard the
+	// reviewer gets notified twice (by auto-promote AND later by CEO's
+	// explicit tag), spawning two turns with nearly identical answers.
+	tagged := uniqueSlugs(body.Tagged)
+	sender := normalizeActorSlug(body.From)
+	isHuman := isHumanMessageSender(sender)
+	leadSlug := officeLeadSlugFrom(b.members)
+	mentionedSlugs := extractMentionedSlugs(body.Content)
+	leadExplicitlyTagged := leadSlug != "" && containsString(tagged, leadSlug)
+	if isHuman && !leadExplicitlyTagged && leadSlug != "" && containsString(mentionedSlugs, leadSlug) && b.findMemberLocked(leadSlug) != nil {
+		tagged = append(tagged, leadSlug)
+		leadExplicitlyTagged = true
+	}
+	suppressAutoPromote := isHuman && leadExplicitlyTagged
+	if b.senderMayAutoPromoteLocked(sender) && !suppressAutoPromote {
+		for _, slug := range mentionedSlugs {
+			if slug == sender {
+				continue
+			}
+			if b.findMemberLocked(slug) == nil {
+				continue
+			}
+			if !containsString(tagged, slug) {
+				tagged = append(tagged, slug)
+			}
+		}
+	}
+	for _, taggedSlug := range tagged {
+		if isHumanMessageSender(taggedSlug) || taggedSlug == "system" {
+			continue
+		}
+		if b.findMemberLocked(taggedSlug) == nil {
+			b.mu.Unlock()
+			http.Error(w, "unknown tagged member", http.StatusBadRequest)
+			return
+		}
+	}
+
+	// Thread auto-tagging: when a HUMAN replies in a thread, notify all
+	// other bots who have already participated. This keeps the team
+	// aligned without requiring the human to re-tag on every reply.
+	// Bot-to-bot auto-tagging is intentionally skipped: focus mode
+	// routing (specialist → lead only) already handles that path, and
+	// auto-tagging bot replies causes broadcast loops.
+	replyTo := strings.TrimSpace(body.ReplyTo)
+	isHumanSender := isHumanMessageSender(sender)
+	if replyTo != "" && isHumanSender {
+		threadRoot := replyTo
+		threadParticipants := []string{}
+		for _, existing := range b.messages {
+			inThread := existing.ID == threadRoot || existing.ReplyTo == threadRoot
+			if inThread && existing.From != body.From {
+				// Include bots; humans see via the web UI poll.
+				if !isHumanMessageSender(existing.From) && b.findMemberLocked(existing.From) != nil {
+					threadParticipants = append(threadParticipants, existing.From)
+				}
+			}
+		}
+		tagged = uniqueSlugs(append(tagged, threadParticipants...))
+	}
+
+	// Dedup near-identical consecutive broadcasts from the same bot in the
+	// same channel + thread within a short window. Observed symptom: a single
+	// CEO turn emits 2-3 team_broadcast calls with the same content in
+	// slightly different wording, each costing a full round-trip downstream.
+	// The prompt tells the model "at most one broadcast per turn", but that
+	// rule is routinely ignored; this is the broker-side safety net.
+	//
+	// Humans and system senders are exempt — this only fires for bot posts.
+	if !isHuman && sender != "" && sender != "system" && sender != "hive" {
+		if b.isDuplicateBotBroadcastLocked(sender, channel, replyTo, body.Content) {
+			b.counter--
+			b.mu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id":         "",
+				"deduped":    true,
+				"total":      len(b.messages),
+				"suppressed": "duplicate broadcast from the same bot in the same thread within the dedup window",
+			})
+			return
+		}
+	}
+
+	msg := channelMessage{
+		ID:        fmt.Sprintf("msg-%d", b.counter),
+		From:      body.From,
+		Channel:   channel,
+		Kind:      strings.TrimSpace(body.Kind),
+		Title:     strings.TrimSpace(body.Title),
+		Content:   body.Content,
+		Tagged:    tagged,
+		ReplyTo:   replyTo,
+		Timestamp: time.Now().UTC().Format(time.RFC3339),
+	}
+	msg = b.appendMessageLocked(msg)
+	total := len(b.messages)
+
+	// Human utterance routing (v3 fix family #2), in priority order:
+	//  1. A thread reply anchored to an active interview IS the interview
+	//     answer — the requesting bot's poll returns it ([19:24:53]: the
+	//     reply box was a dead letter). This must run BEFORE the legacy
+	//     cancel below, which used to cancel the very interview the human
+	//     was answering.
+	//  2. Otherwise a fresh human message cancels a stale same-channel
+	//     interview (the bot re-reads the chat instead).
+	//  3. Stop-order backstop + waiting-task follow-up: the message is
+	//     stamped on this channel's tasks so the owner's next packet leads
+	//     with it; tasks with no natural next turn (review/decision/
+	//     changes-requested/blocked/done) also get the task_followup wake.
+	// In-memory writes only; saveLocked below persists them.
+	var answerCascade []pendingTaskTransition
+	if isHumanMessageSender(msg.From) {
+		var answeredInterview bool
+		answeredInterview, answerCascade = b.answerInterviewFromHumanThreadReplyLocked(msg)
+		if !answeredInterview && humanSenderMayCancelInterviews(msg.From) {
+			b.cancelActiveHumanInterviewsLocked(msg.From, "Human sent a new message; unanswered interview canceled.", channel, replyTo)
+		}
+		b.markHumanNoteOnChannelTasksLocked(msg)
+	}
+
+	// Track which bots were tagged — they should show "typing" immediately
+	if len(msg.Tagged) > 0 && isHumanMessageSender(msg.From) {
+		if b.lastTaggedAt == nil {
+			b.lastTaggedAt = make(map[string]time.Time)
+		}
+		for _, slug := range msg.Tagged {
+			b.lastTaggedAt[slug] = time.Now()
+		}
+	}
+
+	// Clear typing indicator when a bot posts a reply
+	if !isHumanMessageSender(msg.From) && b.lastTaggedAt != nil {
+		delete(b.lastTaggedAt, msg.From)
+	}
+
+	// Snapshot-then-write: prepare the state write (prune + marshal) under
+	// the lock, but perform the DISK write after releasing b.mu. Message
+	// posting is the broker's hottest mutation (bot relays, system posts,
+	// human chat); holding the big lock across file I/O here serialized
+	// every other endpoint behind disk latency (F1, ten-out-of-ten Wave F).
+	// The seq guard in writeBrokerState drops this write if a newer state
+	// snapshot lands first, so out-of-order completion cannot regress the
+	// file. Failure semantics are unchanged: the message stays in memory
+	// and the caller gets a 500, exactly as the locked save behaved.
+	b.pruneCompletedTasksLocked()
+	write, err := b.prepareBrokerStateWriteLocked()
+	if err != nil {
+		b.mu.Unlock()
+		http.Error(w, "failed to persist broker state", http.StatusInternalServerError)
+		return
+	}
+	// Flush any task transitions released by an interview answered via
+	// thread reply — same post-persist cascade the /requests/answer
+	// handler performs.
+	b.flushPendingAutoNotebookTransitionsLocked(answerCascade, "system")
+	b.mu.Unlock()
+	if err := b.writeBrokerState(write); err != nil {
+		http.Error(w, "failed to persist broker state", http.StatusInternalServerError)
+		return
+	}
+
+	// PR 2: human "remember" intent. Hook fires AFTER b.mu.Unlock() and ONLY
+	// for human senders. Handle is a non-blocking enqueue; the classifier and
+	// the wiki write run in the writer goroutine, never re-entering b.mu.
+	if b.humanWikiWriter != nil && isHumanMessageSender(msg.From) {
+		b.humanWikiWriter.Handle(msg)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"id":    msg.ID,
+		"total": total,
+	})
+}
+
+func (b *Broker) handleReactions(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var body struct {
+		MessageID string `json:"message_id"`
+		Emoji     string `json:"emoji"`
+		From      string `json:"from"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "invalid json", http.StatusBadRequest)
+		return
+	}
+	if body.MessageID == "" || body.Emoji == "" || body.From == "" {
+		http.Error(w, "message_id, emoji, and from are required", http.StatusBadRequest)
+		return
+	}
+
+	b.mu.Lock()
+	found := false
+	for i := range b.messages {
+		if b.messages[i].ID == body.MessageID {
+			// Don't duplicate: same emoji from same bot
+			for _, r := range b.messages[i].Reactions {
+				if r.Emoji == body.Emoji && r.From == body.From {
+					b.mu.Unlock()
+					w.Header().Set("Content-Type", "application/json")
+					_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "duplicate": true})
+					return
+				}
+			}
+			b.messages[i].Reactions = append(b.messages[i].Reactions, messageReaction{
+				Emoji: body.Emoji,
+				From:  body.From,
+			})
+			found = true
+			break
+		}
+	}
+	if !found {
+		b.mu.Unlock()
+		http.Error(w, "message not found", http.StatusNotFound)
+		return
+	}
+	if err := b.saveLocked(); err != nil {
+		b.mu.Unlock()
+		http.Error(w, "failed to persist reaction", http.StatusInternalServerError)
+		return
+	}
+	b.mu.Unlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
+}
+
+// RecordTelegramGroup saves a group chat ID and title seen by the transport.
+//
+// TODO(broker-split): RecordTelegramGroup, SeenTelegramGroups, and
+// MarkRoutingTargets below are transport-bridging adjacent rather than
+// pure messaging. They co-locate here for now because the telegram
+// transport flows them through PostInboundSurfaceMessage; a future
+// pass should consider a broker_transport.go.
+func (b *Broker) RecordTelegramGroup(chatID int64, title string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.seenTelegramGroups == nil {
+		b.seenTelegramGroups = make(map[int64]string)
+	}
+	b.seenTelegramGroups[chatID] = title
+}
+
+// SeenTelegramGroups returns all group chats the transport has seen.
+func (b *Broker) SeenTelegramGroups() map[int64]string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.seenTelegramGroups == nil {
+		return nil
+	}
+	out := make(map[int64]string, len(b.seenTelegramGroups))
+	for k, v := range b.seenTelegramGroups {
+		out[k] = v
+	}
+	return out
+}
+
+// MarkRoutingTargets records implicit routing recipients as active so the UI
+// can show typing/thinking state without persisting a routing banner message.
+func (b *Broker) MarkRoutingTargets(slugs []string) {
+	if len(slugs) == 0 {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.lastTaggedAt == nil {
+		b.lastTaggedAt = make(map[string]time.Time)
+	}
+	now := time.Now()
+	for _, slug := range slugs {
+		slug = strings.TrimSpace(slug)
+		if slug == "" {
+			continue
+		}
+		b.lastTaggedAt[slug] = now
+	}
+}
+
+// bootstrapHumanHasPostedLocked seeds b.humanHasPosted from the persisted
+// message log so a freshly-restarted broker doesn't reshow the first-run
+// nudge to a human who already engaged. One linear scan, bounded by the
+// loaded message slice, runs once at NewBrokerAt time. Caller must hold b.mu.
+func (b *Broker) bootstrapHumanHasPostedLocked() {
+	if b.humanHasPosted {
+		return
+	}
+	for _, msg := range b.messages {
+		// Mirror the empty-From guard in appendMessageLocked:
+		// isHumanMessageSender("") returns true (legacy), so an empty
+		// From field must be rejected here too or a corrupted/legacy
+		// persisted message would falsely flip the bit on restart.
+		if strings.TrimSpace(msg.From) != "" && isHumanMessageSender(msg.From) {
+			b.humanHasPosted = true
+			return
+		}
+	}
+}
+
+// HumanHasPosted reports whether any human-authored message has reached the
+// broker since process start (with bootstrap from the persisted log). Used by
+// /office-members to publish the meta.humanHasPosted flag the frontend reads.
+func (b *Broker) HumanHasPosted() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.humanHasPosted
+}
+
+// PostSystemMessage posts a lightweight system message that shows progress without blocking.
+func (b *Broker) PostSystemMessage(channel, content, kind string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.counter++
+	if channel == "" {
+		channel = "general"
+	}
+	msg := channelMessage{
+		ID:        fmt.Sprintf("msg-%d", b.counter),
+		From:      "system",
+		Channel:   normalizeChannelSlug(channel),
+		Kind:      kind,
+		Content:   content,
+		Timestamp: time.Now().UTC().Format(time.RFC3339),
+	}
+	b.appendMessageLocked(msg)
+}
+
+func (b *Broker) PostMessage(from, channel, content string, tagged []string, replyTo string) (channelMessage, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	// Channel-scoped gate — see handlePostMessage for the rationale.
+	if firstBlockingRequestInChannel(b.requests, channel) != nil {
+		return channelMessage{}, fmt.Errorf("request pending in this channel; answer required before chat resumes here")
+	}
+	// A post with no channel goes to the SENDER's own DM. It used to be
+	// laundered into "general", which after the retirement fails the lookup
+	// below with "channel not found" — so every channel-less PostMessage
+	// caller (the task-comment handler among them) simply stopped working.
+	rawChannel := channel
+	channel = normalizeChannelSlug(channel)
+	if strings.TrimSpace(rawChannel) == "" {
+		if home, err := b.homeChannelForLocked(from); err == nil {
+			channel = home
+		}
+	}
+	if b.findChannelLocked(channel) == nil {
+		if IsDMSlug(channel) {
+			if dm := b.ensureDMConversationLocked(channel); dm != nil {
+				channel = dm.Slug
+			}
+		}
+		if b.findChannelLocked(channel) == nil {
+			return channelMessage{}, fmt.Errorf("channel not found")
+		}
+	}
+	if !b.canAccessChannelLocked(from, channel) {
+		return channelMessage{}, fmt.Errorf("channel access denied")
+	}
+	if reason := b.guardBotDMPostLocked(channel, from); reason != "" {
+		return channelMessage{}, fmt.Errorf("%s", reason)
+	}
+	b.counter++
+	msg := channelMessage{
+		ID:        fmt.Sprintf("msg-%d", b.counter),
+		From:      from,
+		Channel:   channel,
+		Kind:      "",
+		Title:     "",
+		Content:   emoji.ToShortcode(strings.TrimSpace(content)),
+		Tagged:    uniqueSlugs(tagged),
+		ReplyTo:   strings.TrimSpace(replyTo),
+		Timestamp: time.Now().UTC().Format(time.RFC3339),
+	}
+	msg = b.appendMessageLocked(msg)
+	// Human utterance routing — same priority order as handlePostMessage:
+	// thread-reply-to-interview answers the interview; otherwise a fresh
+	// human message cancels a stale same-channel interview; the note is
+	// stamped on this channel's tasks with the task_followup wake for
+	// waiting states.
+	var answerCascade []pendingTaskTransition
+	if isHumanMessageSender(msg.From) {
+		var answeredInterview bool
+		answeredInterview, answerCascade = b.answerInterviewFromHumanThreadReplyLocked(msg)
+		if !answeredInterview && humanSenderMayCancelInterviews(msg.From) {
+			b.cancelActiveHumanInterviewsLocked(msg.From, "Human sent a new message; unanswered interview canceled.", channel, msg.ReplyTo)
+		}
+		b.markHumanNoteOnChannelTasksLocked(msg)
+	}
+	// Clear typing indicator — bot has replied
+	if b.lastTaggedAt != nil {
+		delete(b.lastTaggedAt, msg.From)
+	}
+	b.appendActionLocked("automation", msg.Source, channel, msg.From, truncateSummary(msg.Title+" "+msg.Content, 140), msg.ID)
+	if err := b.saveLocked(); err != nil {
+		return channelMessage{}, err
+	}
+	b.flushPendingAutoNotebookTransitionsLocked(answerCascade, "system")
+	// PostMessage intentionally does NOT auto-write notebook entries.
+	// Notebooks are for properly drafted working notes and learnings
+	// authored via the notebook_write MCP tool. Auto-writing every
+	// bot message into the shelf turned notebooks into noisy event
+	// logs and even fed unrelated chatter into the wiki review queue.
+	//
+	// PR 2: when a human posts via PostMessage (non-HTTP entry points such as
+	// integration tests and a small set of in-process callers), the same
+	// remember-intent hook fires. Handle is non-blocking and the writer
+	// goroutine never re-enters b.mu, so calling it under the lock is safe.
+	if b.humanWikiWriter != nil && isHumanMessageSender(msg.From) {
+		b.humanWikiWriter.Handle(msg)
+	}
+	return msg, nil
+}
+
+func (b *Broker) PostAutomationMessage(from, channel, title, content, eventID, source, sourceLabel string, tagged []string, replyTo string) (channelMessage, bool, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if strings.TrimSpace(eventID) != "" {
+		for _, existing := range b.messages {
+			if existing.EventID != "" && existing.EventID == strings.TrimSpace(eventID) {
+				return cloneChannelMessageForRead(existing), true, nil
+			}
+		}
+	}
+
+	b.counter++
+	// Same rule as PostMessage: the sender's DM, never the retired room. This
+	// path does NOT check the channel exists, so a laundered "general" here
+	// wrote an automation message straight into a conversation with no readers.
+	rawAutomationChannel := channel
+	channel = normalizeChannelSlug(channel)
+	if strings.TrimSpace(rawAutomationChannel) == "" {
+		if home, err := b.homeChannelForLocked(from); err == nil {
+			channel = home
+		}
+	}
+	msg := channelMessage{
+		ID:          fmt.Sprintf("msg-%d", b.counter),
+		From:        from,
+		Channel:     channel,
+		Kind:        "automation",
+		Source:      strings.TrimSpace(source),
+		SourceLabel: strings.TrimSpace(sourceLabel),
+		EventID:     strings.TrimSpace(eventID),
+		Title:       strings.TrimSpace(title),
+		Content:     strings.TrimSpace(content),
+		Tagged:      tagged,
+		ReplyTo:     strings.TrimSpace(replyTo),
+		Timestamp:   time.Now().UTC().Format(time.RFC3339),
+	}
+	if msg.Source == "" {
+		msg.Source = "context_graph"
+	}
+	if msg.SourceLabel == "" {
+		msg.SourceLabel = "Automation"
+	}
+	if msg.From == "" {
+		msg.From = "hive"
+	}
+
+	msg = b.appendMessageLocked(msg)
+	if err := b.saveLocked(); err != nil {
+		return channelMessage{}, false, err
+	}
+	return msg, false, nil
+}
+
+func (b *Broker) CreateRequest(req humanInterview) (humanInterview, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	// The requesting bot's DM. A request card laundered into "general" is a
+	// card the human can never see — and for a blocking request that means the
+	// bot waits on an answer that cannot be given.
+	channel := normalizeChannelSlug(req.Channel)
+	if strings.TrimSpace(req.Channel) == "" {
+		if home, err := b.homeChannelForLocked(req.From); err == nil {
+			channel = home
+		}
+	}
+	if b.findChannelLocked(channel) == nil {
+		return humanInterview{}, fmt.Errorf("channel not found")
+	}
+	channel = b.requestChannelForLocked(req.From, channel)
+	b.counter++
+	now := time.Now().UTC().Format(time.RFC3339)
+	req.ID = fmt.Sprintf("request-%d", b.counter)
+	req.Channel = channel
+	req.CreatedAt = now
+	req.UpdatedAt = now
+	req.Kind = normalizeRequestKind(req.Kind)
+	req.Options, req.RecommendedID = normalizeRequestOptions(req.Kind, req.RecommendedID, req.Options)
+	if requestIsHumanInterview(req) {
+		req.Blocking = false
+		req.Required = false
+	}
+	if strings.TrimSpace(req.Status) == "" {
+		req.Status = "pending"
+	}
+	if strings.TrimSpace(req.Title) == "" {
+		req.Title = "Request"
+	}
+	// Loud ask (v3 fix family #2): same announcement + thread-anchor
+	// contract as the HTTP create path in handlePostRequest.
+	b.postRequestRaisedChatMessageLocked(&req)
+	b.requests = append(b.requests, req)
+	b.pendingInterview = firstBlockingRequest(b.requests)
+	b.appendActionLocked("request_created", "office", channel, req.From, truncateSummary(req.Title+" "+req.Question, 140), req.ID)
+	if err := b.saveLocked(); err != nil {
+		return humanInterview{}, err
+	}
+	return req, nil
+}
+
+func (b *Broker) handleGetMessages(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	limit := 10
+	if l, err := strconv.Atoi(q.Get("limit")); err == nil && l > 0 {
+		limit = l
+	}
+	if limit > 100 {
+		limit = 100
+	}
+
+	sinceID := q.Get("since_id")
+	mySlug := strings.TrimSpace(q.Get("my_slug"))
+	viewerSlug := strings.TrimSpace(q.Get("viewer_slug"))
+	threadID := strings.TrimSpace(q.Get("thread_id"))
+	if threadID == "" {
+		threadID = strings.TrimSpace(q.Get("reply_to"))
+	}
+	scope := normalizeMessageScope(q.Get("scope"))
+	if rawScope := strings.ToLower(strings.TrimSpace(q.Get("scope"))); rawScope != "" && scope == "" {
+		// normalizeMessageScope collapses both valid no-filter values
+		// ("all", "channel") and truly-unknown values to "". Accept the
+		// known no-filter aliases here so the wire contract matches the
+		// semantics described in the test cases.
+		switch rawScope {
+		case "all", "channel":
+			// no-filter: leave scope == ""
+		default:
+			http.Error(w, "invalid message scope", http.StatusBadRequest)
+			return
+		}
+	}
+	channel := normalizeChannelSlug(q.Get("channel"))
+	if channel == "" {
+		channel = "general"
+	}
+	accessSlug := mySlug
+	if accessSlug == "" {
+		accessSlug = viewerSlug
+	}
+
+	b.mu.Lock()
+	// Auto-create DM conversation on read (user opens DM before sending)
+	if IsDMSlug(channel) && b.findChannelLocked(channel) == nil {
+		if dm := b.ensureDMConversationLocked(channel); dm != nil {
+			channel = dm.Slug
+		}
+	}
+	if !b.canAccessChannelLocked(accessSlug, channel) {
+		b.mu.Unlock()
+		http.Error(w, "channel access denied", http.StatusForbidden)
+		return
+	}
+	channelMessages := make([]channelMessage, 0, len(b.messages))
+	for _, msg := range b.messages {
+		if normalizeChannelSlug(msg.Channel) != channel {
+			continue
+		}
+		channelMessages = append(channelMessages, msg)
+	}
+	messageIndex := make(map[string]channelMessage, len(channelMessages))
+	for _, msg := range channelMessages {
+		if id := strings.TrimSpace(msg.ID); id != "" {
+			messageIndex[id] = msg
+		}
+	}
+	messages := make([]channelMessage, 0, len(channelMessages))
+	for _, msg := range channelMessages {
+		if b.sessionMode == SessionModeOneOnOne && !b.isOneOnOneDMMessage(msg) {
+			continue
+		}
+		if threadID != "" && !messageInThread(msg, threadID) {
+			continue
+		}
+		if scope != "" && viewerSlug != "" && !messageMatchesViewerScope(msg, viewerSlug, scope, messageIndex) {
+			continue
+		}
+		messages = append(messages, msg)
+	}
+	// Consult relay markers: response-only rows showing that this bot
+	// messaged a peer, or heard back. Derived from the real bot-to-bot
+	// messages (see broker_consult_relay.go), never stored. Only on the main
+	// flow — inside a thread view they would be noise, and they belong to no
+	// thread. Merged by timestamp so they interleave where they happened.
+	if threadID == "" {
+		if markers := b.deriveConsultMarkersLocked(channel); len(markers) > 0 {
+			messages = mergeByTimestamp(messages, markers)
+		}
+	}
+	if sinceID != "" {
+		for i, m := range messages {
+			if m.ID == sinceID {
+				messages = messages[i+1:]
+				break
+			}
+		}
+	}
+	if len(messages) > limit {
+		messages = messages[len(messages)-limit:]
+	}
+	// Copy to avoid race. Deep-copy the mutable nested slices (Tagged,
+	// Reactions) — `copy` only clones the outer struct so a concurrent
+	// POST /reactions mutating Reactions on the same backing array would
+	// race the JSON encoder running after we drop the lock.
+	result := make([]channelMessage, len(messages))
+	for i, m := range messages {
+		result[i] = cloneChannelMessageForRead(m)
+	}
+	b.mu.Unlock()
+
+	taggedCount := 0
+	taggedSlug := mySlug
+	if taggedSlug == "" {
+		taggedSlug = viewerSlug
+	}
+	if taggedSlug != "" {
+		for _, m := range result {
+			for _, t := range m.Tagged {
+				if t == taggedSlug {
+					taggedCount++
+					break
+				}
+			}
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"channel":      channel,
+		"messages":     result,
+		"tagged_count": taggedCount,
+	})
+}
+
+func messageInThread(msg channelMessage, threadID string) bool {
+	threadID = strings.TrimSpace(threadID)
+	if threadID == "" {
+		return true
+	}
+	return strings.TrimSpace(msg.ID) == threadID || strings.TrimSpace(msg.ReplyTo) == threadID
+}
+
+func normalizeMessageScope(value string) string {
+	switch strings.TrimSpace(strings.ToLower(value)) {
+	case "", "all", "channel":
+		return ""
+	case "agent", "inbox", "outbox":
+		return strings.TrimSpace(strings.ToLower(value))
+	default:
+		return ""
+	}
+}
+
+func messageMatchesViewerScope(msg channelMessage, viewerSlug, scope string, messagesByID map[string]channelMessage) bool {
+	scope = normalizeMessageScope(scope)
+	switch scope {
+	case "inbox":
+		return messageBelongsToViewerInbox(msg, viewerSlug, messagesByID)
+	case "outbox":
+		return messageBelongsToViewerOutbox(msg, viewerSlug)
+	case "agent":
+		return messageVisibleToViewer(msg, viewerSlug, messagesByID)
+	default:
+		return true
+	}
+}
+
+func messageVisibleToViewer(msg channelMessage, viewerSlug string, messagesByID map[string]channelMessage) bool {
+	return messageBelongsToViewerOutbox(msg, viewerSlug) || messageBelongsToViewerInbox(msg, viewerSlug, messagesByID)
+}
+
+func messageBelongsToViewerOutbox(msg channelMessage, viewerSlug string) bool {
+	viewerSlug = strings.TrimSpace(viewerSlug)
+	if viewerSlug == "" || viewerSlug == "cos" {
+		return true
+	}
+	return strings.TrimSpace(msg.From) == viewerSlug
+}
+
+func messageBelongsToViewerInbox(msg channelMessage, viewerSlug string, messagesByID map[string]channelMessage) bool {
+	viewerSlug = strings.TrimSpace(viewerSlug)
+	// A DM belongs to its two participants only. Without this, every human
+	// message in every DM landed in every agent's inbox — the Designer
+	// answered an ask the human made in the Chief of Staff's private thread.
+	if !messageDMAdmitsViewer(msg, viewerSlug) {
+		return false
+	}
+	if viewerSlug == "" || viewerSlug == "cos" {
+		return true
+	}
+	from := strings.TrimSpace(msg.From)
+	switch from {
+	case viewerSlug:
+		return false
+	case "cos":
+		return true
+	}
+	if isHumanMessageSender(from) {
+		return true
+	}
+	for _, tagged := range msg.Tagged {
+		tagged = strings.TrimSpace(tagged)
+		if tagged == viewerSlug || tagged == "all" {
+			return true
+		}
+	}
+	return messageRepliesToViewerThread(msg, viewerSlug, messagesByID)
+}
+
+// messageDMAdmitsViewer reports whether a message that lives in a 1:1 DM may
+// be shown to viewerSlug at all: only the DM's two participants (and the
+// human, who owns every DM in their office). Non-DM channels admit everyone
+// here; membership for those is decided elsewhere.
+func messageDMAdmitsViewer(msg channelMessage, viewerSlug string) bool {
+	a, c, ok := DMParticipants(msg.Channel)
+	if !ok {
+		return true
+	}
+	v := normalizeActorSlug(viewerSlug)
+	if v == "" || isHumanMessageSender(viewerSlug) {
+		return true
+	}
+	return v == normalizeActorSlug(a) || v == normalizeActorSlug(c)
+}
+
+func messageRepliesToViewerThread(msg channelMessage, viewerSlug string, messagesByID map[string]channelMessage) bool {
+	replyTo := strings.TrimSpace(msg.ReplyTo)
+	if replyTo == "" || viewerSlug == "" {
+		return false
+	}
+	seen := map[string]bool{}
+	for replyTo != "" {
+		if seen[replyTo] {
+			return false
+		}
+		seen[replyTo] = true
+		parent, ok := messagesByID[replyTo]
+		if !ok {
+			return false
+		}
+		if strings.TrimSpace(parent.From) == viewerSlug {
+			return true
+		}
+		replyTo = strings.TrimSpace(parent.ReplyTo)
+	}
+	return false
+}
+
+// isOneOnOneDMMessage returns true if msg belongs in the 1:1 DM conversation.
+// Only messages exclusively between the human and the 1:1 bot pass through.
+// Caller must hold b.mu.
+func (b *Broker) isOneOnOneDMMessage(msg channelMessage) bool {
+	bot := b.oneOnOneBot
+
+	switch {
+	case isHumanMessageSender(msg.From):
+		// Human messages: only if untagged (direct conversation) or
+		// explicitly tagging the 1:1 bot.
+		if len(msg.Tagged) == 0 {
+			return true
+		}
+		for _, t := range msg.Tagged {
+			if t == bot {
+				return true
+			}
+		}
+		return false
+
+	case msg.From == bot:
+		// Bot messages: only if untagged (direct reply to human) or
+		// explicitly tagging the human.
+		if len(msg.Tagged) == 0 {
+			return true
+		}
+		for _, t := range msg.Tagged {
+			if isHumanMessageSender(t) {
+				return true
+			}
+		}
+		return false
+
+	case msg.From == "system":
+		// System messages: only if they mention the 1:1 bot or human,
+		// or are general system announcements (no routing indicators).
+		if msg.Kind == "routing" {
+			return false
+		}
+		return true
+
+	default:
+		// Messages from any other bot do not belong in this DM.
+		return false
+	}
+}
+
+func FormatChannelView(messages []channelMessage) string {
+	if len(messages) == 0 {
+		return "  No messages yet. The team is getting set up..."
+	}
+
+	var sb strings.Builder
+	for _, m := range messages {
+		// redaction removed (core-loop R1)
+		ts := m.Timestamp
+		if len(ts) > 19 {
+			ts = ts[11:19]
+		}
+
+		prefix := m.From
+		if m.Kind == "automation" || m.From == "hive" {
+			source := m.Source
+			if source == "" {
+				source = "context_graph"
+			}
+			title := m.Title
+			if title != "" {
+				title += ": "
+			}
+			sb.WriteString(fmt.Sprintf("  %s  Automation/%s: %s%s\n", ts, source, title, m.Content))
+			continue
+		}
+		if strings.HasPrefix(m.Content, "[STATUS]") {
+			sb.WriteString(fmt.Sprintf("  %s  @%s %s%s\n", ts, prefix, m.Content, formatMessageUsageSuffix(m.Usage)))
+		} else {
+			thread := ""
+			if m.ReplyTo != "" {
+				thread = fmt.Sprintf(" ↳ %s", m.ReplyTo)
+			}
+			sb.WriteString(fmt.Sprintf("  %s%s  @%s: %s%s\n", ts, thread, prefix, m.Content, formatMessageUsageSuffix(m.Usage)))
+		}
+	}
+	return sb.String()
+}
+
+func formatMessageUsageSuffix(usage *messageUsage) string {
+	if usage == nil {
+		return ""
+	}
+	total := usage.TotalTokens
+	if total == 0 {
+		total = usage.InputTokens + usage.OutputTokens + usage.CacheReadTokens + usage.CacheCreationTokens
+	}
+	if total == 0 {
+		return ""
+	}
+	return fmt.Sprintf(" [%d tok]", total)
+}
+
+// Messages returns all channel messages (for the Go TUI channel view).
+func (b *Broker) Messages() []channelMessage {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	out := make([]channelMessage, len(b.messages))
+	for i, msg := range b.messages {
+		out[i] = cloneChannelMessageForRead(msg)
+	}
+	return out
+}
+
+func (b *Broker) ChannelMessages(channel string) []channelMessage {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	channel = normalizeChannelSlug(channel)
+	if channel == "" {
+		channel = "general"
+	}
+	out := make([]channelMessage, 0, len(b.messages))
+	for _, msg := range b.messages {
+		if normalizeChannelSlug(msg.Channel) == channel {
+			out = append(out, cloneChannelMessageForRead(msg))
+		}
+	}
+	return out
+}
+
+// AllMessages returns a copy of all messages across all channels, ordered by
+// creation time. Use this when the caller needs to search across channels rather
+// than in a single known channel.
+func (b *Broker) AllMessages() []channelMessage {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	out := make([]channelMessage, len(b.messages))
+	for i, msg := range b.messages {
+		out[i] = cloneChannelMessageForRead(msg)
+	}
+	return out
+}
+
+// RecentHumanMessages returns up to limit messages sent by a human or
+// human-facing external sender ("you", "human", or "hive"). The returned slice
+// contains the most recent messages in chronological order (earliest first).
+func (b *Broker) RecentHumanMessages(limit int) []channelMessage {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	var human []channelMessage
+	for _, msg := range b.messages {
+		f := strings.ToLower(strings.TrimSpace(msg.From))
+		if isHumanMessageSender(f) || f == "hive" {
+			human = append(human, cloneChannelMessageForRead(msg))
+		}
+	}
+	if len(human) <= limit {
+		return human
+	}
+	return human[len(human)-limit:]
+}
+
+func cloneChannelMessageForRead(msg channelMessage) channelMessage {
+	clone := msg
+	if len(msg.Tagged) > 0 {
+		clone.Tagged = append([]string(nil), msg.Tagged...)
+	}
+	if len(msg.Reactions) > 0 {
+		clone.Reactions = append([]messageReaction(nil), msg.Reactions...)
+	}
+	if len(msg.RedactionReasons) > 0 {
+		clone.RedactionReasons = append([]string(nil), msg.RedactionReasons...)
+	}
+	clone.Usage = cloneMessageUsage(msg.Usage)
+	return clone
+}

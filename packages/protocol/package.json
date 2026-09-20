@@ -1,0 +1,36 @@
+{
+  "name": "@hivex/protocol",
+  "version": "0.0.0",
+  "private": true,
+  "license": "MIT",
+  "description": "hivebot v1 protocol — branded types, receipt schema, IPC envelopes, audit events. No I/O. No runtime deps on other @hivex packages.",
+  "type": "module",
+  "main": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./browser": "./src/browser.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "test:shuffle": "vitest run --sequence.shuffle.files --sequence.shuffle.tests --sequence.seed=743",
+    "lint": "biome check src/ tests/ scripts/",
+    "lint:fix": "biome check --write src/ tests/ scripts/",
+    "format": "biome format --write src/ tests/ scripts/",
+    "check": "biome check src/ tests/ scripts/",
+    "check:invariants": "bash scripts/check-invariants.sh"
+  },
+  "dependencies": {
+    "canonicalize": "3.0.0"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.4.15",
+    "@types/node": "^25.9.1",
+    "@vitest/coverage-v8": "2.1.9",
+    "fast-check": "^4.7.0",
+    "typescript": "^6.0.3",
+    "vitest": "2.1.9"
+  }
+}

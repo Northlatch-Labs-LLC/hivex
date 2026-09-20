@@ -1,0 +1,248 @@
+package teammcp
+
+import (
+	"context"
+	"path/filepath"
+	"slices"
+	"testing"
+
+	"github.com/modelcontextprotocol/go-sdk/mcp"
+)
+
+// TestConfigureServerToolsBackendMatrix is the IRON regression test for
+// backend-axis tool registration. Markdown and Hive/GBrain must NEVER coexist
+// on one server instance — if someone breaks this, existing users lose
+// shared memory silently.
+//
+// For each backend we assert:
+//   - the expected tool set is registered
+//   - the other backend's tool set is NOT registered
+//   - the office communication tools (team_broadcast, etc.) are unaffected
+func TestConfigureServerToolsBackendMatrix(t *testing.T) {
+	testCases := []struct {
+		name          string
+		backend       string
+		oneOnOne      bool
+		mustHave      []string
+		mustNotHave   []string
+		commonPresent []string // must be present regardless of backend
+	}{
+		{
+			name:    "markdown/office",
+			backend: "markdown",
+			mustHave: []string{
+				"team_wiki_read",
+				"team_wiki_write",
+				"team_wiki_search",
+				"team_wiki_list",
+				"visual_artifact_create",
+			},
+			mustNotHave: []string{
+				"team_memory_query",
+				"team_memory_write",
+				"team_memory_promote",
+			},
+			commonPresent: []string{"team_broadcast", "team_poll", "context_lookup", "context_capture", "context_promote", "context_health"},
+		},
+		{
+			name:    "default/office",
+			backend: "",
+			mustHave: []string{
+				"team_wiki_read",
+				"team_wiki_write",
+				"team_wiki_search",
+				"team_wiki_list",
+				"visual_artifact_create",
+			},
+			mustNotHave: []string{
+				"team_memory_query",
+				"team_memory_write",
+				"team_memory_promote",
+			},
+			commonPresent: []string{"team_broadcast", "team_poll", "context_lookup", "context_capture", "context_promote", "context_health"},
+		},
+		{
+			name:    "gbrain/office",
+			backend: "gbrain",
+			mustHave: []string{
+				"team_memory_query",
+				"team_memory_write",
+				"team_memory_promote",
+			},
+			mustNotHave: []string{
+				"team_wiki_read",
+				"team_wiki_write",
+				"team_wiki_search",
+				"team_wiki_list",
+				"notebook_write",
+				"notebook_promote",
+				"visual_artifact_create",
+			},
+			commonPresent: []string{"team_broadcast", "team_poll", "context_lookup", "context_capture", "context_promote", "context_health"},
+		},
+		{
+			name:     "none/office",
+			backend:  "none",
+			mustHave: []string{},
+			mustNotHave: []string{
+				"team_memory_query",
+				"team_memory_write",
+				"team_memory_promote",
+				"team_wiki_read",
+				"team_wiki_write",
+				"team_wiki_search",
+				"team_wiki_list",
+				"notebook_write",
+				"notebook_promote",
+				"visual_artifact_create",
+			},
+			commonPresent: []string{"team_broadcast", "team_poll", "context_lookup", "context_capture", "context_promote", "context_health"},
+		},
+		{
+			name:     "markdown/dm",
+			backend:  "markdown",
+			oneOnOne: false,
+			mustHave: []string{
+				"team_wiki_read",
+				"team_wiki_write",
+				"team_wiki_search",
+				"team_wiki_list",
+			},
+			mustNotHave: []string{
+				"team_memory_query",
+				"team_memory_write",
+				"team_memory_promote",
+			},
+			commonPresent: []string{"team_broadcast", "team_poll", "context_lookup", "context_capture", "context_promote", "context_health"},
+		},
+		{
+			name:     "markdown/oneOnOne",
+			backend:  "markdown",
+			oneOnOne: true,
+			mustHave: []string{
+				"team_wiki_read",
+				"team_wiki_write",
+				"team_wiki_search",
+				"team_wiki_list",
+			},
+			mustNotHave: []string{
+				"team_memory_query",
+				"team_memory_write",
+				"team_memory_promote",
+			},
+			commonPresent: []string{"reply", "read_conversation", "context_lookup", "context_capture", "context_promote", "context_health"},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Arrange
+			t.Setenv("HIVEX_MEMORY_BACKEND", tc.backend)
+			t.Setenv("HIVEX_ENABLE_AGENT_WIKI_WRITE", "")
+			t.Setenv("HIVEX_CONFIG_PATH", filepath.Join(t.TempDir(), "config.json"))
+
+			channel := "general"
+			if tc.name == "markdown/dm" {
+				channel = "dm-ceo"
+			}
+
+			// Act
+			names := listRegisteredTools(t, channel, tc.oneOnOne)
+
+			// Assert
+			for _, want := range tc.mustHave {
+				if !slices.Contains(names, want) {
+					t.Errorf("backend=%s expected %q to be registered; got %v", tc.backend, want, names)
+				}
+			}
+			for _, wantAbsent := range tc.mustNotHave {
+				if slices.Contains(names, wantAbsent) {
+					t.Errorf("backend=%s expected %q to NOT be registered; got %v", tc.backend, wantAbsent, names)
+				}
+			}
+			for _, common := range tc.commonPresent {
+				if !slices.Contains(names, common) {
+					t.Errorf("backend=%s expected common tool %q to be registered; got %v", tc.backend, common, names)
+				}
+			}
+		})
+	}
+}
+
+func TestConfigureServerToolsDirectWikiWriteAvailableForExplicitHumanRequests(t *testing.T) {
+	t.Setenv("HIVEX_MEMORY_BACKEND", "markdown")
+	t.Setenv("HIVEX_ENABLE_AGENT_WIKI_WRITE", "")
+	t.Setenv("HIVEX_CONFIG_PATH", filepath.Join(t.TempDir(), "config.json"))
+
+	names := listRegisteredTools(t, "general", false)
+	if !slices.Contains(names, "team_wiki_write") {
+		t.Fatalf("expected team_wiki_write for explicit human wiki requests; got %v", names)
+	}
+}
+
+// listRegisteredTools stands up an in-memory MCP server, calls
+// configureServerTools with the given social-axis context, and returns the
+// list of registered tool names.
+func listRegisteredTools(t *testing.T, channel string, oneOnOne bool) []string {
+	t.Helper()
+	ctx := context.Background()
+	clientTransport, serverTransport := mcp.NewInMemoryTransports()
+
+	server := mcp.NewServer(&mcp.Implementation{Name: "hivex-team-test", Version: "0.1.0"}, nil)
+	configureServerTools(server, "workflow-architect", channel, oneOnOne)
+
+	serverSession, err := server.Connect(ctx, serverTransport, nil)
+	if err != nil {
+		t.Fatalf("server connect: %v", err)
+	}
+	defer serverSession.Wait()
+
+	client := mcp.NewClient(&mcp.Implementation{Name: "client", Version: "0.1.0"}, nil)
+	clientSession, err := client.Connect(ctx, clientTransport, nil)
+	if err != nil {
+		t.Fatalf("client connect: %v", err)
+	}
+	defer clientSession.Close()
+
+	tools, err := clientSession.ListTools(ctx, nil)
+	if err != nil {
+		t.Fatalf("list tools: %v", err)
+	}
+	names := make([]string, 0, len(tools.Tools))
+	for _, tool := range tools.Tools {
+		names = append(names, tool.Name)
+	}
+	return names
+}
+
+func listRegisteredToolMap(t *testing.T, channel string, oneOnOne bool) map[string]*mcp.Tool {
+	t.Helper()
+	ctx := context.Background()
+	clientTransport, serverTransport := mcp.NewInMemoryTransports()
+
+	server := mcp.NewServer(&mcp.Implementation{Name: "hivex-team-test", Version: "0.1.0"}, nil)
+	configureServerTools(server, "workflow-architect", channel, oneOnOne)
+
+	serverSession, err := server.Connect(ctx, serverTransport, nil)
+	if err != nil {
+		t.Fatalf("server connect: %v", err)
+	}
+	defer serverSession.Wait()
+
+	client := mcp.NewClient(&mcp.Implementation{Name: "client", Version: "0.1.0"}, nil)
+	clientSession, err := client.Connect(ctx, clientTransport, nil)
+	if err != nil {
+		t.Fatalf("client connect: %v", err)
+	}
+	defer clientSession.Close()
+
+	tools, err := clientSession.ListTools(ctx, nil)
+	if err != nil {
+		t.Fatalf("list tools: %v", err)
+	}
+	out := make(map[string]*mcp.Tool, len(tools.Tools))
+	for _, tool := range tools.Tools {
+		out[tool.Name] = tool
+	}
+	return out
+}

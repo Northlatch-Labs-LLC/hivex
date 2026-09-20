@@ -1,0 +1,1430 @@
+package team
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log"
+	"net"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/Northlatch-Labs-LLC/hivex/internal/brokeraddr"
+	"github.com/Northlatch-Labs-LLC/hivex/internal/channel"
+	"github.com/Northlatch-Labs-LLC/hivex/internal/config"
+	"github.com/Northlatch-Labs-LLC/hivex/internal/gbrain"
+	"github.com/Northlatch-Labs-LLC/hivex/internal/onboarding"
+	"github.com/Northlatch-Labs-LLC/hivex/internal/workspace"
+)
+
+// ErrChannelNotFound is returned by PostInboundSurfaceMessage when the
+// declared channel does not exist in the broker.
+var ErrChannelNotFound = errors.New("channel not found")
+
+const BrokerPort = brokeraddr.DefaultPort
+
+// brokerTokenFilePath is the path where the broker writes its auth token on start.
+// Tests can redirect this to a temp directory to avoid clobbering the live broker token.
+var brokerTokenFilePath = brokeraddr.DefaultTokenFile
+
+const defaultRateLimitRequestsPerWindow = 600
+const defaultRateLimitWindow = time.Minute
+
+// Per-bot rate limit. Applies even to authenticated requests that identify
+// themselves via the X-hivebot-Bot header. The threshold is high enough that
+// well-behaved bots will never trip it, but low enough that a prompt-injected
+// bot stuck in a tool-call loop gets throttled before it burns the budget.
+const defaultBotRateLimitRequestsPerWindow = 1000
+const defaultBotRateLimitWindow = time.Minute
+
+// botRateLimitHeader is the HTTP header the MCP server sets on every outbound
+// broker call so the broker can attribute cost back to the bot. Must match
+// the value set by internal/teammcp/server.go authHeaders().
+const botRateLimitHeader = "X-HIVEX-Agent"
+
+// botStreamBuffer holds recent stdout/stderr lines from a headless bot
+// process and fans them out to SSE subscribers in real time.
+
+// Entity types moved to broker_types.go.
+// DM slug helpers moved to broker_dm.go.
+
+type ipRateLimitBucket struct {
+	timestamps []time.Time
+}
+
+// Broker is a lightweight HTTP message broker for the team channel.
+// All bot MCP instances connect to this shared broker.
+type Broker struct {
+	channelStore      *channel.Store
+	messages          []channelMessage
+	incidents         []incidentRecord
+	members           []officeMember
+	memberIndex       map[string]int                  // slug → index into members; guarded by mu
+	memberPresence    map[string]memberPresenceRecord // slug → presence; guarded by mu, populated via brokerTransportHost
+	presenceKeyToSlug map[string]string               // "adapter:key" → slug; guarded by mu
+	webURL            string                          // base URL of the web UI, set by LaunchWeb; guarded by mu
+	channels          []teamChannel
+	channelIndex      map[string]int // slug → index into channels; guarded by mu
+	sessionMode       string
+	oneOnOneBot       string
+	focusMode         bool
+	// disablePlanFirstDefault turns OFF the structured-planning default
+	// (issueShouldPlanFirstLocked) so new top-level issues land Running instead
+	// of Planning. Zero value (false) keeps planning ON in production. The
+	// office-eval fixture sets it true so its post-execution mechanic checks are
+	// not gated behind plan approval — planning has dedicated coverage in
+	// broker_plan_approval_test.go. Guarded by mu.
+	disablePlanFirstDefault bool
+	tasks                   []teamTask
+	// lifecycleIndex is the inverse-index map maintained by the
+	// broker_lifecycle_transition.go layer. Inbox queries for "all tasks
+	// in state X" are O(1) lookups against this map instead of O(N) scans
+	// of b.tasks. Guarded by b.mu — only the lifecycle transition layer
+	// writes to it, and the snapshot accessor copies under the lock.
+	lifecycleIndex map[LifecycleState][]string
+	// intakeSpecs maps task ID to the validated Spec persisted by the
+	// synthetic intake bot (broker_intake.go, Lane B). The map is the
+	// in-memory chokepoint for spec writes. Lane C consumes the Spec from
+	// here when promoting it into the Decision Packet on intake → ready.
+	// Guarded by b.mu.
+	intakeSpecs map[string]Spec
+	// decisionPackets holds the per-task in-memory Decision Packet model
+	// (Lane C). Lazily allocated by ensureDecisionPacketStateLocked so
+	// tests that never touch the harness path pay no cost. Guarded by
+	// b.mu via the public mutators in broker_decision_packet.go. Lane E
+	// reads through findDecisionPacketLocked / GetDecisionPacket for the
+	// inbox row severity rollup and the /tasks/{id} packet view.
+	decisionPackets *decisionPacketState
+	// reviewerGradesByTask is the Lane D routing-side transient store of
+	// ReviewerGrade entries keyed by task ID. Lane D writes here for
+	// convergence/timeout rule evaluation; Lane C's Decision Packet is
+	// the durable source of truth. The two are kept in sync by
+	// AppendReviewerGrade — Lane C mirrors writes to Lane D on each
+	// grade. Guarded by b.mu.
+	reviewerGradesByTask map[string][]ReviewerGrade
+	requests             []humanInterview
+	approvalAudit        []ApprovalAuditEntry
+	// connectionRegistry is the persisted, last-known connection state per
+	// platform — a dedicated map in broker state, NOT a projection over the
+	// 150-entry action ring. Read by the action resolver to gate external
+	// actions; refreshed by probe + connect/disconnect events. Guarded by b.mu.
+	connectionRegistry map[string]connectionRegistryEntry
+	// actionGrants are persisted, human-issued standing approvals for a specific
+	// (bot, platform, action_id). The resolver reads them to skip the approval
+	// modal for pre-authorized actions. Human-minted only. Guarded by b.mu.
+	actionGrants []actionGrant
+	// policyGrants are the generalized capability grants (policy_engine.go):
+	// exact-match standing approvals over the declared capability registry,
+	// evaluated by the default-deny policy gate. Guarded by b.mu.
+	policyGrants []policyGrant
+	// turnRecords is the Turn Engine v2 journal (turn_engine.go): one
+	// persisted record per bot turn with its typed state and audited
+	// transition trail. Bounded to the latest maxTurnRecords turns. Guarded
+	// by b.mu.
+	turnRecords []TurnRecord
+	// turnMeter is the settle-phase usage meter hook (tier enforcement).
+	// nil means metering disabled. Guarded by b.mu.
+	turnMeter TurnMeter
+	// composioSignin is the in-memory "Sign in with Composio" CLI flow state
+	// (broker_composio_signin.go). Carries its own mutex; zero value ready.
+	composioSignin composioSigninFlow
+	// boxSignin is the "Sign in to ascii.dev" CLI flow (broker_box_signin.go).
+	boxSignin           boxSigninFlow
+	humanInvites        []humanInvite
+	humanSessions       []humanSession
+	humanSessionRevoke  map[string]chan struct{} // session ID → closed on revoke
+	actions             []officeActionLog
+	distillInFlight     map[string]struct{}
+	signals             []officeSignalRecord
+	decisions           []officeDecisionRecord
+	watchdogs           []watchdogAlert
+	scheduler           []schedulerJob
+	schedulerRuns       map[string][]schedulerRun      // per-slug fire history; ring buffer
+	schedulerActivity   map[string][]schedulerActivity // per-slug lifecycle log; ring buffer
+	schedulerRevisions  map[string][]schedulerRevision // per-slug edit snapshots; ring buffer
+	skills              []teamSkill
+	skillDescEmbeddings map[string][]float32         // slug → description embedding vector; guarded by mu
+	sharedMemory        map[string]map[string]string // namespace → key → value
+	lastTaggedAt        map[string]time.Time         // when each bot was last @mentioned
+	botDMWakes          map[string][]time.Time       // bot-pair DM slug → recent partner wakes (loop cap); guarded by mu
+	lastPaneSnapshot    map[string]string            // last captured pane content per bot (for change detection)
+	seenTelegramGroups  map[int64]string             // chat_id -> title, populated by transport
+	counter             int
+	// idPrefix is the Linear-style prefix used for new Issue IDs (e.g.
+	// "NEX" → NEX-1, NEX-2). Derived from the workspace's company_name
+	// via deriveIDPrefix; refreshed on broker init + when the human
+	// updates the company name during onboarding. Existing task-N IDs
+	// are left untouched — only new allocations carry the new prefix.
+	// Guarded by b.mu.
+	idPrefix          string
+	notificationSince string
+	insightsSince     string
+	pendingInterview  *humanInterview
+	usage             teamUsageState
+	externalDelivered map[string]struct{}            // message IDs already queued for external delivery
+	slackTaskCards    map[string]slackTaskCardRecord // task ID → posted Slack lifecycle card (persisted)
+	slackSpawns       map[string]slackSpawnRecord    // slug → pending bot spawn awaiting /slack/bots/spawn/complete (persisted)
+	// slackSpawnAuthTest is the auth.test seam for the spawn-complete flow;
+	// nil means the real Slack Web API. Tests inject a fake.
+	slackSpawnAuthTest        slackSpawnAuthTestFunc
+	messageSubscribers        map[int]chan channelMessage
+	actionSubscribers         map[int]chan officeActionLog
+	activity                  map[string]botActivitySnapshot
+	activitySubscribers       map[int]chan botActivitySnapshot
+	officeSubscribers         map[int]chan officeChangeEvent
+	wikiSubscribers           map[int]chan wikiWriteEvent
+	entitySubscribers         map[int]chan EntityBriefSynthesizedEvent
+	factSubscribers           map[int]chan EntityFactRecordedEvent
+	wikiSectionsSubscribers   map[int]chan WikiSectionsUpdatedEvent
+	wikiCategoriesSubscribers map[int]chan WikiCategoriesUpdatedEvent
+	governorSubscribers       map[int]chan governorStatus
+	// computerService is lazily built by b.computers() (broker_computer.go).
+	computerOnce        sync.Once
+	computerService     *computerService
+	governor            *governor
+	wikiWorker          *WikiWorker
+	wikiInitMu          sync.Mutex
+	wikiInitErr         error
+	customApps          *customAppStore
+	customAppOnce       sync.Once
+	appDev              *appDevManager
+	appDevOnce          sync.Once
+	humanWikiWriter     *HumanWikiIntentWriter
+	obsidianWatcher     *ObsidianWatcher
+	wikiIndex           *WikiIndex
+	wikiExtractor       *Extractor
+	wikiDLQ             *DLQ
+	wikiSectionsCache   *wikiSectionsCache
+	wikiCategoriesCache *wikiCategoriesCache
+	// gbrainClient is the broker-owned gbrain MCP client backing the gbrain
+	// memory backend. Constructed once on Start (lazily — it does not connect
+	// or spawn `gbrain serve` until first use) and registered with the
+	// package-level memory entry points; Close()d on Stop. nil until Start.
+	// gbrain is optional: when it is not installed the client still constructs
+	// fine and only errors on first call, which the backend's Ready() gate
+	// keeps from ever happening.
+	gbrainClient *gbrain.Client
+	// knowledgeBrainOverride substitutes the Knowledge surface's brain in tests
+	// (set before Start; nil in production).
+	knowledgeBrainOverride knowledgeBrain
+	// legacyKnowledge holds the previous product's wiki articles + notebook
+	// notes preserved as Knowledge pages, loaded once per broker from the
+	// legacy wiki tree (broker_apps_knowledge_legacy.go).
+	legacyKnowledgeOnce sync.Once
+	legacyKnowledge     []appKnowledgePage
+	inboxCursorMu       sync.RWMutex
+	userInboxCursors    map[string]InboxCursor
+	factLog             *FactLog
+	readLog             *ReadLog
+	entityGraph         *EntityGraph
+	entitySynthesizer   *EntitySynthesizer
+	wikiCompressor      *WikiCompressor
+	teamLearningLog     *LearningLog
+	playbookSynthesizer *PlaybookSynthesizer
+	pamDispatcher       *PamDispatcher
+	// sourceCaptureDispatcher drains S2 source-capture jobs off-lock (see
+	// source_capture.go). Held as an atomic pointer so captureSource can read
+	// it WITHOUT b.mu — capture hooks fire while b.mu is held, so the read
+	// path must not re-enter the mutex.
+	sourceCaptureDispatcher atomic.Pointer[SourceCaptureDispatcher]
+	scanTracker             *scanStatusTracker
+	nextSubscriberID        int
+	botStreams              map[string]*botStreamBuffer
+	// appBuildStallSwept dedupes the stalled-build acceptance sweep: taskID ->
+	// the StalledSince it was last acted on, so a still-stuck App Builder build
+	// is nudged at most once per stall episode (broker_app_eval.go).
+	appBuildStallSwept map[string]string
+	// inlineDetectActive single-flights inline workflow→App detection so a burst
+	// of task-less turns cannot spawn unbounded goroutines / corpus reads / judge
+	// calls (broker_workflow_detect.go). Guarded by mu.
+	inlineDetectActive bool
+	// mu is the broker's single big lock. contendedMutex == sync.Mutex
+	// semantics plus sampled slow-wait logging (broker_mutex.go) so a
+	// long holder wedging every endpoint is visible in the log.
+	mu                     contendedMutex
+	officeMemberMutationMu sync.Mutex
+	stateWriteMu           sync.Mutex
+	stateWriteSeq          atomic.Uint64
+	stateWriteApplied      atomic.Uint64
+	// configMu serializes handleConfig POST reads/writes so concurrent
+	// /config calls don't corrupt ~/.hivex/config.json. config.Save uses
+	// os.WriteFile (O_TRUNC) without locking, so two parallel POSTs can
+	// produce a truncated/overlaid file.
+	configMu sync.Mutex
+	// archiveSweepMu ensures only one WikiArchiver.Sweep runs at a time.
+	// Without this, concurrent POST /wiki/archive/sweep requests and the
+	// background cron tick could both archive the same articles, with the
+	// second sweep reading tombstone content (written by the first) into the
+	// .archive/ copy — silently destroying the original.
+	archiveSweepMu   sync.Mutex
+	server           *http.Server
+	listener         net.Listener
+	lifecycleCtx     context.Context
+	lifecycleCancel  context.CancelFunc
+	token            string   // shared secret for authenticating requests
+	addr             string   // actual listen address (useful when port=0)
+	webUIOrigins     []string // allowed CORS origins for web UI (set by ServeWebUI)
+	webShareStart    func() (WebShareStatus, error)
+	webShareStatus   func() WebShareStatus
+	webShareStop     func() error
+	webTunnelStart   func() (WebTunnelStatus, error)
+	webTunnelStatus  func() WebTunnelStatus
+	webTunnelStop    func() error
+	brokerRestartMu  sync.Mutex
+	runtimeProvider  string          // "codex" or "claude" — set by launcher
+	packSlug         string          // active bot pack slug ("founding-team", "revops", ...) — set by launcher
+	blankSlateLaunch bool            // start without a saved blueprint and synthesize the first operation
+	openclawBridge   *OpenclawBridge // nil until the bridge attaches itself; used by handleOfficeMembers for live add/remove
+	// humanAdmitHook fires once per successful invite acceptance so the
+	// office-bound share adapter can call Host.UpsertParticipant for the new
+	// admitted human. Stored atomically so the HTTP hot path can read without
+	// contending on b.mu. Installed and cleared by ShareTransport.Run; nil
+	// when no adapter is registered (e.g. legacy launches that bypass
+	// RegisterTransports).
+	humanAdmitHook atomic.Pointer[humanAdmitHookFn]
+	// shareTransport is the registered office-bound share adapter, set by
+	// RegisterTransports when wiring is enabled. The in-process share
+	// controller looks this up to route invite creation through the adapter
+	// (so admit + revoke + invite-create all flow through the same surface)
+	// instead of the legacy HTTP path. Atomic so the controller's read does
+	// not contend with adapter registration on a different goroutine.
+	shareTransport     atomic.Pointer[ShareTransport]
+	generateMemberFn   func(prompt string) (generatedMemberTemplate, error)
+	generateChannelFn  func(context.Context, string) (generatedChannelTemplate, error)
+	generateBotFileFn  func(ctx context.Context, relPath, hint string) (string, error)
+	policies           []officePolicy // active office operating rules
+	rateLimitBuckets   map[string]ipRateLimitBucket
+	rateLimitWindow    time.Duration
+	rateLimitRequests  int
+	lastRateLimitPrune time.Time
+
+	// Bot-scoped buckets — applied to authenticated bot traffic even though
+	// the IP-scoped bucket above exempts callers with a valid Bearer token. This
+	// is the containment for a prompt-injected bot that loops on MCP tools.
+	botRateLimitBuckets   map[string]ipRateLimitBucket
+	botRateLimitWindow    time.Duration
+	botRateLimitRequests  int
+	lastBotRateLimitPrune time.Time
+	botLogRoot            string // override for tests; empty means bot.DefaultTaskLogRoot()
+
+	// App budget buckets — the broker token exempts the web host from the IP
+	// bucket, so a hostile or buggy App could otherwise loop POST /apps/ai or
+	// /apps/integrations/call and burn LLM credits / upstream rate limits
+	// unthrottled (security review H2). Keyed PER-APP (appBudgetKey), enforced on
+	// a per-minute AND a per-day window. Initialized in NewBroker.
+	appAIRateLimitBuckets        map[string]ipRateLimitBucket // ai(): per-minute
+	appAIDailyBuckets            map[string]ipRateLimitBucket // ai(): per-day
+	appIntegrationReadBuckets    map[string]ipRateLimitBucket // reads: per-minute
+	appIntegrationReadDayBuckets map[string]ipRateLimitBucket // reads: per-day
+	appDBWriteBuckets            map[string]ipRateLimitBucket // db writes: per-minute
+	lastAppBudgetPrune           time.Time                    // throttles the idle-key sweep
+
+	// workflowDetectionEnabled gates post-task App discovery (broker_workflow_detect.go).
+	// On only in the production web-serve path so the unit suite never fires a live
+	// LLM judge when a test completes a task.
+	workflowDetectionEnabled bool
+
+	// Slack transport hot-start lifecycle (broker_slack_transport.go). The
+	// transport is started in-process — at boot by RegisterTransports and at
+	// runtime by handleSlackConnect — so connecting a channel from the web app
+	// brings Socket Mode up live, with no broker re-exec. slackTransportMu guards
+	// the start/stop pair; slackTransport is the live adapter (nil when not
+	// running) and slackTransportStop cancels its goroutines and waits for them
+	// to drain (nil when not running).
+	slackTransportMu   sync.Mutex
+	slackTransport     *SlackTransport
+	slackTransportStop func()
+
+	// nowFn is the clock used by rate-limit logic. nil means time.Now.
+	// Inject a fake clock in tests to avoid real-time sleeps.
+	nowFn func() time.Time
+
+	stopCh   chan struct{} // closed by Stop(); signals background goroutines to exit
+	stopOnce sync.Once
+
+	// Fire-and-forget hook tracking (publish-path manifest stamps, workflow
+	// precompile, dev-server pre-warm). Stop waits on bgWG so none of these
+	// can write into the runtime home after Stop returns — a post-Stop write
+	// races whoever owns that tree next (observed: t.TempDir cleanup failing
+	// with "directory not empty" when advisePublishOddities re-stamped
+	// app.json after the test ended).
+	bgMu      sync.Mutex
+	bgStopped bool
+	bgWG      sync.WaitGroup
+
+	// Skill compile (Stage A) plumbing. The scanner is lazily constructed on
+	// first compile; metrics + flags coordinate concurrent triggers. All four
+	// fields are guarded by b.mu except where the metric body uses sync/atomic.
+	skillCompileMetrics   SkillCompileMetrics
+	skillCompileInflight  bool
+	skillCompileCoalesced bool
+	skillScanner          *SkillScanner
+	// recentlyRejectedSkills holds in-memory snapshots of skills rejected in
+	// the last 60s so /skills/reject/undo can restore them. Keyed by undo
+	// token. Guarded by b.mu. See skill_crud_endpoints.go for GC semantics.
+	recentlyRejectedSkills map[string]rejectedSkillSnapshot
+
+	// upgradeRunInFlight serialises POST /upgrade/run so two parallel
+	// clicks (or two browser tabs racing) cannot launch concurrent
+	// `npm install` against the same node_modules. npm's own lockfile
+	// usually recovers, but we've seen partial-extract corruption when
+	// two installs target the same prefix simultaneously — this guard
+	// is the cheap belt to npm's suspenders.
+	upgradeRunInFlight atomic.Bool
+
+	// statePath is the on-disk broker-state.json path bound at construction.
+	// NewBrokerAt(path) sets this directly; NewBroker() resolves
+	// defaultBrokerStatePath() once and pins the result. A later-arriving
+	// goroutine writing via a stale closure (or a sibling broker built at
+	// a different path) cannot retarget this broker's saves.
+	statePath string
+
+	// Multi-workspace plumbing. All three are nil until SetWorkspaceOrchestrator /
+	// SetLauncherDrainer / SetAdminPauseExitFn wire concrete impls. nil is
+	// the expected state on a broker started without multi-workspace
+	// support — handlers degrade to 503 (orchestrator) or fall back to
+	// os.Exit(0) (exit hook). Lane B owns the orchestrator + Launcher.Drain
+	// implementations; this broker only depends on the interfaces in
+	// broker_workspaces.go.
+	workspaces       workspaceOrchestrator
+	launcherDrain    launcherDrainer
+	adminPauseExitFn func(int)
+
+	// humanHasPosted flips true the first time any human-authored message
+	// lands in the broker (across any channel). Drives the office sidebar's
+	// first-run nudge: the rail shows "→ tag @<bot> in #general" until
+	// the human sends their first message in any channel, then the nudge
+	// dismisses for good. Surface point: /office-members?meta.humanHasPosted.
+	//
+	// Bootstrap: NewBrokerAt scans the loaded message history once at startup
+	// (cheap — bounded by the persisted message slice). After that the field
+	// only ever flips false → true, never back. Guarded by b.mu.
+	humanHasPosted bool
+
+	// gbrain on-demand install lifecycle (broker_knowledge.go). installMu
+	// guards the three fields below — a dedicated lock so a multi-minute
+	// install goroutine streaming progress lines never contends on b.mu's
+	// hot path. installState ∈ {"idle","installing","installed","error"};
+	// the empty zero value is reported as "idle". Single-flight: only one
+	// install goroutine runs at a time (guarded by installState=="installing").
+	installMu       sync.Mutex
+	installState    string
+	installProgress string
+	installError    string
+}
+
+func stringSliceContainsFold(values []string, want string) bool {
+	want = strings.TrimSpace(want)
+	if want == "" {
+		return false
+	}
+	for _, value := range values {
+		if strings.EqualFold(strings.TrimSpace(value), want) {
+			return true
+		}
+	}
+	return false
+}
+
+func parseBrokerTimestamp(raw string) time.Time {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return time.Time{}
+	}
+	ts, err := time.Parse(time.RFC3339, raw)
+	if err != nil {
+		return time.Time{}
+	}
+	return ts.UTC()
+}
+
+// skipBrokerStateLoadOnConstruct gates the auto-load of disk state
+// inside NewBrokerAt. Production keeps it false so the CLI resumes from
+// disk state. A *_test.go init flips it to true so tests that call
+// NewBrokerAt / NewBroker get a fresh broker by default, immune to state
+// leaked by prior tests via a shared broker-state.json. Persistence
+// tests that want the load call b.loadState() explicitly after
+// construction (or use reloadedBroker(t, b)).
+var skipBrokerStateLoadOnConstruct = false
+
+// NewBroker constructs a Broker bound to defaultBrokerStatePath() resolved
+// at call time. Production code uses this so the CLI resumes from the
+// default ~/.hivex/team/broker-state.json (or its HIVEX_BROKER_STATE_PATH /
+// HIVEX_RUNTIME_HOME override). Tests should prefer NewBrokerAt or the
+// newTestBroker(t) helper — both pin a per-test path explicitly.
+func NewBroker() *Broker {
+	b := NewBrokerAt(defaultBrokerStatePath())
+	// Production entry only: wire the portal turn meter when the tier
+	// contract is configured (HIVEX_PORTAL_TURNS_URL + key). Tests construct
+	// brokers via NewBrokerAt and stay unmetered.
+	installPortalTurnMeter(b)
+	return b
+}
+
+// NewBrokerAt constructs a Broker whose state is persisted to statePath.
+// The path is bound at construction time and stored on the Broker, so
+// late-arriving goroutines (or sibling brokers built at other paths in
+// the same process) cannot retarget this broker's saves. Use this instead
+// of NewBroker() everywhere that needs path isolation — notably tests
+// that want to pin state under t.TempDir.
+//
+// Panics on an empty statePath. With "" the broker would silently write
+// `.last-good` and `<empty>.tmp.<rand>` files into the process cwd, which
+// is the kind of foot-gun that only surfaces in production when a CI
+// runner happens to execute from a writable directory.
+func NewBrokerAt(statePath string) *Broker {
+	if strings.TrimSpace(statePath) == "" {
+		panic("team.NewBrokerAt: statePath must not be empty (use defaultBrokerStatePath() if no explicit path)")
+	}
+	lifecycleCtx, lifecycleCancel := context.WithCancel(context.Background())
+	b := &Broker{
+		channelStore:        channel.NewStore(),
+		token:               generateToken(),
+		messageSubscribers:  make(map[int]chan channelMessage),
+		actionSubscribers:   make(map[int]chan officeActionLog),
+		activity:            make(map[string]botActivitySnapshot),
+		activitySubscribers: make(map[int]chan botActivitySnapshot),
+		officeSubscribers:   make(map[int]chan officeChangeEvent),
+		wikiSubscribers:     make(map[int]chan wikiWriteEvent),
+		entitySubscribers:   make(map[int]chan EntityBriefSynthesizedEvent),
+		factSubscribers:     make(map[int]chan EntityFactRecordedEvent),
+		botStreams:          make(map[string]*botStreamBuffer),
+		userInboxCursors:    make(map[string]InboxCursor),
+		memberPresence:      make(map[string]memberPresenceRecord),
+		presenceKeyToSlug:   make(map[string]string),
+		rateLimitBuckets:    make(map[string]ipRateLimitBucket),
+		rateLimitWindow:     defaultRateLimitWindow,
+		rateLimitRequests:   defaultRateLimitRequestsPerWindow,
+
+		botRateLimitBuckets:  make(map[string]ipRateLimitBucket),
+		botRateLimitWindow:   defaultBotRateLimitWindow,
+		botRateLimitRequests: defaultBotRateLimitRequestsPerWindow,
+
+		appAIRateLimitBuckets:        make(map[string]ipRateLimitBucket),
+		appAIDailyBuckets:            make(map[string]ipRateLimitBucket),
+		appIntegrationReadBuckets:    make(map[string]ipRateLimitBucket),
+		appIntegrationReadDayBuckets: make(map[string]ipRateLimitBucket),
+		appDBWriteBuckets:            make(map[string]ipRateLimitBucket),
+
+		statePath:       statePath,
+		lifecycleCtx:    lifecycleCtx,
+		lifecycleCancel: lifecycleCancel,
+	}
+	if !skipBrokerStateLoadOnConstruct {
+		_ = b.loadState()
+	}
+	b.mu.Lock()
+	b.ensureDefaultOfficeMembersLocked()
+	b.ensureDefaultChannelsLocked()
+	b.normalizeLoadedStateLocked()
+	b.bootstrapHumanHasPostedLocked()
+	// Resolve the Linear-style ID prefix from the workspace registry's
+	// company_name so any tasks minted from here forward carry e.g.
+	// NEX-N instead of task-N. Failure-tolerant: refresh keeps the
+	// existing (or default) prefix if the registry isn't readable.
+	b.refreshIDPrefixFromWorkspaceLocked()
+	b.mu.Unlock()
+	b.initGovernor()
+	b.stopCh = make(chan struct{})
+	if activityWatchdogEnabled {
+		// Watchdog: reap bots stuck in "active"/"thinking" when the spawn
+		// crashed before reaching the idle transition. Stopped via b.stopCh.
+		ctx, cancel := context.WithCancel(context.Background())
+		go func() {
+			<-b.stopCh
+			cancel()
+		}()
+		go b.runActivityWatchdog(ctx)
+	}
+	return b
+}
+
+// Token returns the shared secret that bots must include in requests.
+func (b *Broker) Token() string {
+	return b.token
+}
+
+// Addr returns the actual listen address (e.g. "127.0.0.1:7890").
+func (b *Broker) Addr() string {
+	return b.addr
+}
+
+// ChannelStore returns the channel store for DM type checks and member lookups.
+func (b *Broker) ChannelStore() *channel.Store {
+	return b.channelStore
+}
+
+// Start launches the broker on the configured localhost port.
+func (b *Broker) Start() error {
+	b.ensureWikiWorker()
+	// S2 source capture: snapshot office activity into the immutable source
+	// layer off the broker's hot path. Started right after the wiki worker so
+	// capture hooks have a live drain to hand jobs to. A nil worker (non-
+	// markdown backend) leaves it unstarted and b.captureSource a no-op.
+	b.startSourceCaptureDispatcher()
+	// Lane A migration: derive LifecycleState for every persisted task
+	// that came back from disk without one, and rebuild the inverse
+	// lifecycle index. Idempotent across restarts and per-process
+	// guarded so additional startup hooks invoking it are no-ops.
+	b.MigrateLifecycleStatesOnce()
+	// Phase 6 migration: the product is now pure task-scoped, so every chat
+	// channel must be owned by a task to stay navigable. Fold any legacy
+	// free-standing channel or DM with history into an archived owning task
+	// (mirrors the Backup & Migration task that owns #general). Idempotent;
+	// runs after lifecycle migration + channel/member seeding above.
+	b.MigrateLegacyChannelsOnce()
+	// Seed company context from previous onboarding skip, if pending.
+	// configMu guards the read-modify-write so a concurrent broker retry
+	// goroutine re-arming the flag under the same lock cannot race with
+	// this claim. runCompanySeedJob re-arms PendingCompanySeed on error
+	// or NeedsRetry, so transient failures are retried on the next startup.
+	var shouldSeed bool
+	var seedCfg config.Config
+	b.configMu.Lock()
+	if cfg, err := config.Load(); err == nil && cfg.PendingCompanySeed {
+		cfg.PendingCompanySeed = false
+		if err := config.Save(cfg); err != nil {
+			log.Printf("broker: failed to clear PendingCompanySeed: %v", err)
+		} else {
+			shouldSeed = true
+			seedCfg = cfg
+		}
+	}
+	b.configMu.Unlock()
+	if shouldSeed {
+		go b.runCompanySeedJob(seedCfg)
+	}
+	// One-time migration: auto-consolidate overlapping skills.
+	b.mu.Lock()
+	b.autoConsolidateSkillsIfNeeded()
+	b.mu.Unlock()
+
+	b.ensureWikiSectionsCache()
+	b.ensureWikiCategoriesCache()
+	b.ensureEntitySynthesizer()
+	b.ensureWikiCompressor()
+	b.ensurePlaybookExecutionLog()
+	b.ensurePlaybookSynthesizer()
+	// PR 8 Lane G: register system-managed crons AFTER review log + wiki
+	// worker init so the registry reflects subsystems that are actually up.
+	// Registration is idempotent — pre-existing entries keep their
+	// IntervalOverride and Enabled choices.
+	b.registerSystemCrons()
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		select {
+		case <-b.stopCh:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+	b.startArchiveSweepLoop(ctx)
+	b.startMemoryWorkflowReconcilerLoop(ctx)
+	// Lane D: reviewer convergence sweeper. Drives the timeout-skipped
+	// filler + the running→review→decision cascade for tasks whose
+	// reviewer slot expires before all grades land. Without this wired
+	// at Start(), reviewer timeouts are dead code in production despite
+	// the test suite calling EvaluateConvergence directly.
+	b.StartReviewConvergenceSweeper(ctx)
+	// S2 feeder 3: daily chat-thread digest sweep → source layer (kind=chat).
+	// Same ctx/stopCh lifecycle as runActivityWatchdog; disabled when the
+	// interval env resolves to 0.
+	b.startChatDigestLoop(ctx)
+	// The operator bot service (routine fires, tool authoring) is the
+	// broker's child now — spawn/supervise it unless externally managed.
+	// See agent_service_supervisor.go and the 2026-08-14 QA findings.
+	b.startBotServiceSupervisor(ctx)
+	if err := b.StartOnPort(brokeraddr.ResolvePort()); err != nil {
+		cancel()
+		if b.lifecycleCancel != nil {
+			b.lifecycleCancel()
+		}
+		return err
+	}
+	return nil
+}
+
+// WikiReadLog returns the broker's ReadLog under b.mu. Handlers must use this
+// accessor — not b.readLog directly — to avoid a data race with
+// ensureWikiWorker's write under b.mu.
+func (b *Broker) WikiReadLog() *ReadLog {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.readLog
+}
+
+// ensureWikiWorker moved to broker_wiki_lifecycle.go.
+
+// StartOnPort launches the broker on the given port. Use 0 for an OS-assigned port.
+func (b *Broker) StartOnPort(port int) error {
+	mux := http.NewServeMux()
+	b.registerPlatformRoutes(mux)
+	b.registerTaskRoutes(mux)
+	// Lane E (multi-bot control loop): Decision Inbox + per-task
+	// Decision Packet view. /tasks/inbox is registered as an exact
+	// path so it wins over the /tasks/ prefix. /tasks/ fires for
+	// /tasks/{id} only because the existing /tasks/ack and
+	// /tasks/memory-workflow exact paths win for their literals.
+	mux.HandleFunc("/tasks/inbox", b.requireAuth(b.handleTasksInbox))
+	mux.HandleFunc("/tasks/", b.requireAuth(b.handleTaskByID))
+	// Phase 2 unified inbox: fan-out merge across tasks + requests +
+	// reviews. Additive — the legacy /tasks/inbox stays in place so
+	// the existing frontend keeps working through the transition.
+	mux.HandleFunc("/inbox/items", b.requireAuth(b.handleInboxItems))
+	mux.HandleFunc("/inbox/cursor", b.requireAuth(b.handleInboxCursor))
+	// Phase 3 bot-thread inbox: per-bot thread grouping +
+	// chat-style detail (messages interleaved with action cards).
+	// /inbox/threads composes on top of /inbox/items.
+	mux.HandleFunc("/inbox/threads", b.requireAuth(b.handleInboxThreads))
+	mux.HandleFunc("/inbox/threads/", b.requireAuth(b.handleInboxThreadDetail))
+	mux.HandleFunc("/session-mode", b.requireAuth(b.handleSessionMode))
+	mux.HandleFunc("/focus-mode", b.requireAuth(b.handleFocusMode))
+	mux.HandleFunc("/messages", b.requireAuth(b.handleMessages))
+	mux.HandleFunc("/reactions", b.requireAuth(b.handleReactions))
+	mux.HandleFunc("/notifications/automation", b.requireAuth(b.handleAutomationNotifications))
+	// Legacy path for the same handler. Anything already pointed at the old
+	// route keeps working rather than starting to 404 silently.
+	mux.HandleFunc("/realtime/session", b.requireAuth(b.handleRealtimeSession))
+	mux.HandleFunc("/execute/browser", b.requireAuth(b.handleExecuteBrowser))
+	mux.HandleFunc("/execute/replay", b.requireAuth(b.handleExecuteReplay))
+	mux.HandleFunc("/execute/approve", b.requireAuth(b.handleExecuteApprove))
+	mux.HandleFunc("/observe/browser", b.requireAuth(b.handleObserveBrowser))
+	mux.HandleFunc("/office-members", b.requireAuth(b.handleOfficeMembers))
+	// Every bot gets a computer (broker_computer_routes.go).
+	b.registerComputerRoutes(mux)
+	// Single derived-stats source: every surface-level count (header
+	// strip, board lane headers, dashboard tiles, inbox badge, wiki
+	// home) reads this one endpoint so the numbers cannot drift.
+	mux.HandleFunc("/office/stats", b.requireAuth(b.handleOfficeStats))
+	mux.HandleFunc("/office-members/generate", b.requireAuth(b.handleGenerateMember))
+	mux.HandleFunc("/channels", b.requireAuth(b.handleChannels))
+	mux.HandleFunc("/channels/dm", b.requireAuth(b.handleCreateDM))
+	mux.HandleFunc("/channels/generate", b.requireAuth(b.handleGenerateChannel))
+	mux.HandleFunc("/channel-members", b.requireAuth(b.handleChannelMembers))
+	mux.HandleFunc("/members", b.requireAuth(b.handleMembers))
+	mux.HandleFunc("/memory", b.requireAuth(b.handleMemory))
+	mux.HandleFunc("/wiki/write", b.requireAuth(b.handleWikiWrite))
+	mux.HandleFunc("/wiki/write-human", b.requireAuth(b.handleWikiWriteHuman))
+	// Per-bot instruction files (SOUL/IDENTITY/OPERATIONS/TOOLS + office
+	// USER.md). Separate from /wiki/* so they use the strict bot-file path
+	// allowlist and skip the team/ article index. See broker_agent_files_http.go.
+	mux.HandleFunc("/agent-files/read", b.requireAuth(b.handleBotFileRead))
+	mux.HandleFunc("/agent-files/write", b.requireAuth(b.handleBotFileWrite))
+	mux.HandleFunc("/agent-files/generate", b.requireAuth(b.handleBotFileGenerate))
+	mux.HandleFunc("/humans", b.requireAuth(b.handleHumans))
+	mux.HandleFunc("/humans/me", b.handleHumanMe)
+	mux.HandleFunc("/humans/invites", b.requireAuth(b.handleHumanInvites))
+	mux.HandleFunc("/humans/invites/accept", b.handleHumanInviteAccept)
+	mux.HandleFunc("/humans/sessions", b.requireAuth(b.handleHumanSessions))
+	mux.HandleFunc("/wiki/read", b.requireAuth(b.handleWikiRead))
+	mux.HandleFunc("/wiki/search", b.requireAuth(b.handleWikiSearch))
+	mux.HandleFunc("/wiki/lookup", b.requireAuth(b.handleWikiLookup))
+	// OpenAI-compatible chat shim. Exists so gbrain can reach a chat model for
+	// query expansion on a subscription-only host, where the user's
+	// credentials live inside the bot CLI and there is no API key to give
+	// gbrain. See broker_openai_compat.go.
+	mux.HandleFunc("/v1/chat/completions", b.requireAuth(b.handleOpenAIChatCompletions))
+	mux.HandleFunc("/wiki/list", b.requireAuth(b.handleWikiList))
+	mux.HandleFunc("/wiki/article", b.requireAuth(b.handleWikiArticle))
+	mux.HandleFunc("/wiki/catalog", b.requireAuth(b.handleWikiCatalog))
+	mux.HandleFunc("/wiki/tree", b.requireAuth(b.handleWikiTree))
+	mux.HandleFunc("/wiki/file", b.requireAuth(b.handleWikiFile))
+	// /wiki/app/ serves embedded HTML app bundles WITHOUT requireAuth: a
+	// sandboxed app has an opaque origin and cannot send the bearer token, so
+	// (like /web-token) the handler's loopback RemoteAddr + Host gate is the
+	// boundary. Trailing slash = path-prefix route.
+	mux.HandleFunc("/wiki/app/", b.handleWikiApp)
+	mux.HandleFunc("/wiki/audit", b.requireAuth(b.handleWikiAudit))
+	mux.HandleFunc("/wiki/visual", b.requireAuth(b.handleWikiVisualArtifact))
+	mux.HandleFunc("/wiki/archive/sweep", b.requireAuth(b.handleWikiArchiveSweep))
+	mux.HandleFunc("/wiki/sections", b.requireAuth(b.handleWikiSections))
+	mux.HandleFunc("/wiki/categories", b.requireAuth(b.handleWikiCategories))
+	mux.HandleFunc("/wiki/categories/", b.requireAuth(b.handleWikiCategory))
+	mux.HandleFunc("/wiki/lint/run", b.requireAuth(b.handleLintRun))
+	mux.HandleFunc("/wiki/lint/resolve", b.requireAuth(b.handleLintResolve))
+	mux.HandleFunc("/wiki/maintenance/suggest", b.requireAuth(b.handleWikiMaintenanceSuggest))
+	mux.HandleFunc("/wiki/extract/replay", b.requireAuth(b.handleWikiExtractReplay))
+	mux.HandleFunc("/wiki/dlq", b.requireAuth(b.handleWikiDLQ))
+	mux.HandleFunc("/wiki/compress", b.requireAuth(b.handleWikiCompress))
+	mux.HandleFunc("/wiki/page", b.requireAuth(b.handleWikiPageDelete))
+	mux.HandleFunc("/wiki/page/create", b.requireAuth(b.handleWikiPageCreate))
+	mux.HandleFunc("/wiki/page/move", b.requireAuth(b.handleWikiPageMove))
+	mux.HandleFunc("/wiki/page/rename", b.requireAuth(b.handleWikiPageRename))
+	mux.HandleFunc("/wiki/upload", b.requireAuth(b.handleWikiUpload))
+	// Slice 5: per-article version history, per-commit diff, append-only restore.
+	// /wiki/history/ is a path-prefix route — the article path is the suffix.
+	mux.HandleFunc("/wiki/history/", b.requireAuth(b.handleWikiHistory))
+	mux.HandleFunc("/wiki/diff", b.requireAuth(b.handleWikiDiff))
+	mux.HandleFunc("/wiki/restore", b.requireAuth(b.handleWikiRestore))
+	mux.HandleFunc("/visual-artifacts", b.requireAuth(b.handleVisualArtifacts))
+	mux.HandleFunc("/visual-artifacts/", b.requireAuth(b.handleVisualArtifactSubpath))
+	// Apps: bot-generated internal tools. Reached only via the /api proxy, so
+	// these never shadow the SPA's client-side /apps/<id> route.
+	mux.HandleFunc("/apps", b.requireAuth(b.handleApps))
+	// Bridge v2: GENERIC integration + LLM surface for sandboxed Apps. Registered
+	// as longer, more specific patterns than "/apps/" so ServeMux routes them
+	// here rather than to handleAppByID (which would mis-read "integrations" or
+	// "ai" as an app id). These replace the bespoke per-feature Gmail endpoint —
+	// see broker_apps_integrations.go for the widened-surface security notes.
+	mux.HandleFunc("/apps/integrations/call", b.requireAuth(b.handleAppsIntegrationsCall))
+	mux.HandleFunc("/apps/integrations/catalog", b.requireAuth(b.handleAppsIntegrationsCatalog))
+	mux.HandleFunc("/apps/ai", b.requireAuth(b.handleAppsAI))
+	// Preserved visual artifacts (HTML briefs / PDFs) from the previous
+	// product's wiki, attached to legacy Knowledge pages.
+	mux.HandleFunc(legacyArtifactURLPrefix, b.requireAuth(b.handleLegacyKnowledgeArtifact))
+	mux.HandleFunc("/apps/", b.requireAuth(b.handleAppByID))
+	b.registerKnowledgeRoutes(mux)
+	mux.HandleFunc("/interview", b.requireAuth(b.handleInterview))
+	mux.HandleFunc("/interview/answer", b.requireAuth(b.handleInterviewAnswer))
+	mux.HandleFunc("/reset", b.requireAuth(b.handleReset))
+	mux.HandleFunc("/reset-dm", b.requireAuth(b.handleResetDM))
+	mux.HandleFunc("/policies", b.requireAuth(b.handlePolicies))
+	mux.HandleFunc("/policies/", b.requireAuth(b.handlePoliciesSubpath))
+	mux.HandleFunc("/signals", b.requireAuth(b.handleSignals))
+	mux.HandleFunc("/decisions", b.requireAuth(b.handleDecisions))
+	mux.HandleFunc("/watchdogs", b.requireAuth(b.handleWatchdogs))
+	mux.HandleFunc("/actions", b.requireAuth(b.handleActions))
+	mux.HandleFunc("/operator/run-plan", b.requireAuth(b.handleOperatorRunPlan))
+	// App-scoped deterministic workflow: compile once + freeze, then run the
+	// same frozen plan every time (compile-and-freeze). See broker_operator_workflow.go.
+	mux.HandleFunc("/operator/apps/", b.requireAuth(b.handleOperatorAppWorkflow))
+	mux.HandleFunc("/approval-audit", b.requireAuth(b.handleApprovalAudit))
+	mux.HandleFunc("/integrations", b.requireAuth(b.handleIntegrations))
+	mux.HandleFunc("/integrations/connect", b.requireAuth(b.handleIntegrationConnect))
+	mux.HandleFunc("/integrations/connect-credentials", b.requireAuth(b.handleIntegrationConnectCredentials))
+	mux.HandleFunc("/integrations/connect-status", b.requireAuth(b.handleIntegrationConnectStatus))
+	mux.HandleFunc("/integrations/disconnect", b.requireAuth(b.handleIntegrationDisconnect))
+	mux.HandleFunc("/integrations/audit", b.requireAuth(b.handleIntegrationAudit))
+	mux.HandleFunc("/integrations/resolve", b.requireAuth(b.handleIntegrationResolve))
+	mux.HandleFunc("/integrations/grants", b.requireAuth(b.handleIntegrationGrants))
+	mux.HandleFunc("/policy/resolve", b.requireAuth(b.handlePolicyResolve))
+	mux.HandleFunc("/policy/grants", b.requireAuth(b.handlePolicyGrants))
+	// "Sign in with Composio" — the broker drives the composio CLI so the
+	// user never copy/pastes an API key. See broker_composio_signin.go.
+	mux.HandleFunc("/integrations/composio/signin/start", b.requireAuth(b.handleComposioSigninStart))
+	mux.HandleFunc("/integrations/composio/signin/status", b.requireAuth(b.handleComposioSigninStatus))
+	mux.HandleFunc("/scheduler", b.requireAuth(b.handleScheduler))
+	mux.HandleFunc("/scheduler/", b.requireAuth(b.handleSchedulerSubpath))
+	mux.HandleFunc("/skills", b.requireAuth(b.handleSkills))
+	// /skills/compile lives ABOVE the wildcard subpath route so the
+	// ServeMux longest-match wins for the compile endpoints.
+	mux.HandleFunc("/skills/compile", b.requireAuth(b.handlePostSkillCompile))
+	mux.HandleFunc("/skills/compile/stats", b.requireAuth(b.handleGetSkillCompileStats))
+	mux.HandleFunc("/skills/", b.requireAuth(b.handleSkillsSubpath))
+	// GET /commands — slash-command registry mirror so the web composer
+	// renders the same command set as the TUI. See broker_commands.go.
+	mux.HandleFunc("/commands", b.requireAuth(b.handleCommands))
+	mux.HandleFunc("/telegram/groups", b.requireAuth(b.handleTelegramGroups))
+	// Web-driven /connect wizard endpoints. The TUI talks to the Telegram Bot
+	// API directly; the web composer drives the same flow through these.
+	mux.HandleFunc("/telegram/verify", b.requireAuth(b.handleTelegramVerify))
+	mux.HandleFunc("/telegram/discover", b.requireAuth(b.handleTelegramDiscover))
+	mux.HandleFunc("/telegram/connect", b.requireAuth(b.handleTelegramConnect))
+	mux.HandleFunc("/slack/connect", b.requireAuth(b.handleSlackConnect))
+	mux.HandleFunc("/slack/agents", b.requireAuth(b.handleSlackBots))
+	mux.HandleFunc("/slack/agents/spawn", b.requireAuth(b.handleSlackBotsSpawn))
+	mux.HandleFunc("/slack/agents/spawn/complete", b.requireAuth(b.handleSlackBotsSpawnComplete))
+	mux.HandleFunc("/bridges", b.requireAuth(b.handleBridge))
+	mux.HandleFunc("/company", b.requireAuth(b.handleCompany))
+	mux.HandleFunc("/config", b.requireAuth(b.handleConfig))
+	mux.HandleFunc("/knowledge/embedding-options", b.requireAuth(b.handleKnowledgeEmbeddingOptions))
+	mux.HandleFunc("/knowledge/install", b.requireAuth(b.handleKnowledgeInstall))
+	mux.HandleFunc("/status/local-providers", b.requireAuth(b.handleLocalProvidersStatus))
+	mux.HandleFunc("/image-providers", b.requireAuth(b.handleImageProviders))
+	mux.HandleFunc("/v1/logs", b.requireAuth(b.handleOTLPLogs))
+	mux.HandleFunc("/events", b.handleEvents)
+	mux.HandleFunc("/agent-stream/", b.requireAuth(b.handleBotStream))
+	mux.HandleFunc("/agent-tool-event", b.requireAuth(b.handleBotToolEvent))
+	// Multi-workspace routes (broker_workspaces.go). Every route below is
+	// wrapped through b.withAuth so the design's "every protected route
+	// requires bearer" assertion holds. /admin/pause additionally requires
+	// loopback RemoteAddr (defense-in-depth, applied inside the handler).
+	mux.HandleFunc("/workspaces/list", b.withAuth(b.handleWorkspacesList))
+	mux.HandleFunc("/workspaces/create", b.withAuth(b.handleWorkspacesCreate))
+	mux.HandleFunc("/workspaces/switch", b.withAuth(b.handleWorkspacesSwitch))
+	mux.HandleFunc("/workspaces/pause", b.withAuth(b.handleWorkspacesPause))
+	mux.HandleFunc("/workspaces/resume", b.withAuth(b.handleWorkspacesResume))
+	mux.HandleFunc("/workspaces/shred", b.withAuth(b.handleWorkspacesShred))
+	mux.HandleFunc("/workspaces/restore", b.withAuth(b.handleWorkspacesRestore))
+	mux.HandleFunc("/workspaces/trash", b.withAuth(b.handleWorkspacesTrash))
+	mux.HandleFunc("/workspaces/onboarding", b.withAuth(b.handleWorkspacesOnboarding))
+	mux.HandleFunc("/admin/pause", b.withAuth(b.handleAdminPause))
+	// Onboarding: state/progress/complete + deterministic CEO phase machine.
+	// completeFn posts the first task as a human message and seeds the team;
+	// transitionFn emits deterministic CEO onboarding cards into the CEO DM.
+	mux.HandleFunc("/onboarding/reseed", b.requireAuth(b.handleOnboardingReseed))
+	onboarding.RegisterRoutesWithTransition(mux, b.onboardingCompleteFn, b.ceoOnboardingTransitionFn(), b.packSlug, b.requireAuth, filepath.Join(config.RuntimeHomeDir(), ".hivex", "wiki"))
+	// Workspace wipes: POST /workspace/reset (narrow) and /workspace/shred (full).
+	// After a successful wipe, b.Reset clears live in-memory broker state so the
+	// broker stays up without repersisting stale messages back onto disk.
+	// Auth-gated via requireAuth because shred permanently deletes state and
+	// must not be reachable without the broker token.
+	workspace.RegisterRoutesWithOptions(mux, workspace.RouteOptions{
+		AuthMiddleware: b.requireAuth,
+		ResetRuntime:   b.Reset,
+	})
+
+	// Wire the broker-owned gbrain MCP client backing the gbrain memory
+	// backend. Non-blocking and gbrain-optional (see ensureGBrainMemoryClient).
+	b.ensureGBrainMemoryClient()
+
+	addr := fmt.Sprintf("127.0.0.1:%d", port)
+	var lc net.ListenConfig
+	ln, err := lc.Listen(context.Background(), "tcp", addr)
+	if err != nil {
+		return err
+	}
+	b.addr = ln.Addr().String()
+	// Record where gbrain can reach the OpenAI-compatible shim, and the token
+	// it must present. Done here because this is the first point the listener's
+	// address is known; the wiki index is constructed later and needs both.
+	SetBrokerShimBase("http://" + b.addr + "/v1")
+	gbrain.SetShimToken(b.Token())
+	b.listener = ln
+
+	srv := &http.Server{
+		Addr:        addr,
+		Handler:     b.corsMiddleware(b.rateLimitMiddleware(mux)),
+		ReadTimeout: 5 * time.Second,
+		// No WriteTimeout — SSE streams (bot-stream, events) are open-ended.
+	}
+	b.server = srv
+
+	// Write token to a well-known path so tests and tools can authenticate.
+	// Use /tmp directly (not os.TempDir which varies by OS).
+	tokenFile := strings.TrimSpace(brokerTokenFilePath)
+	if tokenFile == "" || tokenFile == brokeraddr.DefaultTokenFile {
+		tokenFile = brokeraddr.ResolveTokenFile()
+	}
+	if tokenFile != "" {
+		if err := os.WriteFile(tokenFile, []byte(b.token), 0o600); err != nil {
+			log.Printf("broker: failed to write token file %s: %v", tokenFile, err)
+		}
+	}
+
+	go func() {
+		_ = srv.Serve(ln)
+	}()
+	return nil
+}
+
+// Stop shuts down the broker.
+// trackBackground runs fn on a goroutine Stop waits for. Use it for
+// fire-and-forget work that touches the runtime home (manifest stamps,
+// precompiles, pre-warms): an untracked goroutine can land a write after
+// Stop returns, corrupting whoever owns the tree next. Once Stop has begun,
+// fn is dropped instead of being launched into a dying broker — every
+// tracked hook is best-effort by construction.
+func (b *Broker) trackBackground(fn func()) {
+	b.bgMu.Lock()
+	if b.bgStopped {
+		b.bgMu.Unlock()
+		return
+	}
+	b.bgWG.Add(1)
+	b.bgMu.Unlock()
+	go func() {
+		defer b.bgWG.Done()
+		fn()
+	}()
+}
+
+func (b *Broker) Stop() {
+	// Refuse new tracked background work before anything is torn down, so
+	// the bgWG.Wait below is against a closed set.
+	b.bgMu.Lock()
+	b.bgStopped = true
+	b.bgMu.Unlock()
+
+	if b.stopCh != nil {
+		b.stopOnce.Do(func() {
+			close(b.stopCh)
+		})
+	}
+
+	// Snapshot the obsidian watcher and stop it BEFORE cancelling the
+	// lifecycle context. The watcher has trailing-edge debounce timers
+	// that fire callbacks via time.AfterFunc; those callbacks call
+	// Repo.Commit with the lifecycle context, so cancelling first would
+	// drop in-flight Obsidian-side edits at the commit step. The watcher's
+	// own Stop drains pending timers + commit goroutines under the
+	// pending WaitGroup, so this is the only correct order.
+	b.mu.Lock()
+	obsidianWatcher := b.obsidianWatcher
+	appDev := b.appDev
+	b.mu.Unlock()
+	if obsidianWatcher != nil {
+		_ = obsidianWatcher.Stop()
+	}
+	// Tear down any live app-preview dev servers (bun processes + proxies) so
+	// they don't outlive the broker.
+	if appDev != nil {
+		appDev.StopAll()
+	}
+
+	if b.lifecycleCancel != nil {
+		b.lifecycleCancel()
+	}
+	b.brokerRestartMu.Lock()
+	if b.listener != nil {
+		_ = b.listener.Close()
+	}
+	if b.server != nil {
+		_ = b.server.Close()
+	}
+	b.brokerRestartMu.Unlock()
+	b.mu.Lock()
+	synth := b.entitySynthesizer
+	pbSynth := b.playbookSynthesizer
+	pamDisp := b.pamDispatcher
+	compressor := b.wikiCompressor
+	humanWikiWriter := b.humanWikiWriter
+	b.mu.Unlock()
+	if synth != nil {
+		synth.Stop()
+	}
+	if pbSynth != nil {
+		pbSynth.Stop()
+	}
+	if pamDisp != nil {
+		pamDisp.Stop()
+	}
+	if compressor != nil {
+		compressor.Stop()
+	}
+	if humanWikiWriter != nil {
+		humanWikiWriter.Stop(2 * time.Second)
+	}
+	if sourceCapture := b.sourceCaptureDispatcher.Load(); sourceCapture != nil {
+		sourceCapture.Stop(2 * time.Second)
+	}
+	// Tear down the broker-owned gbrain MCP client: unregister it from the
+	// package-level memory entry points first so no in-flight memory call
+	// reaches a half-closed session, then Close() the session/subprocess.
+	b.mu.Lock()
+	gbrainClient := b.gbrainClient
+	b.gbrainClient = nil
+	b.mu.Unlock()
+	if gbrainClient != nil {
+		setSharedGBrainClient(nil)
+		_ = gbrainClient.Close()
+	}
+
+	// Last: drain tracked fire-and-forget hooks. This runs after
+	// lifecycleCancel so ctx-aware hooks (workflow precompile) abort their
+	// model calls promptly instead of holding Stop for their full timeout.
+	b.bgWG.Wait()
+}
+
+// handleWebToken returns the broker token to localhost clients without requiring auth.
+// This lets the web UI fetch the token to authenticate subsequent API calls.
+//
+// DNS rebinding: even though the listener binds 127.0.0.1, an attacker's
+// DNS record with a short TTL can point rebind.example.com at 127.0.0.1
+// after the browser's origin check passes. Go's default mux routes purely
+// on path, so without an explicit Host check the response would flow back
+// to the attacker's origin. Validate both RemoteAddr AND Host here.
+
+// SSE handlers and the tool-event audit channel (handleEvents,
+// handleBotStream, handleBotToolEvent) moved to broker_sse.go.
+
+// ServeWebUI starts a static file server for the web UI on the given port.
+// Returns an error if the port cannot be bound (e.g. already in use).
+// Web UI server (ServeWebUI, cacheControlMiddleware, webUIProxyHandler)
+// moved to broker_web_proxy.go.
+
+// emitTaskTransitionAutoNotebook used to fan task-status transitions
+// into per-bot notebook shelves. That auto-write path is gone:
+// notebooks must contain only properly drafted working notes and
+// learnings (authored via notebook_write), not a stream of every
+// status delta. The function is kept as an inert seam so the many
+// call sites in the task-mutation paths continue to compile and so a
+// future explicit "log this transition" feature has an obvious home.
+func (b *Broker) emitTaskTransitionAutoNotebook(*teamTask, string, string) {}
+
+// pendingTaskTransition captures a status delta that an under-mutex helper
+// (e.g. unblockDependentsLocked) wants to publish, but only AFTER the caller
+// has persisted via saveLocked. Kept around because cascade callers still
+// build batches with this type; flushPendingAutoNotebookTransitionsLocked is
+// now a no-op so the events are quietly discarded.
+type pendingTaskTransition struct {
+	taskID       string
+	beforeStatus string
+}
+
+// flushPendingAutoNotebookTransitionsLocked is intentionally a no-op.
+// See emitTaskTransitionAutoNotebook — notebooks no longer absorb
+// task-transition events. Kept as a seam so cascading-status callers
+// (e.g. unblockDependentsLocked) keep working without refactor.
+func (b *Broker) flushPendingAutoNotebookTransitionsLocked([]pendingTaskTransition, string) {
+}
+
+// IsBotMemberSlug returns true when `slug` matches a registered office
+// member and is not a human/system slug. Acquires b.mu — DO NOT call from a
+// path that already holds it; use isBotMemberSlugLocked instead.
+func (b *Broker) IsBotMemberSlug(slug string) bool {
+	if b == nil {
+		return false
+	}
+	slug = normalizeActorSlug(slug)
+	if slug == "" || isHumanMessageSender(slug) {
+		return false
+	}
+	switch slug {
+	case "system", "hive":
+		return false
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.findMemberLocked(slug) != nil
+}
+
+// isBotMemberSlugLocked is the hook-site variant: it assumes b.mu is held.
+// Used by the auto-notebook writer hooks to filter senders without re-entering
+// the broker's mutex (which would deadlock).
+func (b *Broker) isBotMemberSlugLocked(slug string) bool {
+	if b == nil {
+		return false
+	}
+	slug = normalizeActorSlug(slug)
+	if slug == "" || isHumanMessageSender(slug) {
+		return false
+	}
+	switch slug {
+	case "system", "hive":
+		return false
+	}
+	return b.findMemberLocked(slug) != nil
+}
+
+// senderMayAutoPromoteLocked reports whether a `from` value is allowed to have
+// its @slug body text auto-promoted into the tagged array. Allowlist shape:
+// humans (empty / "you" / "human") and any registered bot slug are allowed;
+// synthetic senders ("system", "hive", bridges, automation kinds) are not. A
+// denylist would silently let every future synthetic identity leak through.
+// Sender is normalized first so case drift ("PM", "Human") matches the
+// allowlist the same way channel access does.
+// Caller must hold b.mu.
+func (b *Broker) senderMayAutoPromoteLocked(from string) bool {
+	from = normalizeActorSlug(from)
+	if isHumanMessageSender(from) {
+		return true
+	}
+	return b.findMemberLocked(from) != nil
+}
+
+// ExternalQueue returns messages that need to be sent to external surfaces
+// for the given provider. Each message is returned at most once.
+func (b *Broker) ExternalQueue(provider string) []channelMessage {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.externalDelivered == nil {
+		b.externalDelivered = make(map[string]struct{})
+	}
+	surfaceChannels := make(map[string]struct{})
+	for _, ch := range b.channels {
+		if ch.Surface != nil && ch.Surface.Provider == provider {
+			surfaceChannels[ch.Slug] = struct{}{}
+		}
+	}
+	var out []channelMessage
+	for _, msg := range b.messages {
+		ch := normalizeChannelSlug(msg.Channel)
+		if _, ok := surfaceChannels[ch]; !ok {
+			continue
+		}
+		if _, delivered := b.externalDelivered[msg.ID]; delivered {
+			continue
+		}
+		b.externalDelivered[msg.ID] = struct{}{}
+		out = append(out, cloneChannelMessageForRead(msg))
+	}
+	return out
+}
+
+// SetWebURL records the web UI's base URL so surfaces that link back to the
+// app (e.g. the Slack App Home tab) can build real links.
+func (b *Broker) SetWebURL(url string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.webURL = strings.TrimRight(strings.TrimSpace(url), "/")
+}
+
+// WebURL returns the web UI's base URL, or "" before LaunchWeb has run.
+func (b *Broker) WebURL() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.webURL
+}
+
+// EnsureBridgedMember registers a bridged external bot as an office member
+// so it appears in the sidebar and can be @mentioned. Idempotent — calling with
+// an existing slug is a no-op. CreatedBy tags the source (e.g. "openclaw") so
+// the UI can distinguish bridged bots from built-ins or user-generated ones.
+func (b *Broker) EnsureBridgedMember(slug, name, createdBy string) error {
+	// Raw emptiness first: normalizeChannelSlug turns a blank slug into
+	// "general", so this "slug required" error was unreachable and a bridge
+	// with no slug registered a member named after a channel instead.
+	//
+	// Normaliser deliberately UNCHANGED (normalizeChannelSlug): this slug is
+	// PERSISTED, and changing what a stored value normalises to is a migration,
+	// not a rename. Only the emptiness fix lands here. Paired with
+	// findMemberLocked (broker_indexes.go) — move neither alone.
+	if strings.TrimSpace(slug) == "" {
+		return fmt.Errorf("slug required")
+	}
+	slug = normalizeChannelSlug(slug)
+	ensureNotebookDirsAfterUnlock := false
+	defer func() {
+		if ensureNotebookDirsAfterUnlock {
+			b.backfillBotFilesForRoster()
+		}
+	}()
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.findMemberLocked(slug) != nil {
+		return nil
+	}
+	member := officeMember{
+		Slug:      slug,
+		Name:      strings.TrimSpace(name),
+		Role:      "Bridged bot",
+		CreatedBy: strings.TrimSpace(createdBy),
+		CreatedAt: time.Now().UTC().Format(time.RFC3339),
+	}
+	if member.Name == "" {
+		member.Name = slug
+	}
+	applyOfficeMemberDefaults(&member)
+	b.members = append(b.members, member)
+	// Make sure the bridged bot shows up in #general so @mentions work.
+	for i := range b.channels {
+		if b.channels[i].Slug == "general" {
+			if !containsString(b.channels[i].Members, slug) {
+				b.channels[i].Members = append(b.channels[i].Members, slug)
+			}
+			break
+		}
+	}
+	if err := b.saveLocked(); err != nil {
+		return err
+	}
+	b.publishOfficeChangeLocked(officeChangeEvent{Kind: "member_created", Slug: slug})
+	ensureNotebookDirsAfterUnlock = true
+	return nil
+}
+
+// EnsureDirectChannel opens (or returns) the 1:1 DM channel between the
+// default human member and botSlug. Returns the canonical channel slug
+// (pair-sorted via channel.DirectSlug). Safe to call repeatedly; the DM row
+// is upserted in both the channel store and the in-memory broker table so
+// it shows up in the sidebar and findChannelLocked resolves it.
+func (b *Broker) EnsureDirectChannel(botSlug string) (string, error) {
+	botSlug = normalizeActorSlug(botSlug)
+	if botSlug == "" {
+		return "", fmt.Errorf("bot slug required")
+	}
+	if b.channelStore == nil {
+		return "", fmt.Errorf("channel store not initialized")
+	}
+	ch, err := b.channelStore.GetOrCreateDirect("human", botSlug)
+	if err != nil {
+		return "", fmt.Errorf("channel store GetOrCreateDirect: %w", err)
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.findChannelLocked(ch.Slug) == nil {
+		now := time.Now().UTC().Format(time.RFC3339)
+		b.channels = append(b.channels, teamChannel{
+			Slug:        ch.Slug,
+			Name:        ch.Slug,
+			Type:        "dm",
+			Description: "Direct messages with " + botSlug,
+			Members:     []string{"human", botSlug},
+			CreatedBy:   "hivex",
+			CreatedAt:   now,
+			UpdatedAt:   now,
+		})
+		if err := b.saveLocked(); err != nil {
+			return "", err
+		}
+	}
+	return ch.Slug, nil
+}
+
+// PostInboundSurfaceMessage posts a message from an external surface into the broker channel.
+func (b *Broker) PostInboundSurfaceMessage(from, channel, content, provider string) (channelMessage, error) {
+	return b.postInboundSurfaceMessage(from, channel, content, provider, "")
+}
+
+// PostInboundSurfaceMessageInThread is the thread-aware inbound path: when a
+// surface reply arrives inside a thread (threadRootKey is the surface's thread
+// root id — Slack's thread_ts), the broker maps it to the task whose thread
+// root that is and folds the reply into the task's thread (ReplyTo +
+// SourceTaskID). This is what keeps a foreign bot's in-thread reply scoped
+// to the task instead of leaking into the channel's shared context.
+func (b *Broker) PostInboundSurfaceMessageInThread(from, channel, content, provider, threadRootKey string) (channelMessage, error) {
+	return b.postInboundSurfaceMessage(from, channel, content, provider, threadRootKey)
+}
+
+// Purge clears all tasks from the broker's in-memory state and flushes
+// the empty list to disk. Tests that inject task fixtures with StartOnPort
+// should call this in t.Cleanup to prevent in-progress fixtures from leaking
+// via background saves or shared notification paths after the test exits.
+func (b *Broker) Purge() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.tasks = nil
+	if err := b.saveLocked(); err != nil {
+		log.Printf("broker: Purge: save failed: %v", err)
+	}
+}
+
+func (b *Broker) Reset() {
+	b.mu.Lock()
+	mode := b.sessionMode
+	bot := b.oneOnOneBot
+	b.messages = nil
+	b.incidents = nil
+	b.members = defaultOfficeMembers()
+	b.channels = defaultTeamChannels()
+	b.sessionMode = mode
+	b.oneOnOneBot = bot
+	b.tasks = []teamTask{}
+	b.requests = nil
+	b.approvalAudit = nil
+	b.connectionRegistry = nil
+	b.actionGrants = nil
+	b.humanInvites = nil
+	b.humanSessions = nil
+	b.humanSessionRevoke = nil
+	b.actions = nil
+	b.signals = nil
+	b.decisions = nil
+	b.watchdogs = nil
+	b.policies = nil
+	b.scheduler = nil
+	// Clear scheduler history maps so a workspace reset can't surface
+	// stale runs / activity / revisions on a freshly recreated routine
+	// that happens to reuse a prior slug.
+	b.schedulerRuns = nil
+	b.schedulerActivity = nil
+	b.schedulerRevisions = nil
+	b.pendingInterview = nil
+	b.activity = make(map[string]botActivitySnapshot)
+	b.memberPresence = make(map[string]memberPresenceRecord)
+	b.presenceKeyToSlug = make(map[string]string)
+	b.counter = 0
+	b.notificationSince = ""
+	b.insightsSince = ""
+	b.usage = teamUsageState{Bots: make(map[string]usageTotals)}
+	b.normalizeLoadedStateLocked()
+	// Restore session preferences after normalization: Reset() clears content but
+	// should not re-validate the user's explicit 1:1 bot choice against the
+	// current default member list (which may differ from the active pack).
+	b.sessionMode = mode
+	b.oneOnOneBot = bot
+	_ = b.saveLocked()
+	_ = os.Remove(b.stateSnapshotPath())
+	b.mu.Unlock()
+}
+
+// State persistence (defaultBrokerStatePath, stateSnapshotPath,
+// loadBrokerStateFile, brokerStateActivityScore, brokerStateShouldSnapshot,
+// loadState, saveLocked, atomicWriteFile) moved to broker_persistence.go.
+
+// Defaults + state normalization (defaultOfficeMembers, defaultTeamChannels,
+// repoRootForRuntimeDefaults, isDefaultChannelState, isDefaultOfficeMemberState,
+// normalizeChannelSlug, normalizeActorSlug, ensureDefaultChannelsLocked,
+// ensureDefaultOfficeMembersLocked, normalizeLoadedStateLocked,
+// reconcileOrphanedBlockedTasksLocked) moved to broker_defaults.go.
+
+func (b *Broker) SessionModeState() (string, string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.sessionMode, b.oneOnOneBot
+}
+
+func (b *Broker) SetSessionMode(mode, bot string) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.sessionMode = NormalizeSessionMode(mode)
+	b.oneOnOneBot = NormalizeOneOnOneBot(bot)
+	if b.findMemberLocked(b.oneOnOneBot) == nil {
+		b.oneOnOneBot = DefaultOneOnOneBot
+	}
+	return b.saveLocked()
+}
+
+func (b *Broker) SetFocusMode(enabled bool) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.focusMode = enabled
+	return b.saveLocked()
+}
+
+func (b *Broker) SetGenerateMemberFn(fn func(string) (generatedMemberTemplate, error)) {
+	b.generateMemberFn = fn
+}
+
+func (b *Broker) SetGenerateChannelFn(fn func(context.Context, string) (generatedChannelTemplate, error)) {
+	b.generateChannelFn = fn
+}
+
+// SetGenerateBotFileFn injects the LLM authoring path for prose instruction
+// files (SOUL/OPERATIONS/USER). Optional: when unset, /bot-files/generate
+// returns 503 and the UI simply hides the "Generate with AI" affordance.
+func (b *Broker) SetGenerateBotFileFn(fn func(ctx context.Context, relPath, hint string) (string, error)) {
+	b.generateBotFileFn = fn
+}
+
+// SetBotLogRoot overrides where /bot-logs reads task JSONL from.
+// Used by tests; production uses bot.DefaultTaskLogRoot().
+func (b *Broker) SetBotLogRoot(root string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.botLogRoot = root
+}
+
+func (b *Broker) FocusModeEnabled() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.focusMode
+}
+
+// Channel + member lookup indexes (findChannelLocked, ensureDMConversationLocked,
+// findMemberLocked, hasMember, rebuild*IndexLocked) moved to broker_indexes.go to
+// keep this core file under the file-size budget.
+
+// OpenClaw bridge wiring, provider binding, persistence cursors, pane capture,
+// and the channel bridge handler moved to broker_bridge.go,
+// broker_provider_binding.go, broker_cursors.go, and broker_pane.go.
+// Member construction, text helpers, and channel-access predicates moved to
+// broker_member_construction.go, broker_text.go, and broker_channel_access.go.
+
+func usageStateIsZero(state teamUsageState) bool {
+	if state.Total.TotalTokens > 0 || state.Total.CostUsd > 0 || state.Total.Requests > 0 {
+		return false
+	}
+	for _, totals := range state.Bots {
+		if totals.TotalTokens > 0 || totals.CostUsd > 0 || totals.Requests > 0 {
+			return false
+		}
+	}
+	return true
+}
+
+func (b *Broker) appendActionLocked(kind, source, channel, actor, summary, relatedID string) {
+	b.appendActionWithRefsLocked(kind, source, channel, actor, summary, relatedID, nil, "")
+}
+
+// FormatChannelView returns a clean, Slack-style rendering of recent messages.
+func dirExists(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && info.IsDir()
+}

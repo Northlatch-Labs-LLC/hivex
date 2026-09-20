@@ -1,0 +1,579 @@
+package team
+
+import (
+	"errors"
+	"strings"
+	"testing"
+)
+
+func TestListTasksFiltersByChannelStatusOwnerAndDone(t *testing.T) {
+	b := newTestBroker(t)
+	b.channels = []teamChannel{
+		{Slug: "general", Name: "general", Members: []string{"pm"}},
+		{Slug: "planning", Name: "planning", Members: []string{"pm"}},
+	}
+	b.tasks = []teamTask{
+		{ID: "general-alice-open", Channel: "general", Title: "General alice open", Owner: "alice", status: "open"},
+		{ID: "general-alice-done", Channel: "general", Title: "General alice done", Owner: "alice", status: "done"},
+		{ID: "general-bob-open", Channel: "general", Title: "General bob open", Owner: "bob", status: "open"},
+		{ID: "general-unowned-open", Channel: "general", Title: "General unowned open", status: "open"},
+		{ID: "planning-alice-open", Channel: "planning", Title: "Planning alice open", Owner: "alice", status: "open"},
+	}
+
+	got, err := b.ListTasks(TaskListRequest{
+		Channel:    "general",
+		ViewerSlug: "pm",
+		MySlug:     "alice",
+	})
+	if err != nil {
+		t.Fatalf("ListTasks: %v", err)
+	}
+	assertTaskIDs(t, got.Tasks, []string{"general-alice-open", "general-unowned-open"})
+
+	got, err = b.ListTasks(TaskListRequest{
+		Channel:     "general",
+		ViewerSlug:  "pm",
+		MySlug:      "alice",
+		IncludeDone: true,
+	})
+	if err != nil {
+		t.Fatalf("ListTasks include done: %v", err)
+	}
+	assertTaskIDs(t, got.Tasks, []string{"general-alice-open", "general-alice-done", "general-unowned-open"})
+
+	got, err = b.ListTasks(TaskListRequest{
+		Channel:      "general",
+		ViewerSlug:   "pm",
+		StatusFilter: "done",
+	})
+	if err != nil {
+		t.Fatalf("ListTasks status done: %v", err)
+	}
+	assertTaskIDs(t, got.Tasks, []string{"general-alice-done"})
+}
+
+func TestListTasksRejectsSingleChannelNonMember(t *testing.T) {
+	b := newTestBroker(t)
+	b.channels = []teamChannel{
+		{Slug: "private", Name: "private", Members: []string{"cos"}},
+	}
+	b.tasks = []teamTask{
+		{ID: "private-task", Channel: "private", Title: "Private", status: "open"},
+	}
+
+	_, err := b.ListTasks(TaskListRequest{Channel: "private", ViewerSlug: "pm"})
+	if !errors.Is(err, errTaskChannelAccessDenied) {
+		t.Fatalf("expected errTaskChannelAccessDenied, got %v", err)
+	}
+}
+
+func TestListTasksAllChannelsStillChecksViewerAccess(t *testing.T) {
+	b := newTestBroker(t)
+	b.channels = []teamChannel{
+		{Slug: "general", Name: "general", Members: []string{"pm"}},
+		{Slug: "private", Name: "private", Members: []string{"cos"}},
+	}
+	b.tasks = []teamTask{
+		{ID: "general-task", Channel: "general", Title: "General", status: "open"},
+		{ID: "private-task", Channel: "private", Title: "Private", status: "open"},
+	}
+
+	got, err := b.ListTasks(TaskListRequest{AllChannels: true, ViewerSlug: "pm"})
+	if err != nil {
+		t.Fatalf("ListTasks all channels: %v", err)
+	}
+	if got.Channel != "general" {
+		t.Fatalf("channel: want general, got %q", got.Channel)
+	}
+	assertTaskIDs(t, got.Tasks, []string{"general-task"})
+}
+
+func TestAckTaskMarksTaskForOwner(t *testing.T) {
+	b := newTestBroker(t)
+	b.tasks = []teamTask{
+		{ID: "task-1", Channel: "general", Title: "Task", Owner: "alice", status: "in_progress"},
+	}
+
+	got, err := b.AckTask(TaskAckRequest{ID: "task-1", Channel: "general", Slug: "alice"})
+	if err != nil {
+		t.Fatalf("AckTask: %v", err)
+	}
+	if got.Task.AckedAt == "" {
+		t.Fatal("expected ack timestamp")
+	}
+	if got.Task.UpdatedAt == "" {
+		t.Fatal("expected updated timestamp")
+	}
+	if b.tasks[0].AckedAt == "" {
+		t.Fatal("expected broker state to be updated")
+	}
+}
+
+func TestAckTaskRejectsInvalidOwnerAndMissingTask(t *testing.T) {
+	b := newTestBroker(t)
+	b.tasks = []teamTask{
+		{ID: "task-1", Channel: "general", Title: "Task", Owner: "alice", status: "in_progress"},
+	}
+
+	_, err := b.AckTask(TaskAckRequest{ID: "task-1", Channel: "general", Slug: "bob"})
+	if !errors.Is(err, errTaskAckOwnerOnly) {
+		t.Fatalf("expected errTaskAckOwnerOnly, got %v", err)
+	}
+
+	_, err = b.AckTask(TaskAckRequest{ID: "missing", Channel: "general", Slug: "alice"})
+	if !errors.Is(err, errTaskNotFound) {
+		t.Fatalf("expected errTaskNotFound, got %v", err)
+	}
+
+	_, err = b.AckTask(TaskAckRequest{Channel: "general", Slug: "alice"})
+	if !errors.Is(err, errTaskAckInvalid) {
+		t.Fatalf("expected errTaskAckInvalid, got %v", err)
+	}
+}
+
+func TestMutateTaskCreatesAndCompletesTask(t *testing.T) {
+	b := newTestBroker(t)
+	b.channels = []teamChannel{
+		{Slug: "general", Name: "general", Members: []string{"cos"}},
+	}
+
+	// Issues can only be created by @cos or the human. @cos is also a
+	// trusted sender, so it keeps access to the per-task channel that is
+	// now minted on create — which is what authorizes the later "complete".
+	created, err := b.MutateTask(TaskPostRequest{
+		Action:    "create",
+		Channel:   "general",
+		Title:     "Write the plan",
+		Owner:     "alice",
+		CreatedBy: "cos",
+	})
+	if err != nil {
+		t.Fatalf("MutateTask create: %v", err)
+	}
+	if created.Task.ID == "" {
+		t.Fatal("expected task id")
+	}
+	// An owner-set top-level issue lands in Planning (structured planning);
+	// Planning's derived status is in_progress (the owner is actively planning).
+	if created.Task.Status() != "in_progress" {
+		t.Fatalf("created status: want in_progress, got %q", created.Task.Status())
+	}
+	if created.Task.LifecycleState != LifecycleStatePlanning {
+		t.Fatalf("created lifecycle: want planning, got %q", created.Task.LifecycleState)
+	}
+	var foundCreated *teamTask
+	for i := range b.tasks {
+		if b.tasks[i].ID == created.Task.ID {
+			foundCreated = &b.tasks[i]
+			break
+		}
+	}
+	if foundCreated == nil {
+		t.Fatalf("expected broker state to include created task, got %+v", b.tasks)
+	}
+
+	// Parked tasks are the ONE drafting state left. Park the lane the
+	// deliberate way (lifecycle chokepoint, same as /task-plan park=true),
+	// then pin the parked-task gate: a bot "complete" on a parked task
+	// must be refused with a structured conflict, and the human's start
+	// (approve) un-parks it into running.
+	if err := b.TransitionLifecycle(created.Task.ID, LifecycleStateDrafting, "parked by composer"); err != nil {
+		t.Fatalf("park: %v", err)
+	}
+	_, parkedErr := b.MutateTask(TaskPostRequest{
+		Action:    "complete",
+		ID:        created.Task.ID,
+		Channel:   "general",
+		CreatedBy: "cos",
+	})
+	var parkedMutationErr *TaskMutationError
+	if !errors.As(parkedErr, &parkedMutationErr) || parkedMutationErr.Kind != TaskMutationConflict {
+		t.Fatalf("complete on parked task: want conflict, got %v", parkedErr)
+	}
+	if !strings.Contains(parkedMutationErr.Message, "parked") {
+		t.Fatalf("parked refusal must say parked, got %q", parkedMutationErr.Message)
+	}
+
+	// The human's approve STARTS the parked task (drafting→running) — the
+	// one remaining start affordance.
+	started, err := b.MutateTask(TaskPostRequest{
+		Action:    "approve",
+		ID:        created.Task.ID,
+		Channel:   "general",
+		CreatedBy: "human",
+	})
+	if err != nil {
+		t.Fatalf("MutateTask start parked: %v", err)
+	}
+	if started.Task.LifecycleState != LifecycleStateRunning {
+		t.Fatalf("approve on parked: want running, got %q", started.Task.LifecycleState)
+	}
+
+	updated, err := b.MutateTask(TaskPostRequest{
+		Action:    "complete",
+		ID:        created.Task.ID,
+		Channel:   "general",
+		CreatedBy: "cos",
+	})
+	if err != nil {
+		t.Fatalf("MutateTask complete: %v", err)
+	}
+	if updated.Task.Status() != "done" {
+		t.Fatalf("updated status: want done, got %q", updated.Task.Status())
+	}
+	if updated.Task.CompletedAt == "" {
+		t.Fatal("expected completion timestamp")
+	}
+	var foundUpdated *teamTask
+	for i := range b.tasks {
+		if b.tasks[i].ID == created.Task.ID {
+			foundUpdated = &b.tasks[i]
+			break
+		}
+	}
+	if foundUpdated == nil || foundUpdated.Status() != "done" {
+		t.Fatalf("expected broker state to be updated, got %+v", b.tasks)
+	}
+}
+
+// Ownerless creates land READY (not parked, not running) and promote to
+// running on assignment — "tasks created without an owner go Ready and
+// dispatch on assignment".
+func TestMutateTaskOwnerlessCreateLandsReadyAndRunsOnAssign(t *testing.T) {
+	b := newTestBroker(t)
+	b.channels = []teamChannel{
+		{Slug: "general", Name: "general", Members: []string{"cos"}},
+	}
+	created, err := b.MutateTask(TaskPostRequest{
+		Action:    "create",
+		Channel:   "general",
+		Title:     "Staff me later",
+		CreatedBy: "cos",
+	})
+	if err != nil {
+		t.Fatalf("MutateTask create: %v", err)
+	}
+	if created.Task.LifecycleState != LifecycleStateReady {
+		t.Fatalf("ownerless create: want ready, got %q", created.Task.LifecycleState)
+	}
+	assigned, err := b.MutateTask(TaskPostRequest{
+		Action:    "assign",
+		ID:        created.Task.ID,
+		Channel:   "general",
+		Owner:     "alice",
+		CreatedBy: "cos",
+	})
+	if err != nil {
+		t.Fatalf("MutateTask assign: %v", err)
+	}
+	if assigned.Task.LifecycleState != LifecycleStateRunning {
+		t.Fatalf("assign on ready: want running, got %q", assigned.Task.LifecycleState)
+	}
+}
+
+func TestMutateTaskReusesExistingTask(t *testing.T) {
+	b := newTestBroker(t)
+	b.channels = []teamChannel{
+		{Slug: "general", Name: "general", Members: []string{"pm"}},
+	}
+	b.tasks = []teamTask{
+		{ID: "task-1", Channel: "general", Title: "Write the plan", Owner: "alice", status: "open"},
+	}
+
+	got, err := b.MutateTask(TaskPostRequest{
+		Action:    "create",
+		Channel:   "general",
+		Title:     " Write the plan ",
+		Details:   " Updated details ",
+		Owner:     "alice",
+		CreatedBy: "pm",
+	})
+	if err != nil {
+		t.Fatalf("MutateTask create reuse: %v", err)
+	}
+	if got.Task.ID != "task-1" {
+		t.Fatalf("expected reusable task id task-1, got %q", got.Task.ID)
+	}
+	if len(b.tasks) != 1 {
+		t.Fatalf("expected reusable task without appending, got %+v", b.tasks)
+	}
+	if b.tasks[0].Details != "Updated details" {
+		t.Fatalf("expected reused task details to update, got %q", b.tasks[0].Details)
+	}
+}
+
+func TestMutateTaskTrimsDependenciesAndBlocksUnresolved(t *testing.T) {
+	b := newTestBroker(t)
+	b.channels = []teamChannel{
+		{Slug: "general", Name: "general", Members: []string{"pm"}},
+	}
+	b.tasks = []teamTask{
+		{ID: "parent-done", Channel: "general", Title: "Parent", status: "done"},
+	}
+
+	got, err := b.MutateTask(TaskPostRequest{
+		Action:    "create",
+		Channel:   "general",
+		Title:     "Blocked child",
+		Owner:     "alice",
+		CreatedBy: "pm",
+		DependsOn: []string{" parent-done ", " ", " missing-parent "},
+	})
+	if err != nil {
+		t.Fatalf("MutateTask create with dependencies: %v", err)
+	}
+	if got.Task.Status() != "open" || !got.Task.Blocked() {
+		t.Fatalf("expected unresolved dependency to block open task, got status=%q blocked=%v", got.Task.Status(), got.Task.Blocked())
+	}
+	if len(got.Task.DependsOn) != 2 {
+		t.Fatalf("expected empty dependency entries to be removed, got %+v", got.Task.DependsOn)
+	}
+	assertTaskIDs(t, []teamTask{{ID: got.Task.DependsOn[0]}, {ID: got.Task.DependsOn[1]}}, []string{"parent-done", "missing-parent"})
+}
+
+func TestMutateTaskAppliesStateActions(t *testing.T) {
+	cases := []struct {
+		name        string
+		task        teamTask
+		req         TaskPostRequest
+		wantStatus  string
+		wantOwner   string
+		wantBlocked bool
+	}{
+		{
+			name:       "claim",
+			task:       teamTask{ID: "task-1", Channel: "general", Title: "Task", status: "done", CompletedAt: "2026-05-03T00:00:00Z"},
+			req:        TaskPostRequest{Action: "claim", Owner: "alice"},
+			wantStatus: "in_progress",
+			wantOwner:  "alice",
+		},
+		{
+			name:       "reassign",
+			task:       teamTask{ID: "task-1", Channel: "general", Title: "Task", Owner: "alice", status: "in_progress"},
+			req:        TaskPostRequest{Action: "reassign", Owner: "bob"},
+			wantStatus: "in_progress",
+			wantOwner:  "bob",
+		},
+		{
+			name:        "block",
+			task:        teamTask{ID: "task-1", Channel: "general", Title: "Task", Owner: "alice", status: "in_progress"},
+			req:         TaskPostRequest{Action: "block", Details: "waiting on input"},
+			wantStatus:  "blocked",
+			wantOwner:   "alice",
+			wantBlocked: true,
+		},
+		{
+			name:       "resume",
+			task:       teamTask{ID: "task-1", Channel: "general", Title: "Task", Owner: "alice", status: "blocked", blocked: true},
+			req:        TaskPostRequest{Action: "resume", Details: "ready again"},
+			wantStatus: "in_progress",
+			wantOwner:  "alice",
+		},
+		{
+			name:       "release",
+			task:       teamTask{ID: "task-1", Channel: "general", Title: "Task", Owner: "alice", status: "in_progress"},
+			req:        TaskPostRequest{Action: "release"},
+			wantStatus: "open",
+		},
+		{
+			name:       "cancel",
+			task:       teamTask{ID: "task-1", Channel: "general", Title: "Task", Owner: "alice", status: "in_progress", blocked: true},
+			req:        TaskPostRequest{Action: "cancel"},
+			wantStatus: "canceled",
+			wantOwner:  "alice",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			b := newTestBroker(t)
+			b.channels = []teamChannel{
+				{Slug: "general", Name: "general", Members: []string{"pm"}},
+			}
+			b.tasks = []teamTask{tc.task}
+			tc.req.ID = "task-1"
+			tc.req.Channel = "general"
+			tc.req.CreatedBy = "pm"
+
+			got, err := b.MutateTask(tc.req)
+			if err != nil {
+				t.Fatalf("MutateTask %s: %v", tc.req.Action, err)
+			}
+			if got.Task.Status() != tc.wantStatus {
+				t.Fatalf("status: want %q, got %q", tc.wantStatus, got.Task.Status())
+			}
+			if got.Task.Owner != tc.wantOwner {
+				t.Fatalf("owner: want %q, got %q", tc.wantOwner, got.Task.Owner)
+			}
+			if got.Task.Blocked() != tc.wantBlocked {
+				t.Fatalf("blocked: want %v, got %v", tc.wantBlocked, got.Task.Blocked())
+			}
+			if got.Task.Status() != "done" && got.Task.CompletedAt != "" {
+				t.Fatalf("expected completed_at to clear outside done status, got %q", got.Task.CompletedAt)
+			}
+		})
+	}
+}
+
+func TestMutateTaskAuthorizesExistingTaskAgainstActualChannel(t *testing.T) {
+	b := newTestBroker(t)
+	b.channels = []teamChannel{
+		{Slug: "general", Name: "general", Members: []string{"pm"}},
+		{Slug: "private", Name: "private", Members: []string{"cos"}},
+	}
+	b.tasks = []teamTask{
+		{ID: "task-1", Channel: "private", Title: "Private task", Owner: "alice", status: "review", reviewState: "ready_for_review"},
+	}
+
+	got, err := b.MutateTask(TaskPostRequest{
+		Action:    "complete",
+		ID:        "task-1",
+		CreatedBy: "cos",
+	})
+	if err != nil {
+		t.Fatalf("MutateTask complete with actual channel access: %v", err)
+	}
+	if got.Task.Status() != "done" {
+		t.Fatalf("status: want done, got %q", got.Task.Status())
+	}
+	if got.Task.CompletedAt == "" {
+		t.Fatal("expected completion timestamp")
+	}
+}
+
+func TestMutateTaskReturnsTypedErrors(t *testing.T) {
+	b := newTestBroker(t)
+	b.channels = []teamChannel{
+		{Slug: "general", Name: "general", Members: []string{"pm"}},
+		{Slug: "private", Name: "private", Members: []string{"cos"}},
+	}
+	b.tasks = []teamTask{
+		{ID: "task-1", Channel: "general", Title: "Task", Owner: "alice", status: "open"},
+	}
+
+	cases := []struct {
+		name string
+		req  TaskPostRequest
+		kind TaskMutationErrorKind
+	}{
+		{
+			name: "missing create title",
+			req:  TaskPostRequest{Action: "create", Channel: "general", CreatedBy: "pm"},
+			kind: TaskMutationInvalid,
+		},
+		{
+			name: "missing create actor",
+			req:  TaskPostRequest{Action: "create", Channel: "general", Title: "Task"},
+			kind: TaskMutationInvalid,
+		},
+		{
+			name: "channel access denied",
+			req:  TaskPostRequest{Action: "create", Channel: "private", Title: "Secret", CreatedBy: "pm"},
+			kind: TaskMutationForbidden,
+		},
+		{
+			name: "missing task",
+			req:  TaskPostRequest{Action: "claim", ID: "missing", Channel: "general", Owner: "alice", CreatedBy: "pm"},
+			kind: TaskMutationNotFound,
+		},
+		{
+			name: "unknown action",
+			req:  TaskPostRequest{Action: "bogus", ID: "task-1", Channel: "general", CreatedBy: "pm"},
+			kind: TaskMutationInvalid,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := b.MutateTask(tc.req)
+			var mutationErr *TaskMutationError
+			if !errors.As(err, &mutationErr) {
+				t.Fatalf("expected TaskMutationError, got %v", err)
+			}
+			if mutationErr.Kind != tc.kind {
+				t.Fatalf("kind: want %q, got %q", tc.kind, mutationErr.Kind)
+			}
+		})
+	}
+}
+
+func TestMutateTaskReconcilesReviewStateAfterFieldPatches(t *testing.T) {
+	cases := []struct {
+		name       string
+		task       teamTask
+		req        TaskPostRequest
+		wantStatus string
+		wantReview string
+	}{
+		{
+			name: "structured review overrides invalid body state",
+			task: teamTask{
+				ID:            "task-1",
+				Channel:       "general",
+				Title:         "Task",
+				Owner:         "alice",
+				status:        "in_progress",
+				ExecutionMode: "local_worktree",
+				reviewState:   "pending_review",
+			},
+			req:        TaskPostRequest{Action: "review", ReviewState: "not_required"},
+			wantStatus: "review",
+			wantReview: "ready_for_review",
+		},
+		{
+			name: "office task ignores stale structured review state",
+			task: teamTask{
+				ID:          "task-1",
+				Channel:     "general",
+				Title:       "Task",
+				Owner:       "alice",
+				status:      "in_progress",
+				TaskType:    "follow_up",
+				reviewState: "ready_for_review",
+			},
+			req:        TaskPostRequest{Action: "resume", ReviewState: "approved"},
+			wantStatus: "in_progress",
+			wantReview: "not_required",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			b := newTestBroker(t)
+			b.channels = []teamChannel{
+				{Slug: "general", Name: "general", Members: []string{"pm"}},
+			}
+			b.tasks = []teamTask{tc.task}
+			tc.req.ID = "task-1"
+			tc.req.Channel = "general"
+			tc.req.CreatedBy = "pm"
+
+			got, err := b.MutateTask(tc.req)
+			if err != nil {
+				t.Fatalf("MutateTask %s: %v", tc.req.Action, err)
+			}
+			if got.Task.Status() != tc.wantStatus {
+				t.Fatalf("status: want %q, got %q", tc.wantStatus, got.Task.Status())
+			}
+			if got.Task.ReviewState() != tc.wantReview {
+				t.Fatalf("review state: want %q, got %q", tc.wantReview, got.Task.ReviewState())
+			}
+		})
+	}
+}
+
+func assertTaskIDs(t *testing.T, tasks []teamTask, want []string) {
+	t.Helper()
+	got := make([]string, 0, len(tasks))
+	for _, task := range tasks {
+		got = append(got, task.ID)
+	}
+	if len(got) != len(want) {
+		t.Fatalf("task ids: want %v, got %v", want, got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("task ids: want %v, got %v", want, got)
+		}
+	}
+}

@@ -1,0 +1,591 @@
+package team
+
+import (
+	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"strings"
+	"time"
+)
+
+const (
+	humanInviteTTL      = 24 * time.Hour
+	humanSessionTTL     = 7 * 24 * time.Hour
+	humanSessionCookie  = "hivex_human_session"
+	humanShareEventFrom = "system"
+	humanLastSeenFlush  = time.Minute
+)
+
+// humanAdmitHookFn fires after acceptHumanInvite succeeds and the new session
+// is persisted. The office-bound share adapter installs this hook in
+// ShareTransport.Run so it can call Host.UpsertParticipant for the admitted
+// human — closing the v1 lifecycle gap where only the revoke half flowed
+// through the transport host. Hook signature accepts only exported scalars so
+// share_transport.go does not need to reach into humanSession internals.
+type humanAdmitHookFn func(ctx context.Context, sessionID, slug, displayName string)
+
+// SetHumanAdmitHook installs (or clears, when hook is nil) the per-broker
+// callback fired after handleHumanInviteAccept admits a session. Called from
+// ShareTransport.Run on adapter startup and shutdown. The pointer is read
+// atomically on the HTTP hot path; passing nil is the documented way for the
+// adapter to detach on shutdown.
+func (b *Broker) SetHumanAdmitHook(hook humanAdmitHookFn) {
+	if b == nil {
+		return
+	}
+	if hook == nil {
+		b.humanAdmitHook.Store(nil)
+		return
+	}
+	b.humanAdmitHook.Store(&hook)
+}
+
+// SetShareTransport registers (or clears, when t is nil) the office-bound
+// share adapter so the in-process share controller can route invite creation
+// through it. Called by RegisterTransports during launcher boot and cleared on
+// shutdown. Stored atomically because the controller reads it on its start
+// path while RegisterTransports may still be installing other adapters.
+func (b *Broker) SetShareTransport(t *ShareTransport) {
+	if b == nil {
+		return
+	}
+	if t == nil {
+		b.shareTransport.Store(nil)
+		return
+	}
+	b.shareTransport.Store(t)
+}
+
+// ShareTransport returns the registered office-bound share adapter, or nil
+// when no adapter has been registered yet. Used by the in-process share
+// controller to obtain a handle for invite creation; callers must tolerate a
+// nil return and fall back to their legacy path.
+func (b *Broker) ShareTransport() *ShareTransport {
+	if b == nil {
+		return nil
+	}
+	return b.shareTransport.Load()
+}
+
+// fireHumanAdmitHook invokes the installed hook with the new session, if any.
+// Called from handleHumanInviteAccept *after* persistence succeeds so an
+// adapter cannot observe a session that was rolled back by a save failure. A
+// nil hook (no adapter registered, or shutdown in progress) is a silent no-op.
+func (b *Broker) fireHumanAdmitHook(ctx context.Context, session humanSession) {
+	if b == nil {
+		return
+	}
+	hp := b.humanAdmitHook.Load()
+	if hp == nil {
+		return
+	}
+	(*hp)(ctx, session.ID, session.HumanSlug, session.DisplayName)
+}
+
+type humanInviteResponse struct {
+	ID         string `json:"id"`
+	CreatedAt  string `json:"created_at"`
+	ExpiresAt  string `json:"expires_at"`
+	AcceptedAt string `json:"accepted_at,omitempty"`
+	AcceptedBy string `json:"accepted_by,omitempty"`
+	RevokedAt  string `json:"revoked_at,omitempty"`
+}
+
+type humanSessionResponse struct {
+	ID          string `json:"id"`
+	InviteID    string `json:"invite_id"`
+	HumanSlug   string `json:"human_slug"`
+	DisplayName string `json:"display_name"`
+	// Role is hardcoded to "member" so the joiner web client can branch on
+	// useSessionRole().role without a second roundtrip. The host placeholder
+	// returned from /humans/me uses the same field with value "host".
+	Role       string `json:"role"`
+	Device     string `json:"device,omitempty"`
+	CreatedAt  string `json:"created_at"`
+	ExpiresAt  string `json:"expires_at"`
+	RevokedAt  string `json:"revoked_at,omitempty"`
+	LastSeenAt string `json:"last_seen_at,omitempty"`
+}
+
+type shareError struct {
+	Code    string `json:"code"`
+	Message string `json:"message"`
+	Action  string `json:"action"`
+	DocURL  string `json:"doc_url,omitempty"`
+}
+
+func (b *Broker) handleHumanInvites(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		b.mu.Lock()
+		invites := make([]humanInviteResponse, 0, len(b.humanInvites))
+		for _, invite := range b.humanInvites {
+			invites = append(invites, humanInviteToResponse(invite))
+		}
+		b.mu.Unlock()
+		writeJSON(w, http.StatusOK, map[string]any{"invites": invites})
+	case http.MethodPost:
+		token, invite, err := b.createHumanInvite()
+		if err != nil {
+			log.Printf("human invite create failed: %v", err)
+			writeShareError(w, http.StatusInternalServerError, "invite_create_failed", "Could not create invite.", "Check the host logs and try again.")
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"invite": humanInviteToResponse(invite),
+			"token":  token,
+		})
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (b *Broker) handleHumanInviteAccept(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var body struct {
+		Token       string `json:"token"`
+		DisplayName string `json:"display_name"`
+		Device      string `json:"device"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeShareError(w, http.StatusBadRequest, "invalid_json", "Invalid invite request.", "Reload the invite link and try again.")
+		return
+	}
+	sessionToken, session, err := b.acceptHumanInvite(body.Token, body.DisplayName, body.Device)
+	if err != nil {
+		code := "invite_invalid"
+		status := http.StatusBadRequest
+		if errors.Is(err, errHumanInviteExpiredOrUsed) {
+			code = "invite_expired_or_used"
+			status = http.StatusGone
+		}
+		writeShareError(w, status, code, "This invite is no longer valid.", "Ask the host for a new team-member invite.")
+		return
+	}
+	http.SetCookie(w, humanSessionCookieForToken(sessionToken, sessionExpiresAt(session)))
+	// Notify the office-bound share adapter so it can call
+	// Host.UpsertParticipant for the admitted human. Fired after persistence
+	// succeeds (acceptHumanInvite returned no error) so a rolled-back invite
+	// never produces a phantom upsert.
+	b.fireHumanAdmitHook(r.Context(), session)
+	writeJSON(w, http.StatusOK, map[string]any{"session": humanSessionToResponse(session)})
+}
+
+func (b *Broker) handleHumanSessions(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		b.mu.Lock()
+		sessions := make([]humanSessionResponse, 0, len(b.humanSessions))
+		for _, session := range b.humanSessions {
+			sessions = append(sessions, humanSessionToResponse(session))
+		}
+		b.mu.Unlock()
+		writeJSON(w, http.StatusOK, map[string]any{"sessions": sessions})
+	case http.MethodDelete:
+		if actor, ok := requestActorFromContext(r.Context()); ok && actor.Kind != requestActorKindBroker {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = io.WriteString(w, `{"error":"host_only"}`)
+			return
+		}
+		var body struct {
+			ID string `json:"id"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeShareError(w, http.StatusBadRequest, "invalid_json", "Invalid revoke request.", "Retry from Settings.")
+			return
+		}
+		if err := b.revokeHumanSession(body.ID); err != nil {
+			writeShareError(w, http.StatusNotFound, "session_not_found", "Session not found.", "Refresh the Sharing settings.")
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (b *Broker) handleHumanMe(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	session, ok := b.humanSessionFromRequest(r)
+	if ok {
+		body := map[string]any{"human": humanSessionToResponse(session)}
+		if name := resolveHostDisplayName(); name != "" {
+			body["host_display_name"] = name
+		}
+		writeJSON(w, http.StatusOK, body)
+		return
+	}
+	if b.requestHasBrokerAuth(r) {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"human": map[string]string{
+				"slug":         "human",
+				"display_name": "Host",
+				"role":         "host",
+			},
+		})
+		return
+	}
+	writeShareError(w, http.StatusUnauthorized, "session_required", "Your session expired.", "Ask the host for a new team-member invite.")
+}
+
+// resolveHostDisplayName returns the host's local git identity name so the
+// joiner welcome card can read "You joined Sam's office" instead of "this
+// office". Falls back to "" when only the FallbackHumanIdentity is available
+// (fresh install, no `git config user.name`) so the web client keeps its
+// generic copy and we never surface the literal "hivex" placeholder.
+func resolveHostDisplayName() string {
+	id := brokerHumanIdentityRegistry().Local()
+	if id.Email == FallbackHumanIdentity.Email {
+		return ""
+	}
+	return strings.TrimSpace(id.Name)
+}
+
+var errHumanInviteExpiredOrUsed = errors.New("invite expired or used")
+
+func (b *Broker) createHumanInvite() (string, humanInvite, error) {
+	token, err := randomToken("wphf")
+	if err != nil {
+		return "", humanInvite{}, err
+	}
+	id, err := randomID(8)
+	if err != nil {
+		return "", humanInvite{}, err
+	}
+	now := time.Now().UTC()
+	invite := humanInvite{
+		ID:        "invite-" + id,
+		TokenHash: hashShareToken(token),
+		CreatedAt: now.Format(time.RFC3339),
+		ExpiresAt: now.Add(humanInviteTTL).Format(time.RFC3339),
+	}
+	b.mu.Lock()
+	b.humanInvites = append(b.humanInvites, invite)
+	err = b.saveLocked()
+	b.mu.Unlock()
+	if err != nil {
+		return "", humanInvite{}, err
+	}
+	return token, invite, nil
+}
+
+func (b *Broker) acceptHumanInvite(token, displayName, device string) (string, humanSession, error) {
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return "", humanSession{}, errHumanInviteExpiredOrUsed
+	}
+	now := time.Now().UTC()
+	tokenHash := hashShareToken(token)
+	sessionToken, err := randomToken("wphfs")
+	if err != nil {
+		return "", humanSession{}, err
+	}
+	sessionID, err := randomID(8)
+	if err != nil {
+		return "", humanSession{}, err
+	}
+	displayName = strings.TrimSpace(displayName)
+	if displayName == "" {
+		displayName = "Team member"
+	}
+	slug := normalizeHumanSessionSlug(displayName)
+	if slug == "" {
+		slug = "team-member"
+	}
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for i := range b.humanInvites {
+		invite := &b.humanInvites[i]
+		if invite.TokenHash != tokenHash {
+			continue
+		}
+		if invite.RevokedAt != "" || invite.AcceptedAt != "" || !now.Before(parseBrokerTimestamp(invite.ExpiresAt)) {
+			return "", humanSession{}, errHumanInviteExpiredOrUsed
+		}
+		invite.AcceptedAt = now.Format(time.RFC3339)
+		invite.AcceptedBy = slug
+		session := humanSession{
+			ID:          "session-" + sessionID,
+			TokenHash:   hashShareToken(sessionToken),
+			InviteID:    invite.ID,
+			HumanSlug:   slug,
+			DisplayName: displayName,
+			Device:      strings.TrimSpace(device),
+			CreatedAt:   now.Format(time.RFC3339),
+			ExpiresAt:   now.Add(humanSessionTTL).Format(time.RFC3339),
+			LastSeenAt:  now.Format(time.RFC3339),
+		}
+		b.humanSessions = append(b.humanSessions, session)
+		if b.humanSessionRevoke == nil {
+			b.humanSessionRevoke = make(map[string]chan struct{})
+		}
+		b.humanSessionRevoke[session.ID] = make(chan struct{})
+		b.counter++
+		b.appendMessageLocked(channelMessage{
+			ID:        fmt.Sprintf("msg-%d", b.counter),
+			From:      humanShareEventFrom,
+			Channel:   "general",
+			Kind:      "system",
+			Content:   fmt.Sprintf("%s joined the team.", displayName),
+			Timestamp: now.Format(time.RFC3339),
+		})
+		if err := b.saveLocked(); err != nil {
+			return "", humanSession{}, err
+		}
+		return sessionToken, session, nil
+	}
+	return "", humanSession{}, errHumanInviteExpiredOrUsed
+}
+
+// RevokeHumanInvite marks the invite RevokedAt (so no further accepts can
+// admit a new session against it) and returns the IDs of sessions that were
+// still active under this invite at revoke time. It does NOT revoke the
+// sessions themselves — that belongs to the caller (typically
+// transport.Host.RevokeParticipant via the OfficeBoundTransport adapter), so
+// the same per-session teardown path runs whether triggered through the
+// adapter or directly via revokeHumanSession.
+//
+// Returns an error when the invite is unknown or when persisting the mutation
+// fails. On a save failure the in-memory mutation is rolled back so a restart
+// will not see a half-revoked state — without this rollback an attacker who
+// still has the invite token could re-join after the next restart because the
+// persisted state would still show the invite live. An already-revoked invite
+// is a no-op success that returns any sessions still active under it.
+func (b *Broker) RevokeHumanInvite(inviteID string) ([]string, error) {
+	inviteID = strings.TrimSpace(inviteID)
+	if inviteID == "" {
+		return nil, errors.New("invite id required")
+	}
+	now := time.Now().UTC()
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	idx := -1
+	for i := range b.humanInvites {
+		if b.humanInvites[i].ID == inviteID {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		return nil, errors.New("invite not found")
+	}
+	prevRevokedAt := b.humanInvites[idx].RevokedAt
+	if prevRevokedAt == "" {
+		b.humanInvites[idx].RevokedAt = now.Format(time.RFC3339)
+	}
+	var affected []string
+	for i := range b.humanSessions {
+		s := &b.humanSessions[i]
+		if s.InviteID != inviteID || s.RevokedAt != "" {
+			continue
+		}
+		affected = append(affected, s.ID)
+	}
+	if err := b.saveLocked(); err != nil {
+		// Roll back the in-memory mutation so a restart cannot see a state
+		// where the invite was marked revoked in memory but never persisted.
+		b.humanInvites[idx].RevokedAt = prevRevokedAt
+		return nil, fmt.Errorf("share: RevokeHumanInvite save: %w", err)
+	}
+	return affected, nil
+}
+
+func (b *Broker) revokeHumanSession(id string) error {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return errors.New("session id required")
+	}
+	now := time.Now().UTC()
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for i := range b.humanSessions {
+		if b.humanSessions[i].ID != id {
+			continue
+		}
+		if b.humanSessions[i].RevokedAt == "" {
+			b.humanSessions[i].RevokedAt = now.Format(time.RFC3339)
+			if ch, ok := b.humanSessionRevoke[id]; ok {
+				close(ch)
+				delete(b.humanSessionRevoke, id)
+			}
+		}
+		return b.saveLocked()
+	}
+	return errors.New("session not found")
+}
+
+func (b *Broker) humanSessionIDActive(id string) bool {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return false
+	}
+	now := time.Now().UTC()
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for i := range b.humanSessions {
+		session := &b.humanSessions[i]
+		if session.ID != id || session.RevokedAt != "" {
+			continue
+		}
+		expiresAt := sessionExpiresAt(*session)
+		return expiresAt.IsZero() || now.Before(expiresAt)
+	}
+	return false
+}
+
+// humanSessionRevokeCh returns a channel that is closed when the session is
+// revoked. Returns a nil channel (blocks forever) for broker-bearer actors and
+// for sessions whose revoke channel has already been consumed.
+func (b *Broker) humanSessionRevokeCh(id string) <-chan struct{} {
+	if id == "" {
+		return nil
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.humanSessionRevoke[id]
+}
+
+func (b *Broker) humanSessionFromRequest(r *http.Request) (humanSession, bool) {
+	cookie, err := r.Cookie(humanSessionCookie)
+	if err != nil {
+		return humanSession{}, false
+	}
+	tokenHash := hashShareToken(cookie.Value)
+	now := time.Now().UTC()
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for i := range b.humanSessions {
+		session := &b.humanSessions[i]
+		if session.TokenHash != tokenHash || session.RevokedAt != "" {
+			continue
+		}
+		expiresAt := sessionExpiresAt(*session)
+		if !expiresAt.IsZero() && !now.Before(expiresAt) {
+			continue
+		}
+		lastSeen := parseBrokerTimestamp(session.LastSeenAt)
+		session.LastSeenAt = now.Format(time.RFC3339)
+		// LastSeenAt is activity metadata, not part of the auth decision.
+		// Persist it at most once a minute so polling/SSE checks do not turn
+		// every shared UI request into a state-file write.
+		if lastSeen.IsZero() || now.Sub(lastSeen) >= humanLastSeenFlush {
+			_ = b.saveLocked()
+		}
+		return *session, true
+	}
+	return humanSession{}, false
+}
+
+func humanSessionCookieForToken(token string, expires time.Time) *http.Cookie {
+	return &http.Cookie{
+		Name:     humanSessionCookie,
+		Value:    token,
+		Path:     "/",
+		Expires:  expires,
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+	}
+}
+
+func sessionExpiresAt(s humanSession) time.Time {
+	if expires := parseBrokerTimestamp(s.ExpiresAt); !expires.IsZero() {
+		return expires
+	}
+	created := parseBrokerTimestamp(s.CreatedAt)
+	if created.IsZero() {
+		created = time.Now().UTC()
+	}
+	return created.Add(humanSessionTTL)
+}
+
+func humanInviteToResponse(invite humanInvite) humanInviteResponse {
+	return humanInviteResponse{
+		ID:         invite.ID,
+		CreatedAt:  invite.CreatedAt,
+		ExpiresAt:  invite.ExpiresAt,
+		AcceptedAt: invite.AcceptedAt,
+		AcceptedBy: invite.AcceptedBy,
+		RevokedAt:  invite.RevokedAt,
+	}
+}
+
+func humanSessionToResponse(session humanSession) humanSessionResponse {
+	return humanSessionResponse{
+		ID:          session.ID,
+		InviteID:    session.InviteID,
+		HumanSlug:   session.HumanSlug,
+		DisplayName: session.DisplayName,
+		Role:        "member",
+		Device:      session.Device,
+		CreatedAt:   session.CreatedAt,
+		ExpiresAt:   sessionExpiresAt(session).Format(time.RFC3339),
+		RevokedAt:   session.RevokedAt,
+		LastSeenAt:  session.LastSeenAt,
+	}
+}
+
+func writeShareError(w http.ResponseWriter, status int, code, message, action string) {
+	writeJSON(w, status, map[string]shareError{"error": {
+		Code:    code,
+		Message: message,
+		Action:  action,
+		DocURL:  "https://github.com/Northlatch-Labs-LLC/hivex#share-with-a-team-member",
+	}})
+}
+
+func randomToken(prefix string) (string, error) {
+	buf := make([]byte, 24)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	return prefix + "_" + hex.EncodeToString(buf), nil
+}
+
+func randomID(n int) (string, error) {
+	if n <= 0 {
+		n = 8
+	}
+	buf := make([]byte, n)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(buf), nil
+}
+
+func hashShareToken(token string) string {
+	sum := sha256.Sum256([]byte(strings.TrimSpace(token)))
+	return hex.EncodeToString(sum[:])
+}
+
+func normalizeHumanSessionSlug(name string) string {
+	name = strings.ToLower(strings.TrimSpace(name))
+	var b strings.Builder
+	lastDash := false
+	for _, r := range name {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			b.WriteRune(r)
+			lastDash = false
+			continue
+		}
+		if !lastDash {
+			b.WriteByte('-')
+			lastDash = true
+		}
+	}
+	return strings.Trim(b.String(), "-")
+}

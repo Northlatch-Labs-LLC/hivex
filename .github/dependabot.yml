@@ -1,0 +1,112 @@
+version: 2
+# Grant Dependabot read access to private GitHub repos in the org.
+# Required because workflows under .github/workflows/ consume reusable
+# workflows from the private hive-crm/.github repo (see `uses:
+# hive-crm/.github/...` refs). Without this, every weekly Dependabot
+# run fails closed with `git_dependencies_not_reachable`.
+#
+# `DEPENDABOT_PRIVATE_REPO_TOKEN` is provisioned at the org level —
+# see hive-crm/docs#37 for the original rollout + the gh command to
+# create it.
+registries:
+  hive-crm-github:
+    type: git
+    url: https://github.com
+    username: x-access-token
+    password: ${{secrets.DEPENDABOT_PRIVATE_REPO_TOKEN}}
+
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    registries:
+      - hive-crm-github
+    schedule:
+      interval: "monthly"
+    open-pull-requests-limit: 5
+    cooldown:
+      default-days: 21
+    groups:
+      github-actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: "ci"
+      include: "scope"
+
+  - package-ecosystem: "gomod"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+    open-pull-requests-limit: 10
+    cooldown:
+      default-days: 21
+    groups:
+      all-dependencies:
+        patterns: ["*"]
+    commit-message:
+      prefix: "chore"
+      include: "scope"
+
+  # Root: dev-only tooling (secretlint, commitlint, @secretlint rule presets).
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+    open-pull-requests-limit: 10
+    cooldown:
+      default-days: 21
+    groups:
+      all-dependencies:
+        patterns: ["*"]
+    commit-message:
+      prefix: "chore"
+      include: "scope"
+
+  # Web frontend (React/vite). Uses bun.lock locally; dependabot reads
+  # package.json directly. Without this entry, biome / vitest / vite /
+  # tailwind bumps land manually only.
+  - package-ecosystem: "npm"
+    directory: "/web"
+    schedule:
+      interval: "monthly"
+    open-pull-requests-limit: 10
+    cooldown:
+      default-days: 21
+    groups:
+      web-dependencies:
+        patterns: ["*"]
+    commit-message:
+      prefix: "chore(web)"
+      include: "scope"
+
+  # Playwright e2e harness. Self-contained workspace under web/e2e/ so
+  # @playwright/test bumps don't entangle the main web build.
+  - package-ecosystem: "npm"
+    directory: "/web/e2e"
+    schedule:
+      interval: "monthly"
+    open-pull-requests-limit: 5
+    cooldown:
+      default-days: 21
+    groups:
+      e2e-dependencies:
+        patterns: ["*"]
+    commit-message:
+      prefix: "chore(e2e)"
+      include: "scope"
+
+  # npm wrapper that ships `npx hivex` to the npm registry. Bumps here
+  # affect the public install surface — keep its own group so they get
+  # individual review, not lumped with the dev-tooling root group.
+  - package-ecosystem: "npm"
+    directory: "/npm"
+    schedule:
+      interval: "monthly"
+    open-pull-requests-limit: 5
+    cooldown:
+      default-days: 21
+    groups:
+      npm-wrapper-dependencies:
+        patterns: ["*"]
+    commit-message:
+      prefix: "chore(npm)"
+      include: "scope"

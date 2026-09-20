@@ -1,0 +1,46 @@
+{
+  "name": "@hiveapi/client",
+  "version": "0.1.0",
+  "description": "Typed, zero-runtime-dependency TypeScript client for the HiveAPI Gateway — OpenAI-compatible chat completions with SSE streaming and tool-call accumulation, models, embeddings, images, TTS, STT and web search.",
+  "type": "module",
+  "license": "MIT",
+  "author": "Northlatch Labs",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Northlatch-Labs-LLC/hiveapi.git"
+  },
+  "homepage": "https://github.com/Northlatch-Labs-LLC/hiveapi",
+  "bugs": {
+    "url": "https://github.com/Northlatch-Labs-LLC/hiveapi/issues"
+  },
+  "keywords": [
+    "hiveapi",
+    "hive",
+    "llm",
+    "gateway",
+    "openai-compatible",
+    "sse",
+    "streaming",
+    "embeddings",
+    "tts",
+    "stt",
+    "web-search"
+  ],
+  "sideEffects": false,
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "default": "./src/index.ts"
+    }
+  },
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.4.2",
+    "typescript": "^6.0.3"
+  }
+}

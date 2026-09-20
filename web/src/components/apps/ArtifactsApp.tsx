@@ -1,0 +1,580 @@
+// biome-ignore-all lint/a11y/noStaticElementInteractions: Intentional wrapper/backdrop or SVG hover target; interactive child controls and keyboard paths are handled nearby.
+import { useQuery } from "@tanstack/react-query";
+
+import {
+  get,
+  getConfig,
+  getLocalProvidersStatus,
+  getOfficeMembers,
+  getScheduler,
+  getWatchdogs,
+} from "../../api/client";
+import { getUsage } from "../../api/platform";
+import { getOfficeTasks } from "../../api/tasks";
+import { formatTokens } from "../../lib/format";
+import { isBotActive, normalizeStatus } from "../../lib/officeStatus";
+import { router } from "../../lib/router";
+import {
+  configuredConnectedRuntimeProviders,
+  type RuntimeProviderOption,
+} from "../../lib/runtimeProviders";
+import { type Insight, InsightsList } from "../activity/InsightsList";
+import type { PrereqResult } from "../onboarding/runtimes";
+import { ActiveTasksPanel } from "./shared/ActiveTasksPanel";
+import { BotPulsePanel } from "./shared/BotPulsePanel";
+
+/** Minimal action/decision/watchdog shapes from the untyped endpoints. */
+interface WatchdogRecord {
+  summary?: string;
+  kind?: string;
+  channel?: string;
+  owner?: string;
+  target_type?: string;
+  target_id?: string;
+  updated_at?: string;
+  created_at?: string;
+}
+
+interface SchedulerJobRaw {
+  id?: string;
+  label?: string;
+  slug?: string;
+  status?: string;
+  channel?: string;
+  provider?: string;
+  workflow_key?: string;
+  skill_name?: string;
+  kind?: string;
+  next_run?: string;
+  due_at?: string;
+}
+
+export function ArtifactsApp() {
+  const tasks = useQuery({
+    queryKey: ["activity-tasks"],
+    queryFn: () => getOfficeTasks({ includeDone: true }),
+    refetchInterval: 15_000,
+  });
+
+  const watchdogs = useQuery({
+    queryKey: ["activity-watchdogs"],
+    queryFn: () => getWatchdogs() as Promise<{ watchdogs: WatchdogRecord[] }>,
+    refetchInterval: 15_000,
+  });
+
+  const scheduler = useQuery({
+    queryKey: ["activity-scheduler"],
+    queryFn: () => getScheduler({ dueOnly: true }),
+    refetchInterval: 15_000,
+  });
+
+  const usage = useQuery({
+    queryKey: ["activity-usage"],
+    queryFn: () => getUsage(),
+    refetchInterval: 15_000,
+  });
+
+  const members = useQuery({
+    queryKey: ["activity-members"],
+    queryFn: () => getOfficeMembers(),
+    refetchInterval: 15_000,
+  });
+  const config = useQuery({
+    queryKey: ["activity-config"],
+    queryFn: getConfig,
+    staleTime: 15_000,
+  });
+  const prereqs = useQuery({
+    queryKey: ["activity-runtime-prereqs"],
+    queryFn: () =>
+      get<{ prereqs?: PrereqResult[] } | PrereqResult[]>("/onboarding/prereqs"),
+    staleTime: 15_000,
+  });
+  const localProviders = useQuery({
+    queryKey: ["activity-local-providers"],
+    queryFn: getLocalProvidersStatus,
+    staleTime: 15_000,
+  });
+
+  const isLoading =
+    tasks.isLoading ||
+    watchdogs.isLoading ||
+    scheduler.isLoading ||
+    usage.isLoading ||
+    members.isLoading;
+
+  if (isLoading) {
+    return (
+      <div
+        style={{
+          padding: "40px 20px",
+          textAlign: "center",
+          color: "var(--text-tertiary)",
+          fontSize: 14,
+        }}
+      >
+        Loading office activity...
+      </div>
+    );
+  }
+
+  const allTasks = tasks.data?.tasks ?? [];
+  const allWatchdogs = (
+    (watchdogs.data as { watchdogs?: WatchdogRecord[] })?.watchdogs ?? []
+  ).slice();
+  const allJobs = (scheduler.data?.jobs ?? []) as unknown as SchedulerJobRaw[];
+  const usageData = usage.data;
+  const allMembers = members.data?.members ?? [];
+  const prereqList = Array.isArray(prereqs.data)
+    ? prereqs.data
+    : (prereqs.data?.prereqs ?? []);
+  const connectedProviders = config.data
+    ? configuredConnectedRuntimeProviders(config.data, {
+        prereqs: prereqList,
+        localStatuses: localProviders.data,
+      })
+    : [];
+  const providersIsFetched =
+    config.isFetched && prereqs.isFetched && localProviders.isFetched;
+
+  const activeTasks = allTasks.filter((t) => {
+    const s = normalizeStatus(t.status);
+    return s === "in_progress" || s === "review" || s === "open";
+  });
+  const blockedTasks = allTasks.filter(
+    (t) => normalizeStatus(t.status) === "blocked",
+  );
+  const liveBots = allMembers.filter(isBotActive);
+
+  const insights: Insight[] = [
+    ...blockedTasks.map<Insight>((t) => ({
+      priority: "high",
+      category: "task",
+      title: t.title || t.id || "Blocked task",
+      body: t.description,
+      target:
+        [t.channel ? `#${t.channel}` : "", t.owner ? `@${t.owner}` : ""]
+          .filter(Boolean)
+          .join(" · ") || undefined,
+      time: t.updated_at
+        ? new Date(t.updated_at).toLocaleTimeString([], {
+            hour: "numeric",
+            minute: "2-digit",
+          })
+        : undefined,
+    })),
+    ...allWatchdogs.map<Insight>((w) => ({
+      priority: w.kind?.toLowerCase() === "critical" ? "critical" : "high",
+      category: w.kind || "watchdog",
+      title: w.summary || w.kind || "Watchdog alert",
+      body: w.target_type
+        ? `${w.target_type}${w.target_id ? ` · ${w.target_id}` : ""}`
+        : undefined,
+      target: w.channel ? `#${w.channel}` : undefined,
+      time:
+        w.updated_at || w.created_at
+          ? new Date(w.updated_at || w.created_at || "").toLocaleTimeString(
+              [],
+              { hour: "numeric", minute: "2-digit" },
+            )
+          : undefined,
+    })),
+  ];
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+      {/* Hero */}
+      <div
+        style={{
+          display: "flex",
+          justifyContent: "space-between",
+          alignItems: "flex-start",
+        }}
+      >
+        <div>
+          <h3 style={{ fontSize: 18, fontWeight: 700 }}>Office activity</h3>
+          <div
+            style={{
+              fontSize: 13,
+              color: "var(--text-secondary)",
+              marginTop: 4,
+            }}
+          >
+            Which lanes are moving, which bots are active, and where work is
+            blocked.
+          </div>
+        </div>
+        <div
+          style={{
+            fontSize: 12,
+            color: "var(--text-tertiary)",
+            whiteSpace: "nowrap",
+          }}
+        >
+          {new Date().toLocaleTimeString([], {
+            hour: "numeric",
+            minute: "2-digit",
+          })}
+        </div>
+      </div>
+
+      {providersIsFetched && connectedProviders.length > 0 ? (
+        <ConnectedProvidersSection providers={connectedProviders} />
+      ) : null}
+
+      {/* Stat grid */}
+      <div
+        style={{
+          display: "grid",
+          gridTemplateColumns: "repeat(auto-fill, minmax(180px, 1fr))",
+          gap: 10,
+        }}
+      >
+        <StatCard
+          kicker="Active lanes"
+          value={String(activeTasks.length)}
+          copy="Live tasks currently moving."
+        />
+        <StatCard
+          kicker="Blocked lanes"
+          value={String(blockedTasks.length)}
+          copy="Tasks needing operator attention."
+          anchorId="needs-attention"
+        />
+        <StatCard
+          kicker="Watchdog alerts"
+          value={String(allWatchdogs.length)}
+          copy="Watchdogs firing right now."
+          anchorId="needs-attention"
+        />
+        <StatCard
+          kicker="Bots in motion"
+          value={String(liveBots.length)}
+          copy="Specialists currently shipping or plotting."
+        />
+        <StatCard
+          kicker="Due automations"
+          value={String(allJobs.length)}
+          copy="Scheduled jobs that are due now."
+        />
+        <StatCard
+          kicker="Session tokens"
+          value={formatTokens(usageData?.session?.total_tokens ?? 0)}
+          copy="Live token burn this session."
+        />
+      </div>
+
+      {/* Two-column grid */}
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16 }}>
+        {/* Left column */}
+        <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+          <ActivitySection
+            title="Active lanes"
+            meta={`${activeTasks.length} open or moving`}
+          >
+            <ActiveTasksPanel
+              tasks={activeTasks}
+              limit={10}
+              emptyLabel="No active lanes right now."
+            />
+          </ActivitySection>
+
+          <ActivitySection
+            title="Bot pulse"
+            meta={`${liveBots.length} active right now`}
+          >
+            <BotPulsePanel agents={liveBots} limit={10} />
+          </ActivitySection>
+        </div>
+
+        {/* Right column */}
+        <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+          <ActivitySection
+            title="Needs attention"
+            meta={`${insights.length} items`}
+            anchorId="needs-attention"
+          >
+            <InsightsList
+              insights={insights}
+              emptyLabel="No active blockers or watchdog alerts."
+              limit={12}
+            />
+          </ActivitySection>
+
+          <ActivitySection
+            title="Due automations"
+            meta={`${allJobs.length} due now`}
+          >
+            {allJobs.length === 0 ? (
+              <EmptyState>No jobs are due right now.</EmptyState>
+            ) : (
+              allJobs
+                .slice(0, 6)
+                .map((job, idx) => (
+                  <ActivityItem
+                    key={job.slug ?? job.id ?? `due-${idx}`}
+                    title={job.label || job.slug || "Scheduled job"}
+                    body={job.workflow_key || job.skill_name || job.kind || ""}
+                    meta={[
+                      job.channel ? `#${job.channel}` : "",
+                      job.provider ?? "",
+                      job.next_run || job.due_at
+                        ? new Date(
+                            job.next_run || job.due_at || "",
+                          ).toLocaleString()
+                        : "",
+                    ].filter(Boolean)}
+                    kindLabel={job.status || "scheduled"}
+                  />
+                ))
+            )}
+          </ActivitySection>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ── Shared sub-components ── */
+
+function goToSettings(): void {
+  void router.navigate({ to: "/apps/$appId", params: { appId: "settings" } });
+}
+
+function goToHealthCheck(): void {
+  void router.navigate({
+    to: "/apps/$appId",
+    params: { appId: "health-check" },
+  });
+}
+
+function ConnectedProvidersSection({
+  providers,
+}: {
+  providers: RuntimeProviderOption[];
+}) {
+  return (
+    <section
+      id="connected-providers"
+      aria-label="Connected providers"
+      style={{
+        background: "var(--green-bg)",
+        border: "1px solid var(--border)",
+        borderRadius: 8,
+        padding: "12px 16px",
+      }}
+    >
+      <div
+        style={{
+          display: "flex",
+          justifyContent: "space-between",
+          alignItems: "baseline",
+          marginBottom: 8,
+        }}
+      >
+        <div style={{ fontSize: 13, fontWeight: 600 }}>
+          {providers.length} provider{providers.length !== 1 ? "s" : ""}{" "}
+          connected
+        </div>
+        <div style={{ display: "flex", gap: 8 }}>
+          <button
+            type="button"
+            className="btn btn-sm btn-ghost"
+            onClick={goToSettings}
+          >
+            Settings
+          </button>
+          <button
+            type="button"
+            className="btn btn-sm btn-ghost"
+            onClick={goToHealthCheck}
+          >
+            Provider Doctor
+          </button>
+        </div>
+      </div>
+      {providers.map((provider) => (
+        <div
+          key={provider.id}
+          style={{
+            fontSize: 13,
+            color: "var(--text)",
+            marginBottom: 4,
+            display: "flex",
+            alignItems: "center",
+            gap: 6,
+          }}
+        >
+          <span
+            style={{
+              width: 6,
+              height: 6,
+              borderRadius: "50%",
+              background: "var(--green)",
+              flexShrink: 0,
+            }}
+          />
+          <strong>{provider.label}</strong>
+          {" — ready"}
+          <span style={{ color: "var(--text-tertiary)", fontSize: 11 }}>
+            ({provider.desc})
+          </span>
+        </div>
+      ))}
+      <div
+        style={{
+          marginTop: 8,
+          fontSize: 12,
+          color: "var(--warning-400, #ce6b09)",
+        }}
+      >
+        Task creation and runtime switching only show configured providers that
+        pass connection checks.
+      </div>
+    </section>
+  );
+}
+
+interface StatCardProps {
+  kicker: string;
+  value: string;
+  copy: string;
+  anchorId?: string;
+}
+
+function StatCard({ kicker, value, copy, anchorId }: StatCardProps) {
+  const clickable = Boolean(anchorId);
+
+  const activate = () => {
+    if (!anchorId) return;
+    const target = document.getElementById(anchorId);
+    if (target) target.scrollIntoView({ behavior: "smooth", block: "start" });
+  };
+
+  function handleKeyDown(event: React.KeyboardEvent<HTMLDivElement>) {
+    if (!clickable) return;
+    if (event.key === "Enter" || event.key === " ") {
+      event.preventDefault();
+      activate();
+    }
+  }
+
+  return (
+    <div
+      className="app-card"
+      style={{
+        padding: "12px 14px",
+        cursor: clickable ? "pointer" : "default",
+      }}
+      onClick={clickable ? activate : undefined}
+      onKeyDown={clickable ? handleKeyDown : undefined}
+      role={clickable ? "button" : undefined}
+      tabIndex={clickable ? 0 : undefined}
+      title={clickable ? `${kicker}: ${value}. Scroll to details.` : undefined}
+    >
+      <div
+        style={{
+          fontSize: 10,
+          fontWeight: 600,
+          textTransform: "uppercase",
+          letterSpacing: "0.06em",
+          color: "var(--text-tertiary)",
+        }}
+      >
+        {kicker}
+      </div>
+      <div style={{ fontSize: 22, fontWeight: 700, margin: "4px 0 2px" }}>
+        {value}
+      </div>
+      <div style={{ fontSize: 11, color: "var(--text-secondary)" }}>{copy}</div>
+    </div>
+  );
+}
+
+function ActivitySection({
+  title,
+  meta,
+  children,
+  anchorId,
+}: {
+  title: string;
+  meta?: string;
+  children: React.ReactNode;
+  anchorId?: string;
+}) {
+  return (
+    <section id={anchorId} style={{ scrollMarginTop: 16 }}>
+      <div
+        style={{
+          display: "flex",
+          justifyContent: "space-between",
+          alignItems: "baseline",
+          marginBottom: 8,
+        }}
+      >
+        <div style={{ fontSize: 14, fontWeight: 600 }}>{title}</div>
+        {meta ? <div className="app-card-meta">{meta}</div> : null}
+      </div>
+      {children}
+    </section>
+  );
+}
+
+function ActivityItem({
+  title,
+  body,
+  meta,
+  kindLabel,
+}: {
+  title: string;
+  body: string;
+  meta: string[];
+  kindLabel: string;
+}) {
+  return (
+    <div className="app-card" style={{ marginBottom: 6 }}>
+      <div
+        style={{
+          display: "flex",
+          alignItems: "center",
+          gap: 6,
+          marginBottom: 2,
+        }}
+      >
+        <span className="badge badge-accent">{kindLabel}</span>
+        <span className="app-card-title" style={{ marginBottom: 0 }}>
+          {title}
+        </span>
+      </div>
+      {body ? (
+        <div
+          style={{
+            fontSize: 12,
+            color: "var(--text-secondary)",
+            marginBottom: 4,
+          }}
+        >
+          {body}
+        </div>
+      ) : null}
+      {meta.length > 0 ? (
+        <div className="app-card-meta">{meta.join(" \u2022 ")}</div>
+      ) : null}
+    </div>
+  );
+}
+
+function EmptyState({ children }: { children: React.ReactNode }) {
+  return (
+    <div
+      style={{
+        padding: "20px 0",
+        textAlign: "center",
+        color: "var(--text-tertiary)",
+        fontSize: 13,
+      }}
+    >
+      {children}
+    </div>
+  );
+}

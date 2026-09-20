@@ -1,0 +1,59 @@
+{
+  "name": "hivebot",
+  "version": "0.236.2",
+  "description": "The open source Grok Bot. hivebots automate your menial work via AI models and build you microapps to manage the outcome, so that you have a false sense of control.",
+  "bin": {
+    "hivebot": "bin/hivebot.js"
+  },
+  "files": [
+    "bin/hivebot.js",
+    "scripts/cloudflared.json",
+    "scripts/download-binary.js",
+    "scripts/download-cloudflared.js",
+    "scripts/postinstall.js",
+    "scripts/version-check.js",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "postinstall": "node scripts/postinstall.js",
+    "test": "bun test"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "os": [
+    "darwin",
+    "linux",
+    "win32"
+  ],
+  "cpu": [
+    "x64",
+    "arm64"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Northlatch-Labs-LLC/hivebot.git"
+  },
+  "homepage": "https://hive.bot",
+  "bugs": {
+    "url": "https://github.com/Northlatch-Labs-LLC/hivebot/issues"
+  },
+  "license": "MIT",
+  "keywords": [
+    "grobot",
+    "grok-bot",
+    "open-source-grok-bot",
+    "ai-agents",
+    "ai-teammates",
+    "microapps",
+    "multi-agent",
+    "agent-office",
+    "claude-code",
+    "codex",
+    "openclaw",
+    "local-llm",
+    "cli",
+    "hivex"
+  ]
+}

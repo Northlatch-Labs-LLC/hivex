@@ -1,0 +1,1397 @@
+package team
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+// TestNormalizeRequestOptions_StableOrderAndIDs pins that calling
+// normalizeRequestOptions with empty input returns kind-specific
+// defaults in their declared order, and that supplied options are
+// preserved in caller order while picking up missing metadata from
+// the defaults.
+func TestNormalizeRequestOptions_StableOrderAndIDs(t *testing.T) {
+	defaults, fallback := requestOptionDefaults("approval")
+
+	// Empty input yields defaults plus the kind's recommendation.
+	got, rec := normalizeRequestOptions("approval", "", nil)
+	if rec != fallback {
+		t.Errorf("recommended: want %q, got %q", fallback, rec)
+	}
+	if len(got) != len(defaults) {
+		t.Fatalf("expected %d defaults, got %d", len(defaults), len(got))
+	}
+	for i := range defaults {
+		if got[i].ID != defaults[i].ID {
+			t.Errorf("position %d: ID drift — want %q, got %q", i, defaults[i].ID, got[i].ID)
+		}
+	}
+
+	// Supplied options preserve order and pick up labels from defaults.
+	out, _ := normalizeRequestOptions("approval", "approve", []interviewOption{
+		{ID: "reject"},
+		{ID: "approve"},
+	})
+	if len(out) != 2 || out[0].ID != "reject" || out[1].ID != "approve" {
+		t.Errorf("expected caller order preserved, got %+v", out)
+	}
+	// Approval defaults declare a Description for "approve" — assert it is
+	// inherited rather than left blank.
+	if out[1].Description == "" {
+		t.Error("expected approve description to be inherited from defaults")
+	}
+}
+
+// TestEnrichRequestOptions_AddsKindDefaults pins that empty input
+// returns the kind's full default option list (used when callers
+// haven't customised the choice surface).
+func TestEnrichRequestOptions_AddsKindDefaults(t *testing.T) {
+	for _, kind := range []string{"approval", "confirm", "choice", "interview"} {
+		t.Run(kind, func(t *testing.T) {
+			got := enrichRequestOptions(kind, nil)
+			defaults, _ := requestOptionDefaults(kind)
+			if len(got) == 0 || len(got) != len(defaults) {
+				t.Fatalf("kind=%s: expected %d defaults, got %d", kind, len(defaults), len(got))
+			}
+			for i := range defaults {
+				if got[i].ID != defaults[i].ID {
+					t.Errorf("kind=%s pos %d: want %q, got %q", kind, i, defaults[i].ID, got[i].ID)
+				}
+			}
+		})
+	}
+}
+
+// TestCancelActiveHumanInterviewsLocked_NoOpWhenNonePending pins that
+// the cancellation path is a no-op when no active interview matches
+// the channel filter, and returns 0 to signal nothing was changed.
+func TestCancelActiveHumanInterviewsLocked_NoOpWhenNonePending(t *testing.T) {
+	b := newTestBroker(t)
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	// No requests at all.
+	if got := b.cancelActiveHumanInterviewsLocked("human", "abandoned", "general", ""); got != 0 {
+		t.Errorf("empty broker: expected 0 cancellations, got %d", got)
+	}
+
+	// Add a resolved request — must not be cancelled.
+	b.requests = append(b.requests, humanInterview{
+		ID:      "req-resolved",
+		Kind:    "interview",
+		Status:  "resolved",
+		Channel: "general",
+	})
+	if got := b.cancelActiveHumanInterviewsLocked("human", "abandoned", "general", ""); got != 0 {
+		t.Errorf("only-resolved broker: expected 0 cancellations, got %d", got)
+	}
+	if b.requests[0].Status != "resolved" {
+		t.Error("resolved request should not be flipped by cancel")
+	}
+}
+
+func TestBrokerRequestsLifecycle(t *testing.T) {
+	b := newTestBroker(t)
+	if err := b.StartOnPort(0); err != nil {
+		t.Fatalf("failed to start broker: %v", err)
+	}
+	defer b.Stop()
+
+	base := fmt.Sprintf("http://%s", b.Addr())
+	body, _ := json.Marshal(map[string]any{
+		"kind":     "approval",
+		"from":     "cos",
+		"channel":  "general",
+		"title":    "Approval needed",
+		"question": "Should we proceed?",
+		"blocking": true,
+		"required": true,
+		"reply_to": "msg-1",
+	})
+	req, _ := http.NewRequest(http.MethodPost, base+"/requests", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+b.Token())
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("request create failed: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200 creating request, got %d: %s", resp.StatusCode, raw)
+	}
+
+	req, _ = http.NewRequest(http.MethodGet, base+"/requests?channel=general", nil)
+	req.Header.Set("Authorization", "Bearer "+b.Token())
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("request list failed: %v", err)
+	}
+	defer resp.Body.Close()
+	var listing struct {
+		Requests []humanInterview `json:"requests"`
+		Pending  *humanInterview  `json:"pending"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&listing); err != nil {
+		t.Fatalf("decode requests: %v", err)
+	}
+	if len(listing.Requests) != 1 || listing.Pending == nil {
+		t.Fatalf("expected one pending request, got %+v", listing)
+	}
+	if listing.Requests[0].ReminderAt == "" || listing.Requests[0].FollowUpAt == "" || listing.Requests[0].RecheckAt == "" {
+		t.Fatalf("expected reminder timestamps on request create, got %+v", listing.Requests[0])
+	}
+
+	answerBody, _ := json.Marshal(map[string]any{
+		"id":          listing.Requests[0].ID,
+		"choice_text": "Yes",
+	})
+	req, _ = http.NewRequest(http.MethodPost, base+"/requests/answer", bytes.NewReader(answerBody))
+	req.Header.Set("Authorization", "Bearer "+b.Token())
+	req.Header.Set("Content-Type", "application/json")
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("request answer failed: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 answering request, got %d", resp.StatusCode)
+	}
+	req, _ = http.NewRequest(http.MethodGet, base+"/queue", nil)
+	req.Header.Set("Authorization", "Bearer "+b.Token())
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("queue request failed: %v", err)
+	}
+	defer resp.Body.Close()
+	var queue struct {
+		Actions   []officeActionLog `json:"actions"`
+		Scheduler []schedulerJob    `json:"scheduler"`
+		Due       []schedulerJob    `json:"due"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&queue); err != nil {
+		t.Fatalf("decode queue response: %v", err)
+	}
+	for _, job := range queue.Scheduler {
+		if job.TargetType == "request" && job.TargetID == listing.Requests[0].ID && !strings.EqualFold(job.Status, "done") {
+			t.Fatalf("expected answered request scheduler jobs to complete, got %+v", job)
+		}
+	}
+
+	if b.HasBlockingRequest() {
+		t.Fatal("expected blocking request to clear after answer")
+	}
+}
+
+// TestBrokerPostRequestDedupeKeyCollapsesDuplicates locks in the fix
+// for the 117-stacked-approval bug: when a bot retries a mutating
+// external action, every call into the approval gate POSTs /requests
+// with the same dedupe_key. The broker must return the existing
+// active request instead of stacking duplicates.
+func TestBrokerPostRequestDedupeKeyCollapsesDuplicates(t *testing.T) {
+	b := newTestBroker(t)
+	ensureTestMemberAccess(b, "general", "integration-ops", "Integration Ops")
+	if err := b.StartOnPort(0); err != nil {
+		t.Fatalf("failed to start broker: %v", err)
+	}
+	defer b.Stop()
+
+	base := fmt.Sprintf("http://%s", b.Addr())
+	post := func() (string, bool) {
+		t.Helper()
+		body, _ := json.Marshal(map[string]any{
+			"kind":       "approval",
+			"from":       "integration-ops",
+			"channel":    "general",
+			"title":      "Approve gmail action: send",
+			"question":   "@integration-ops wants to send. Approve?",
+			"blocking":   true,
+			"required":   true,
+			"dedupe_key": "action:integration-ops:gmail:gmail_send_email:conn-key",
+		})
+		req, _ := http.NewRequest(http.MethodPost, base+"/requests", bytes.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+b.Token())
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("post request: %v", err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			raw, _ := io.ReadAll(resp.Body)
+			t.Fatalf("expected 200, got %d: %s", resp.StatusCode, raw)
+		}
+		var out struct {
+			ID      string `json:"id"`
+			Deduped bool   `json:"deduped"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		return out.ID, out.Deduped
+	}
+
+	firstID, firstDeduped := post()
+	if firstID == "" || firstDeduped {
+		t.Fatalf("first post: id=%q deduped=%v (expected fresh request)", firstID, firstDeduped)
+	}
+
+	// Five retries of the same dedupe_key must all collapse onto the
+	// first request — not stack five new ones.
+	for i := 0; i < 5; i++ {
+		id, deduped := post()
+		if id != firstID {
+			t.Fatalf("retry %d: id=%q want %q", i, id, firstID)
+		}
+		if !deduped {
+			t.Fatalf("retry %d: expected deduped=true", i)
+		}
+	}
+
+	// Sanity check via GET /requests: only one pending entry exists.
+	req, _ := http.NewRequest(http.MethodGet, base+"/requests?channel=general", nil)
+	req.Header.Set("Authorization", "Bearer "+b.Token())
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	defer resp.Body.Close()
+	var listing struct {
+		Requests []humanInterview `json:"requests"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&listing); err != nil {
+		t.Fatalf("decode listing: %v", err)
+	}
+	if len(listing.Requests) != 1 {
+		t.Fatalf("expected 1 pending request after 6 dedup-keyed POSTs, got %d", len(listing.Requests))
+	}
+	if listing.Requests[0].DedupeKey == "" {
+		t.Fatalf("expected DedupeKey to be persisted, got %+v", listing.Requests[0])
+	}
+}
+
+// TestBrokerPostRequestDedupeKeyReusesApprovedApproval pins the
+// post-Slice-7 contract: once an APPROVAL is approved, a subsequent
+// POST with the same dedupe_key within recentApprovalReuseWindow
+// reuses the existing answered request (so the calling bot's poll
+// loop sees the approval immediately and executes without re-prompting
+// the human). This is the explicit fix for the "I approved it but it
+// asked me again" loop the user reported. The window-expiry +
+// non-approval-kind paths are covered by the other dedupe tests.
+func TestBrokerPostRequestDedupeKeyReusesApprovedApproval(t *testing.T) {
+	b := newTestBroker(t)
+	ensureTestMemberAccess(b, "general", "cos", "CEO")
+	if err := b.StartOnPort(0); err != nil {
+		t.Fatalf("failed to start broker: %v", err)
+	}
+	defer b.Stop()
+
+	base := fmt.Sprintf("http://%s", b.Addr())
+	body, _ := json.Marshal(map[string]any{
+		"kind":       "approval",
+		"from":       "cos",
+		"channel":    "general",
+		"title":      "Approve",
+		"question":   "Approve?",
+		"blocking":   true,
+		"required":   true,
+		"dedupe_key": "action:cos:gmail:send:k",
+	})
+	post := func() (string, bool) {
+		t.Helper()
+		req, _ := http.NewRequest(http.MethodPost, base+"/requests", bytes.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+b.Token())
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("post: %v", err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			raw, _ := io.ReadAll(resp.Body)
+			t.Fatalf("expected 200 posting request, got %d: %s", resp.StatusCode, raw)
+		}
+		var out struct {
+			ID      string `json:"id"`
+			Deduped bool   `json:"deduped"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		return out.ID, out.Deduped
+	}
+
+	first, _ := post()
+	if first == "" {
+		t.Fatal("expected first request id")
+	}
+
+	// Answer the first request → terminal state.
+	answerBody, _ := json.Marshal(map[string]any{
+		"id":          first,
+		"choice_id":   "approve",
+		"choice_text": "Approve",
+	})
+	req, _ := http.NewRequest(http.MethodPost, base+"/requests/answer", bytes.NewReader(answerBody))
+	req.Header.Set("Authorization", "Bearer "+b.Token())
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("answer: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 answering request, got %d", resp.StatusCode)
+	}
+
+	// Same dedupe key after approve → reuse the existing answered
+	// approval (deduped=true). The bot's poll loop on /interview/
+	// answer?id=<first> already shows answer=approve, so the bot
+	// proceeds to execute without spamming the human with a new card.
+	second, deduped := post()
+	if second != first {
+		t.Fatalf("expected reused approval, got first=%q second=%q", first, second)
+	}
+	if !deduped {
+		t.Fatal("expected deduped=true for reused approval within window")
+	}
+}
+
+// TestBrokerPostRequestDedupeKeyRecreatesAfterCancel pins the cancel
+// branch of the terminal-state contract: cancelRequestLocked sets
+// Status="canceled" and requestIsActive returns false for it, so a
+// subsequent POST with the same dedupe_key must create a fresh
+// request rather than silently mapping to the canceled one.
+func TestBrokerPostRequestDedupeKeyRecreatesAfterCancel(t *testing.T) {
+	b := newTestBroker(t)
+	ensureTestMemberAccess(b, "general", "cos", "CEO")
+	if err := b.StartOnPort(0); err != nil {
+		t.Fatalf("failed to start broker: %v", err)
+	}
+	defer b.Stop()
+
+	base := fmt.Sprintf("http://%s", b.Addr())
+	post := func() (string, bool) {
+		t.Helper()
+		body, _ := json.Marshal(map[string]any{
+			"kind":       "approval",
+			"from":       "cos",
+			"channel":    "general",
+			"title":      "Approve",
+			"question":   "Approve?",
+			"blocking":   true,
+			"required":   true,
+			"dedupe_key": "action:cos:gmail:send:k",
+		})
+		req, _ := http.NewRequest(http.MethodPost, base+"/requests", bytes.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+b.Token())
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("post: %v", err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			raw, _ := io.ReadAll(resp.Body)
+			t.Fatalf("expected 200 posting request, got %d: %s", resp.StatusCode, raw)
+		}
+		var out struct {
+			ID      string `json:"id"`
+			Deduped bool   `json:"deduped"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		return out.ID, out.Deduped
+	}
+
+	first, _ := post()
+	if first == "" {
+		t.Fatal("expected first request id")
+	}
+
+	// Cancel the first request → terminal state.
+	cancelBody, _ := json.Marshal(map[string]any{"action": "cancel", "id": first, "from": "cos"})
+	req, _ := http.NewRequest(http.MethodPost, base+"/requests", bytes.NewReader(cancelBody))
+	req.Header.Set("Authorization", "Bearer "+b.Token())
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("cancel: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 canceling request, got %d", resp.StatusCode)
+	}
+
+	// Same dedupe key after cancel → new request, not the canceled one.
+	second, deduped := post()
+	if second == "" || second == first {
+		t.Fatalf("expected fresh request after cancel, got first=%q second=%q", first, second)
+	}
+	if deduped {
+		t.Fatal("expected deduped=false for fresh request after cancel")
+	}
+}
+
+func TestHumanRequestAnswerUsesSessionActor(t *testing.T) {
+	b := newTestBroker(t)
+	b.mu.Lock()
+	b.requests = append(b.requests, humanInterview{
+		ID:        "request-human",
+		Kind:      "approval",
+		Status:    "pending",
+		From:      "cos",
+		Channel:   "general",
+		Title:     "Approval needed",
+		Question:  "Ship it?",
+		ReplyTo:   "msg-root",
+		CreatedAt: "2026-01-01T00:00:00Z",
+		UpdatedAt: "2026-01-01T00:00:00Z",
+	})
+	b.mu.Unlock()
+
+	token, _, err := b.createHumanInvite()
+	if err != nil {
+		t.Fatalf("create invite: %v", err)
+	}
+	sessionToken, _, err := b.acceptHumanInvite(token, "Mira", "browser")
+	if err != nil {
+		t.Fatalf("accept invite: %v", err)
+	}
+
+	answerBody, _ := json.Marshal(map[string]any{
+		"id":          "request-human",
+		"choice_text": "Yes",
+	})
+	req := httptest.NewRequest(http.MethodPost, "/requests/answer", bytes.NewReader(answerBody))
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(&http.Cookie{Name: humanSessionCookie, Value: sessionToken})
+	rec := httptest.NewRecorder()
+	b.withAuth(b.handleRequestAnswer)(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("answer status = %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	var foundMessage bool
+	for _, msg := range b.messages {
+		if msg.ReplyTo == "" || msg.Channel != "general" {
+			continue
+		}
+		foundMessage = true
+		if msg.From != "human:mira" {
+			t.Fatalf("answer message from = %q, want human:mira", msg.From)
+		}
+	}
+	if !foundMessage {
+		t.Fatalf("did not find request answer message in %+v", b.messages)
+	}
+	var foundAction bool
+	for _, action := range b.actions {
+		if action.Kind != "request_answered" || action.RelatedID != "request-human" {
+			continue
+		}
+		foundAction = true
+		if action.Actor != "human:mira" {
+			t.Fatalf("answer action actor = %q, want human:mira", action.Actor)
+		}
+	}
+	if !foundAction {
+		t.Fatalf("did not find request_answered action in %+v", b.actions)
+	}
+}
+
+// Regression: the broker rejects new messages with 409 whenever ANY blocking
+// request is pending (handlePostMessage uses firstBlockingRequest across all
+// channels), so GET /requests must expose a "scope=all" view. Without it, the
+// web UI only sees per-channel requests and can't render a blocker that lives
+// in another channel — leaving the human stuck: can't send, can't see why.
+func TestBrokerGetRequestsScopeAllSeesCrossChannelBlocker(t *testing.T) {
+	b := newTestBroker(t)
+	ensureTestMemberAccess(b, "general", "cos", "CEO")
+	ensureTestMemberAccess(b, "backend", "cos", "CEO")
+	ensureTestMemberAccess(b, "backend", "human", "Human")
+	ensureTestMemberAccess(b, "general", "human", "Human")
+	if err := b.StartOnPort(0); err != nil {
+		t.Fatalf("failed to start broker: %v", err)
+	}
+	defer b.Stop()
+
+	base := fmt.Sprintf("http://%s", b.Addr())
+
+	createBody, _ := json.Marshal(map[string]any{
+		"kind":     "approval",
+		"from":     "cos",
+		"channel":  "backend",
+		"title":    "Deploy approval",
+		"question": "Ship the backend migration?",
+		"blocking": true,
+		"required": true,
+	})
+	req, _ := http.NewRequest(http.MethodPost, base+"/requests", bytes.NewReader(createBody))
+	req.Header.Set("Authorization", "Bearer "+b.Token())
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("create cross-channel request failed: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 creating backend request, got %d", resp.StatusCode)
+	}
+
+	// Per-channel view (#general) must NOT see the #backend blocker — this is
+	// the pre-fix behavior the UI was relying on and is still correct.
+	req, _ = http.NewRequest(http.MethodGet, base+"/requests?channel=general&viewer_slug=human", nil)
+	req.Header.Set("Authorization", "Bearer "+b.Token())
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("per-channel listing failed: %v", err)
+	}
+	var perChannel struct {
+		Requests []humanInterview `json:"requests"`
+		Pending  *humanInterview  `json:"pending"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&perChannel); err != nil {
+		t.Fatalf("decode per-channel response: %v", err)
+	}
+	resp.Body.Close()
+	if len(perChannel.Requests) != 0 || perChannel.Pending != nil {
+		t.Fatalf("expected #general view to hide #backend request, got %+v", perChannel)
+	}
+
+	// scope=all must include the cross-channel blocker so the overlay can show
+	// what's preventing the human from chatting anywhere.
+	req, _ = http.NewRequest(http.MethodGet, base+"/requests?scope=all&viewer_slug=human", nil)
+	req.Header.Set("Authorization", "Bearer "+b.Token())
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("scope=all listing failed: %v", err)
+	}
+	var global struct {
+		Requests []humanInterview `json:"requests"`
+		Pending  *humanInterview  `json:"pending"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&global); err != nil {
+		t.Fatalf("decode scope=all response: %v", err)
+	}
+	resp.Body.Close()
+	if len(global.Requests) != 1 {
+		t.Fatalf("expected 1 blocker across channels, got %d: %+v", len(global.Requests), global.Requests)
+	}
+	if global.Pending == nil || global.Pending.Channel != "backend" {
+		t.Fatalf("expected pending blocker from #backend, got %+v", global.Pending)
+	}
+}
+
+func TestBrokerCancelBlockingApprovalUnblocksMessages(t *testing.T) {
+	b := newTestBroker(t)
+	if err := b.StartOnPort(0); err != nil {
+		t.Fatalf("failed to start broker: %v", err)
+	}
+	defer b.Stop()
+
+	base := fmt.Sprintf("http://%s", b.Addr())
+	createBody, _ := json.Marshal(map[string]any{
+		"kind":     "approval",
+		"from":     "cos",
+		"channel":  "general",
+		"title":    "Approval needed",
+		"question": "Ship it?",
+		"blocking": true,
+		"required": true,
+	})
+	req, _ := http.NewRequest(http.MethodPost, base+"/requests", bytes.NewReader(createBody))
+	req.Header.Set("Authorization", "Bearer "+b.Token())
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("create approval failed: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200 creating approval, got %d: %s", resp.StatusCode, raw)
+	}
+	var created struct {
+		Request humanInterview `json:"request"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&created); err != nil {
+		t.Fatalf("decode created request: %v", err)
+	}
+	if !b.HasBlockingRequest() {
+		t.Fatal("approval should block before it is canceled")
+	}
+
+	messageBody, _ := json.Marshal(map[string]any{
+		"from":    "you",
+		"channel": "general",
+		"content": "This should still be blocked.",
+	})
+	req, _ = http.NewRequest(http.MethodPost, base+"/messages", bytes.NewReader(messageBody))
+	req.Header.Set("Authorization", "Bearer "+b.Token())
+	req.Header.Set("Content-Type", "application/json")
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("post message before cancel failed: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("expected approval to block message before cancel, got %d", resp.StatusCode)
+	}
+
+	cancelBody, _ := json.Marshal(map[string]any{
+		"action": "cancel",
+		"id":     created.Request.ID,
+	})
+	req, _ = http.NewRequest(http.MethodPost, base+"/requests", bytes.NewReader(cancelBody))
+	req.Header.Set("Authorization", "Bearer "+b.Token())
+	req.Header.Set("Content-Type", "application/json")
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("cancel approval failed: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200 canceling approval, got %d: %s", resp.StatusCode, raw)
+	}
+	if b.HasBlockingRequest() {
+		t.Fatal("canceled approval should not block")
+	}
+
+	req, _ = http.NewRequest(http.MethodPost, base+"/messages", bytes.NewReader(messageBody))
+	req.Header.Set("Authorization", "Bearer "+b.Token())
+	req.Header.Set("Content-Type", "application/json")
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("post message after cancel failed: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected message after canceled approval to succeed, got %d", resp.StatusCode)
+	}
+}
+
+func TestBrokerHumanInterviewDoesNotBlockAndThreadReplyAnswers(t *testing.T) {
+	b := newTestBroker(t)
+	if err := b.StartOnPort(0); err != nil {
+		t.Fatalf("failed to start broker: %v", err)
+	}
+	defer b.Stop()
+
+	base := fmt.Sprintf("http://%s", b.Addr())
+	createBody, _ := json.Marshal(map[string]any{
+		"kind":     "interview",
+		"from":     "cos",
+		"channel":  "general",
+		"title":    "Human interview",
+		"question": "Which customer segment should we prioritize?",
+		"blocking": true,
+		"required": true,
+		"reply_to": "msg-thread-1",
+	})
+	req, _ := http.NewRequest(http.MethodPost, base+"/requests", bytes.NewReader(createBody))
+	req.Header.Set("Authorization", "Bearer "+b.Token())
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("create interview failed: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200 creating interview, got %d: %s", resp.StatusCode, raw)
+	}
+	var created struct {
+		Request humanInterview `json:"request"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&created); err != nil {
+		t.Fatalf("decode created interview: %v", err)
+	}
+	if created.Request.Blocking || created.Request.Required {
+		t.Fatalf("human interviews must be non-blocking, got %+v", created.Request)
+	}
+	var answerDirectly *interviewOption
+	for i := range created.Request.Options {
+		if created.Request.Options[i].ID == "answer_directly" {
+			answerDirectly = &created.Request.Options[i]
+			break
+		}
+	}
+	if answerDirectly == nil || !answerDirectly.RequiresText || strings.TrimSpace(answerDirectly.TextHint) == "" {
+		t.Fatalf("expected answer_directly to require text, got %+v", answerDirectly)
+	}
+	if b.HasBlockingRequest() {
+		t.Fatal("human interview should not count as a blocking request")
+	}
+
+	createFollowUpBody, _ := json.Marshal(map[string]any{
+		"kind":     "interview",
+		"from":     "cos",
+		"channel":  "general",
+		"title":    "Follow-up interview",
+		"question": "Which launch channel should we test next?",
+		"blocking": true,
+		"required": true,
+		"reply_to": "msg-thread-2",
+	})
+	req, _ = http.NewRequest(http.MethodPost, base+"/requests", bytes.NewReader(createFollowUpBody))
+	req.Header.Set("Authorization", "Bearer "+b.Token())
+	req.Header.Set("Content-Type", "application/json")
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("create follow-up interview failed: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		raw, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		t.Fatalf("expected 200 creating follow-up interview, got %d: %s", resp.StatusCode, raw)
+	}
+	var createdFollowUp struct {
+		Request humanInterview `json:"request"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&createdFollowUp); err != nil {
+		resp.Body.Close()
+		t.Fatalf("decode created follow-up interview: %v", err)
+	}
+	resp.Body.Close()
+
+	invalidMessageBody, _ := json.Marshal(map[string]any{
+		"from":    "",
+		"channel": "general",
+		"content": "This send should fail validation.",
+		"tagged":  []string{"unknown-agent"},
+	})
+	req, _ = http.NewRequest(http.MethodPost, base+"/messages", bytes.NewReader(invalidMessageBody))
+	req.Header.Set("Authorization", "Bearer "+b.Token())
+	req.Header.Set("Content-Type", "application/json")
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("post invalid message after interview failed: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected invalid message to fail before canceling interview, got %d", resp.StatusCode)
+	}
+
+	req, _ = http.NewRequest(http.MethodGet, base+"/interview/answer?id="+created.Request.ID, nil)
+	req.Header.Set("Authorization", "Bearer "+b.Token())
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("get interview answer after invalid send failed: %v", err)
+	}
+	var pendingAnswer struct {
+		Answered *interviewAnswer `json:"answered"`
+		Status   string           `json:"status"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&pendingAnswer); err != nil {
+		t.Fatalf("decode pending interview answer: %v", err)
+	}
+	resp.Body.Close()
+	if pendingAnswer.Answered != nil || pendingAnswer.Status != "pending" {
+		t.Fatalf("expected invalid send to leave interview pending, got %+v", pendingAnswer)
+	}
+
+	// A human THREAD reply on the interview's anchor is the ANSWER (v3
+	// fix family #2, [19:24:53]) — it must not cancel the interview the
+	// human is answering.
+	messageBody, _ := json.Marshal(map[string]any{
+		"from":     "you",
+		"channel":  "general",
+		"content":  "Let's keep moving in this thread.",
+		"reply_to": "msg-thread-1",
+	})
+	req, _ = http.NewRequest(http.MethodPost, base+"/messages", bytes.NewReader(messageBody))
+	req.Header.Set("Authorization", "Bearer "+b.Token())
+	req.Header.Set("Content-Type", "application/json")
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("post message after interview failed: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected message send after interview to succeed, got %d", resp.StatusCode)
+	}
+
+	req, _ = http.NewRequest(http.MethodGet, base+"/requests?scope=all&viewer_slug=human&include_resolved=true", nil)
+	req.Header.Set("Authorization", "Bearer "+b.Token())
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("list requests failed: %v", err)
+	}
+	defer resp.Body.Close()
+	var listing struct {
+		Requests []humanInterview `json:"requests"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&listing); err != nil {
+		t.Fatalf("decode requests: %v", err)
+	}
+	if len(listing.Requests) != 2 {
+		t.Fatalf("expected two interviews, got %+v", listing.Requests)
+	}
+	byID := map[string]humanInterview{}
+	for _, listed := range listing.Requests {
+		byID[listed.ID] = listed
+	}
+	if byID[created.Request.ID].Status != "answered" {
+		t.Fatalf("expected replied-to interview to be ANSWERED by the thread reply, got %+v", byID[created.Request.ID])
+	}
+	if got := byID[created.Request.ID].Answered; got == nil || got.CustomText != "Let's keep moving in this thread." {
+		t.Fatalf("expected the human's reply text as the answer, got %+v", got)
+	}
+	if byID[createdFollowUp.Request.ID].Status != "pending" {
+		t.Fatalf("expected queued follow-up interview to remain pending, got %+v", byID[createdFollowUp.Request.ID])
+	}
+
+	req, _ = http.NewRequest(http.MethodGet, base+"/interview", nil)
+	req.Header.Set("Authorization", "Bearer "+b.Token())
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("get active interview failed: %v", err)
+	}
+	var activeInterview struct {
+		Pending *humanInterview `json:"pending"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&activeInterview); err != nil {
+		resp.Body.Close()
+		t.Fatalf("decode active interview: %v", err)
+	}
+	resp.Body.Close()
+	if activeInterview.Pending == nil || activeInterview.Pending.ID != createdFollowUp.Request.ID {
+		t.Fatalf("expected active interview to switch to follow-up %q, got %+v", createdFollowUp.Request.ID, activeInterview.Pending)
+	}
+
+	req, _ = http.NewRequest(http.MethodGet, base+"/interview/answer?id="+created.Request.ID, nil)
+	req.Header.Set("Authorization", "Bearer "+b.Token())
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("get interview answer failed: %v", err)
+	}
+	defer resp.Body.Close()
+	var answer struct {
+		Answered *interviewAnswer `json:"answered"`
+		Status   string           `json:"status"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&answer); err != nil {
+		t.Fatalf("decode interview answer: %v", err)
+	}
+	if answer.Answered == nil || answer.Status != "answered" ||
+		answer.Answered.CustomText != "Let's keep moving in this thread." {
+		t.Fatalf("expected the polling bot to receive the thread-reply answer, got %+v", answer)
+	}
+}
+
+func TestBrokerRequestAnswerUnblocksDependentTask(t *testing.T) {
+	b := newTestBroker(t)
+	ensureTestMemberAccess(b, "general", "cos", "CEO")
+	ensureTestMemberAccess(b, "general", "builder", "Builder")
+	if err := b.StartOnPort(0); err != nil {
+		t.Fatalf("failed to start broker: %v", err)
+	}
+	defer b.Stop()
+
+	base := fmt.Sprintf("http://%s", b.Addr())
+	createRequestBody, _ := json.Marshal(map[string]any{
+		"action":   "create",
+		"from":     "cos",
+		"channel":  "general",
+		"title":    "Approve the launch packet",
+		"question": "Should we proceed with the external launch?",
+		"kind":     "approval",
+		"blocking": true,
+		"required": true,
+		"reply_to": "msg-approval-1",
+	})
+	req, _ := http.NewRequest(http.MethodPost, base+"/requests", bytes.NewReader(createRequestBody))
+	req.Header.Set("Authorization", "Bearer "+b.Token())
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("create request failed: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200 creating request, got %d: %s", resp.StatusCode, raw)
+	}
+	var created struct {
+		Request humanInterview `json:"request"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&created); err != nil {
+		t.Fatalf("decode request create response: %v", err)
+	}
+	reqID := created.Request.ID
+	if reqID == "" {
+		t.Fatal("expected request id")
+	}
+
+	createTaskBody, _ := json.Marshal(map[string]any{
+		"action":     "create",
+		"channel":    "general",
+		"title":      "Ship the launch packet after approval",
+		"details":    "Continue once the approval request is answered.",
+		"created_by": "cos",
+		"owner":      "builder",
+		"depends_on": []string{reqID},
+		"task_type":  "launch",
+	})
+	req, _ = http.NewRequest(http.MethodPost, base+"/tasks", bytes.NewReader(createTaskBody))
+	req.Header.Set("Authorization", "Bearer "+b.Token())
+	req.Header.Set("Content-Type", "application/json")
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("create task failed: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200 creating task, got %d: %s", resp.StatusCode, raw)
+	}
+	var taskResult struct {
+		Task teamTask `json:"task"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&taskResult); err != nil {
+		t.Fatalf("decode task create response: %v", err)
+	}
+	if !taskResult.Task.Blocked() {
+		t.Fatalf("expected task to start blocked on request dependency, got %+v", taskResult.Task)
+	}
+
+	answerBody, _ := json.Marshal(map[string]any{
+		"id":        reqID,
+		"choice_id": "approve",
+	})
+	req, _ = http.NewRequest(http.MethodPost, base+"/requests/answer", bytes.NewReader(answerBody))
+	req.Header.Set("Authorization", "Bearer "+b.Token())
+	req.Header.Set("Content-Type", "application/json")
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("answer request failed: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200 answering request, got %d: %s", resp.StatusCode, raw)
+	}
+
+	// "Ship the launch packet after approval" is a business-objective task
+	// (title contains "launch") so it gets its own per-task channel — query
+	// using all_channels=true so the check is channel-location-agnostic.
+	req, _ = http.NewRequest(http.MethodGet, base+"/tasks?all_channels=true&viewer=cos", nil)
+	req.Header.Set("Authorization", "Bearer "+b.Token())
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("get tasks failed: %v", err)
+	}
+	defer resp.Body.Close()
+	var listing struct {
+		Tasks []teamTask `json:"tasks"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&listing); err != nil {
+		t.Fatalf("decode tasks: %v", err)
+	}
+	var updated *teamTask
+	for i := range listing.Tasks {
+		if listing.Tasks[i].ID == taskResult.Task.ID {
+			updated = &listing.Tasks[i]
+			break
+		}
+	}
+	if updated == nil {
+		t.Fatalf("expected to find task %s after answer", taskResult.Task.ID)
+	}
+	if updated.Blocked() {
+		t.Fatalf("expected task to be unblocked after request answer, got %+v", updated)
+	}
+	if updated.Status() != "in_progress" {
+		t.Fatalf("expected task to resume in_progress after answer, got %+v", updated)
+	}
+}
+
+func TestBrokerDecisionRequestsDefaultToBlocking(t *testing.T) {
+	b := newTestBroker(t)
+	if err := b.StartOnPort(0); err != nil {
+		t.Fatalf("failed to start broker: %v", err)
+	}
+	defer b.Stop()
+
+	base := fmt.Sprintf("http://%s", b.Addr())
+	body, _ := json.Marshal(map[string]any{
+		"kind":     "approval",
+		"from":     "cos",
+		"channel":  "general",
+		"title":    "Approval needed",
+		"question": "Should we proceed?",
+	})
+	req, _ := http.NewRequest(http.MethodPost, base+"/requests", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+b.Token())
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("request create failed: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200 creating request, got %d: %s", resp.StatusCode, raw)
+	}
+
+	var created struct {
+		Request humanInterview `json:"request"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&created); err != nil {
+		t.Fatalf("decode request: %v", err)
+	}
+	if !created.Request.Blocking || !created.Request.Required {
+		t.Fatalf("expected approval to default to blocking+required, got %+v", created.Request)
+	}
+	if got := created.Request.RecommendedID; got != "approve" {
+		t.Fatalf("expected approval recommended_id to default to approve, got %q", got)
+	}
+	if len(created.Request.Options) != 5 {
+		t.Fatalf("expected enriched approval options, got %+v", created.Request.Options)
+	}
+	var approveWithNote *interviewOption
+	for i := range created.Request.Options {
+		if created.Request.Options[i].ID == "approve_with_note" {
+			approveWithNote = &created.Request.Options[i]
+			break
+		}
+	}
+	if approveWithNote == nil || !approveWithNote.RequiresText || strings.TrimSpace(approveWithNote.TextHint) == "" {
+		t.Fatalf("expected approve_with_note to require text, got %+v", approveWithNote)
+	}
+}
+
+func TestBrokerRequestAnswerRequiresCustomTextWhenOptionNeedsIt(t *testing.T) {
+	b := newTestBroker(t)
+	if err := b.StartOnPort(0); err != nil {
+		t.Fatalf("failed to start broker: %v", err)
+	}
+	defer b.Stop()
+
+	base := fmt.Sprintf("http://%s", b.Addr())
+	body, _ := json.Marshal(map[string]any{
+		"kind":     "approval",
+		"from":     "cos",
+		"channel":  "general",
+		"title":    "Approval needed",
+		"question": "Should we proceed?",
+	})
+	req, _ := http.NewRequest(http.MethodPost, base+"/requests", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+b.Token())
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("request create failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	var created struct {
+		Request humanInterview `json:"request"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&created); err != nil {
+		t.Fatalf("decode request: %v", err)
+	}
+
+	answerBody, _ := json.Marshal(map[string]any{
+		"id":        created.Request.ID,
+		"choice_id": "approve_with_note",
+	})
+	req, _ = http.NewRequest(http.MethodPost, base+"/requests/answer", bytes.NewReader(answerBody))
+	req.Header.Set("Authorization", "Bearer "+b.Token())
+	req.Header.Set("Content-Type", "application/json")
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("request answer failed: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 400 for missing custom text, got %d: %s", resp.StatusCode, raw)
+	}
+}
+
+func TestRequestAnswerUnblocksReferencedTask(t *testing.T) {
+	b := newTestBroker(t)
+	if err := b.StartOnPort(0); err != nil {
+		t.Fatalf("start broker: %v", err)
+	}
+	defer b.Stop()
+
+	b.mu.Lock()
+	now := "2026-01-01T00:00:00Z"
+	b.channels = append(b.channels, teamChannel{Slug: "client-loop", Name: "Client Loop"})
+	b.requests = append(b.requests, humanInterview{
+		ID:        "request-11",
+		Kind:      "input",
+		Status:    "pending",
+		From:      "builder",
+		Channel:   "client-loop",
+		Question:  "What exact client name should I use for the Google Drive workspace folder?",
+		Blocking:  true,
+		Required:  true,
+		CreatedAt: now,
+		UpdatedAt: now,
+	})
+	b.tasks = append(b.tasks, teamTask{
+		ID:        "task-3",
+		Channel:   "client-loop",
+		Title:     "Create live client workspace in Google Drive",
+		Details:   "Blocked on request-11: exact client name for the workspace folder.",
+		Owner:     "builder",
+		status:    "blocked",
+		blocked:   true,
+		CreatedBy: "operator",
+		CreatedAt: now,
+		UpdatedAt: now,
+	})
+	b.mu.Unlock()
+
+	base := fmt.Sprintf("http://%s", b.Addr())
+	answerBody, _ := json.Marshal(map[string]any{
+		"id":          "request-11",
+		"custom_text": "Meridian Growth Studio",
+	})
+	req, _ := http.NewRequest(http.MethodPost, base+"/requests/answer", bytes.NewReader(answerBody))
+	req.Header.Set("Authorization", "Bearer "+b.Token())
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("request answer: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, raw)
+	}
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	var got *teamTask
+	for i := range b.tasks {
+		if b.tasks[i].ID == "task-3" {
+			got = &b.tasks[i]
+			break
+		}
+	}
+	if got == nil {
+		t.Fatal("expected task-3 to exist after answer")
+	}
+	if got.Blocked() {
+		t.Fatalf("expected task to unblock after request answer, got %+v", *got)
+	} else {
+		if got.Status() != "in_progress" {
+			t.Fatalf("expected task status to move to in_progress, got %+v", *got)
+		}
+		if !strings.Contains(got.Details, "Meridian Growth Studio") {
+			t.Fatalf("expected task details to include human answer, got %q", got.Details)
+		}
+	}
+	var found bool
+	for _, action := range b.actions {
+		if action.Kind == "task_unblocked" && action.RelatedID == "task-3" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatal("expected task_unblocked action after answering request")
+	}
+}
+
+// TestAlsoAskingSurvivesRestart pins the dedupe fan-out across a broker
+// restart: a subscriber attached to a pending interview must still be
+// treated as awaiting the answer after the state round-trips disk.
+func TestAlsoAskingSurvivesRestart(t *testing.T) {
+	dir := t.TempDir()
+	statePath := filepath.Join(dir, "broker-state.json")
+	b := NewBrokerAt(statePath)
+	b.mu.Lock()
+	b.requests = append(b.requests, humanInterview{
+		ID: "req-restart", Kind: "interview", Status: "pending",
+		From: "ae", Channel: "general",
+		Question:   "Which CRM should I connect to?",
+		AlsoAsking: []string{"revops"},
+	})
+	if err := b.saveLocked(); err != nil {
+		b.mu.Unlock()
+		t.Fatalf("save: %v", err)
+	}
+	b.mu.Unlock()
+
+	b2 := NewBrokerAt(statePath)
+	if err := b2.loadState(); err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if !b2.BotAwaitingInterviewAnswer("revops") {
+		t.Fatal("also_asking subscriber must still be awaiting after restart")
+	}
+	if !b2.BotAwaitingInterviewAnswer("ae") {
+		t.Fatal("original asker must still be awaiting after restart")
+	}
+	if b2.BotAwaitingInterviewAnswer("eng") {
+		t.Fatal("non-subscriber must not be parked")
+	}
+}
+
+// TestGetRequestsFilterByID locks the poll-by-id contract an App relies on
+// after callIntegration returns {status:"needs_approval", request_id}: GET
+// /requests?id=<request_id> returns ONLY that request (still visible after it
+// is answered, so the App can observe the terminal decision), an unknown id
+// yields an empty list with HTTP 200, and the id filter is applied AFTER the
+// visibility filtering so it can never widen what a viewer may see.
+func TestGetRequestsFilterByID(t *testing.T) {
+	b := newTestBroker(t)
+	// A viewer with access to #backend only — used to prove the id filter
+	// cannot leak a #general request to a viewer who may not see it.
+	ensureTestMemberAccess(b, "backend", "scout", "Scout")
+	if err := b.StartOnPort(0); err != nil {
+		t.Fatalf("failed to start broker: %v", err)
+	}
+	defer b.Stop()
+
+	base := fmt.Sprintf("http://%s", b.Addr())
+	createRequest := func(title string) string {
+		t.Helper()
+		body, _ := json.Marshal(map[string]any{
+			"kind":     "approval",
+			"from":     "cos",
+			"channel":  "general",
+			"title":    title,
+			"question": "Run " + title + "?",
+			"blocking": false,
+		})
+		req, _ := http.NewRequest(http.MethodPost, base+"/requests", bytes.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+b.Token())
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("create request %q failed: %v", title, err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			raw, _ := io.ReadAll(resp.Body)
+			t.Fatalf("expected 200 creating %q, got %d: %s", title, resp.StatusCode, raw)
+		}
+		var created struct {
+			Request humanInterview `json:"request"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&created); err != nil {
+			t.Fatalf("decode create response: %v", err)
+		}
+		if created.Request.ID == "" {
+			t.Fatalf("create %q returned no request id", title)
+		}
+		return created.Request.ID
+	}
+	listRequests := func(query string) []humanInterview {
+		t.Helper()
+		req, _ := http.NewRequest(http.MethodGet, base+"/requests?"+query, nil)
+		req.Header.Set("Authorization", "Bearer "+b.Token())
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("GET /requests?%s failed: %v", query, err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			raw, _ := io.ReadAll(resp.Body)
+			t.Fatalf("GET /requests?%s: expected 200, got %d: %s", query, resp.StatusCode, raw)
+		}
+		var listing struct {
+			Requests []humanInterview `json:"requests"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&listing); err != nil {
+			t.Fatalf("decode listing for %q: %v", query, err)
+		}
+		return listing.Requests
+	}
+
+	firstID := createRequest("App action: Slack post")
+	secondID := createRequest("App action: Gmail send")
+
+	// Sanity: both are visible in the default channel view.
+	if got := listRequests("channel=general"); len(got) != 2 {
+		t.Fatalf("expected 2 requests before filtering, got %d: %+v", len(got), got)
+	}
+
+	// ?id= narrows the listing to exactly the matching request.
+	got := listRequests("id=" + firstID)
+	if len(got) != 1 || got[0].ID != firstID {
+		t.Fatalf("expected only %s for ?id=%s, got %+v", firstID, firstID, got)
+	}
+
+	// An unknown id yields an empty list with HTTP 200 (asserted in the helper).
+	if got := listRequests("id=request-nonexistent"); len(got) != 0 {
+		t.Fatalf("expected empty list for unknown id, got %+v", got)
+	}
+
+	// Answer the first request; a by-id poll must STILL see it (with the
+	// decision) — that is the whole point of the App polling the request_id.
+	answerBody, _ := json.Marshal(map[string]any{"id": firstID, "choice_id": "reject"})
+	req, _ := http.NewRequest(http.MethodPost, base+"/requests/answer", bytes.NewReader(answerBody))
+	req.Header.Set("Authorization", "Bearer "+b.Token())
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("answer request failed: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 answering request, got %d", resp.StatusCode)
+	}
+	answered := listRequests("id=" + firstID)
+	if len(answered) != 1 || answered[0].ID != firstID {
+		t.Fatalf("expected answered request for ?id=%s, got %+v", firstID, answered)
+	}
+	if answered[0].Answered == nil || answered[0].Answered.ChoiceID != "reject" {
+		t.Fatalf("expected the rejection to be visible on the id poll, got %+v", answered[0])
+	}
+
+	// The id filter must be applied AFTER visibility filtering: a viewer with
+	// no access to the request's channel gets an empty list, not the request.
+	if got := listRequests("scope=all&viewer_slug=scout&id=" + secondID); len(got) != 0 {
+		t.Fatalf("id filter widened visibility for an unauthorized viewer: %+v", got)
+	}
+}
+
+// TestCancelActiveHumanInterviewsLocked_RetiresEveryStackedAsk: a bot that
+// re-asked three times left three cards in the human's DM. One human
+// message must retire all of them; retiring one per message left the last
+// one pending and BotAwaitingInterviewAnswer kept dropping the bot's wakes
+// (prod, 2026-09-07).
+func TestCancelActiveHumanInterviewsLocked_RetiresEveryStackedAsk(t *testing.T) {
+	b := newTestBroker(t)
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.requests = []humanInterview{
+		{ID: "r1", Kind: "interview", Status: "pending", From: "cos", Channel: "cos__human", ReplyTo: "msg-5", Question: "q1"},
+		{ID: "r2", Kind: "interview", Status: "pending", From: "cos", Channel: "cos__human", ReplyTo: "msg-5", Question: "q2"},
+		{ID: "r3", Kind: "interview", Status: "pending", From: "cos", Channel: "cos__human", ReplyTo: "msg-5", Question: "q3"},
+		{ID: "r4", Kind: "interview", Status: "pending", From: "pm", Channel: "human__pm", Question: "elsewhere"},
+	}
+	if got := b.cancelActiveHumanInterviewsLocked("human", "Human sent a new message", "cos__human", ""); got != 3 {
+		t.Fatalf("expected all 3 stacked asks cancelled, got %d", got)
+	}
+	for _, r := range b.requests[:3] {
+		if requestIsActive(r) {
+			t.Fatalf("%s still active after the human moved on", r.ID)
+		}
+	}
+	if !requestIsActive(b.requests[3]) {
+		t.Fatalf("an interview in another channel must not be touched")
+	}
+	if b.BotAwaitingInterviewAnswerLocked("cos") {
+		t.Fatalf("cos must no longer count as awaiting an answer")
+	}
+}

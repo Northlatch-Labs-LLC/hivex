@@ -1,0 +1,23 @@
+{
+  "name": "hivex-dev-tooling",
+  "private": true,
+  "license": "MIT",
+  "description": "Root-level dev tooling (secretlint, commitlint). The Go v0 app lives at the repo root; web UI lives in ./web with its own package.json; v1 protocol package lives in ./packages/protocol.",
+  "workspaces": [
+    "packages/*"
+  ],
+  "dependencyOverrideNotes": {
+    "fast-uri": "Pinned to 3.1.2 so bun audit --audit-level high stays clean for transitive Ajv consumers. Remove when all workspace dependency chains resolve to fast-uri 3.1.2 or newer without an override."
+  },
+  "overrides": {
+    "fast-uri": "3.1.2"
+  },
+  "devDependencies": {
+    "@commitlint/cli": "21.0.1",
+    "@commitlint/config-conventional": "21.0.1",
+    "@secretlint/secretlint-rule-pattern": "13.0.2",
+    "@secretlint/secretlint-rule-preset-recommend": "13.0.2",
+    "secretlint": "13.0.2"
+  },
+  "version": "0.0.0"
+}

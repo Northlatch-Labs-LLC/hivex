@@ -1,0 +1,825 @@
+package team
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"log"
+	"log/slog"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/Northlatch-Labs-LLC/hivex/internal/bot"
+)
+
+func (b *Broker) handleSkills(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		b.handleGetSkills(w, r)
+	case http.MethodPost:
+		b.handlePostSkill(w, r)
+	case http.MethodPut:
+		b.handlePutSkill(w, r)
+	case http.MethodDelete:
+		b.handleDeleteSkill(w, r)
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (b *Broker) handleSkillsSubpath(w http.ResponseWriter, r *http.Request) {
+	path := strings.TrimPrefix(r.URL.Path, "/skills/")
+	if strings.HasSuffix(path, "/invoke") {
+		b.handleInvokeSkill(w, r)
+		return
+	}
+	// PR 1b CRUD verbs: patch / archive / files / approve / reject + reject/undo.
+	if b.handleSkillsCRUDSubpath(w, r) {
+		return
+	}
+	// PR 1b PUT /skills/{name} — full SKILL.md replacement.
+	if b.handleSkillEditOnName(w, r) {
+		return
+	}
+	http.Error(w, "not found", http.StatusNotFound)
+}
+
+func skillSlug(name string) string {
+	s := strings.ToLower(strings.TrimSpace(name))
+	s = strings.ReplaceAll(s, " ", "-")
+	s = strings.ReplaceAll(s, "_", "-")
+	return s
+}
+
+func (b *Broker) findSkillByNameLocked(name string) *teamSkill {
+	slug := skillSlug(name)
+	for i := range b.skills {
+		if skillSlug(b.skills[i].Name) == slug && b.skills[i].Status != "archived" {
+			return &b.skills[i]
+		}
+	}
+	return nil
+}
+
+// findSkillByNameIncludingArchivedLocked is the archive-aware sibling of
+// findSkillByNameLocked. It exists so /skills/{name}/restore can locate a
+// skill that the regular lookup intentionally hides. Caller holds b.mu.
+func (b *Broker) findSkillByNameIncludingArchivedLocked(name string) *teamSkill {
+	slug := skillSlug(name)
+	for i := range b.skills {
+		if skillSlug(b.skills[i].Name) == slug {
+			return &b.skills[i]
+		}
+	}
+	return nil
+}
+
+// allocateSkillIDLocked mints a new skill ID derived from the name's slug.
+// If the bare slug-based ID already exists in the broker (active OR archived),
+// a numeric discriminator is appended so create→archive→create cycles can't
+// collide. Existing IDs are preserved on the common, no-collision path.
+func (b *Broker) allocateSkillIDLocked(name string) string {
+	base := fmt.Sprintf("skill-%s", skillSlug(name))
+	if !b.skillIDExistsLocked(base) {
+		return base
+	}
+	for n := 2; ; n++ {
+		candidate := fmt.Sprintf("%s-%d", base, n)
+		if !b.skillIDExistsLocked(candidate) {
+			return candidate
+		}
+	}
+}
+
+func (b *Broker) skillIDExistsLocked(id string) bool {
+	for i := range b.skills {
+		if b.skills[i].ID == id {
+			return true
+		}
+	}
+	return false
+}
+
+// SkillSummary is the slim projection of an active skill used to render the
+// AVAILABLE SKILLS catalog block into bot system prompts. Slug + title +
+// one-line description is enough for the LLM to pick the right team_skill_run
+// target without dragging the full Content body (which can be long) into the
+// prompt of every bot on every spawn.
+type SkillSummary struct {
+	Slug        string
+	Title       string
+	Description string
+	// OwnerBots lists bot slugs this skill is assigned to. Compilation
+	// auto-assigns the office roster at creation (core-loop step 8); the
+	// human or CEO can narrow it via the Skills tab. prompt_builder.go
+	// renders ONLY assigned skills into a bot's prompt — unassigned
+	// skills are invisible to that bot.
+	OwnerBots []string
+}
+
+// ListActiveSkillSummaries returns slim summaries of every active skill,
+// sorted by slug so the rendered prompt block is byte-stable for prompt
+// caching. Mirrors ListPolicies semantics: only active (Status=="active")
+// records are returned; archived (and any legacy proposed) skills are
+// filtered out.
+//
+// Slim by design: the broker's full skill content can be many KB. We render
+// only the slug and a short description into the prompt so every bot has a
+// definitive catalog to compare against before invoking team_skill_run,
+// without paying full content cost on every system prompt build.
+func (b *Broker) ListActiveSkillSummaries() []SkillSummary {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	out := make([]SkillSummary, 0, len(b.skills))
+	for i := range b.skills {
+		sk := b.skills[i]
+		if sk.Status != "active" {
+			continue
+		}
+		slug := skillSlug(sk.Name)
+		if slug == "" {
+			continue
+		}
+		owners := append([]string(nil), sk.OwnerBots...)
+		if sk.System {
+			owners = b.systemSkillEffectiveOwnersLocked(&sk)
+		}
+		out = append(out, SkillSummary{
+			Slug:        slug,
+			Title:       strings.TrimSpace(sk.Title),
+			Description: strings.TrimSpace(sk.Description),
+			OwnerBots:   owners,
+		})
+	}
+	return out
+}
+
+func (b *Broker) findSkillByWorkflowKeyLocked(key string) *teamSkill {
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return nil
+	}
+	for i := range b.skills {
+		if strings.TrimSpace(b.skills[i].WorkflowKey) == key && b.skills[i].Status != "archived" {
+			return &b.skills[i]
+		}
+	}
+	return nil
+}
+
+func (b *Broker) handleGetSkills(w http.ResponseWriter, r *http.Request) {
+	// An absent ?channel= means NO FILTER — list every skill. Normalising an
+	// empty query value first would turn it into "general" (that is
+	// normalizeChannelSlug's lobby fallback), so the `channelFilter != ""`
+	// test below could never be false and an unfiltered request silently
+	// returned only #general's skills. Test the raw value, then normalise.
+	channelFilter := ""
+	if raw := strings.TrimSpace(r.URL.Query().Get("channel")); raw != "" {
+		channelFilter = normalizeChannelSlug(raw)
+	}
+
+	b.mu.Lock()
+	result := make([]teamSkill, 0, len(b.skills))
+	for _, sk := range b.skills {
+		// A system skill's assignment is the roster minus DisabledBots;
+		// surface that as owner_agents so every consumer (bot Skills tab,
+		// Skills app, prompt debuggers) reads the effective set without
+		// learning the system-skill rule.
+		if sk.System {
+			sk.OwnerBots = b.systemSkillEffectiveOwnersLocked(&sk)
+		}
+		if sk.Status == "archived" {
+			continue
+		}
+		if channelFilter != "" && normalizeChannelSlug(sk.Channel) != channelFilter {
+			continue
+		}
+		result = append(result, sk)
+	}
+	b.mu.Unlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{"skills": result})
+}
+
+// handlePostSkill creates a skill directly via HTTP. Bot-driven skill
+// creation was removed in core-loop R5 — skills are created ONLY by playbook
+// compilation. This endpoint remains as the INTERNAL seeding/install path
+// (e.g. `hivex skills install` from a hub, test fixtures); it is not exposed
+// to bots through any MCP tool.
+func (b *Broker) handlePostSkill(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		// Action is parsed only to fail closed: the propose flow was
+		// removed (core-loop R5), and a stale caller sending
+		// action=propose must NOT silently get an immediately-active
+		// skill instead of the approval gate it expected.
+		Action              string   `json:"action"`
+		Name                string   `json:"name"`
+		Title               string   `json:"title"`
+		Description         string   `json:"description"`
+		Content             string   `json:"content"`
+		CreatedBy           string   `json:"created_by"`
+		Channel             string   `json:"channel"`
+		Tags                []string `json:"tags"`
+		Trigger             string   `json:"trigger"`
+		WorkflowProvider    string   `json:"workflow_provider"`
+		WorkflowKey         string   `json:"workflow_key"`
+		WorkflowDefinition  string   `json:"workflow_definition"`
+		WorkflowSchedule    string   `json:"workflow_schedule"`
+		RelayID             string   `json:"relay_id"`
+		RelayPlatform       string   `json:"relay_platform"`
+		RelayEventTypes     []string `json:"relay_event_types"`
+		LastExecutionAt     string   `json:"last_execution_at"`
+		LastExecutionStatus string   `json:"last_execution_status"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "invalid json", http.StatusBadRequest)
+		return
+	}
+
+	if action := strings.TrimSpace(body.Action); action != "" && action != "create" {
+		http.Error(w, "skill proposals were removed; skills are created only by playbook compilation", http.StatusGone)
+		return
+	}
+	if strings.TrimSpace(body.Name) == "" || strings.TrimSpace(body.Content) == "" || strings.TrimSpace(body.CreatedBy) == "" || strings.TrimSpace(body.Description) == "" {
+		// Description is required by RenderSkillMarkdown — without it the
+		// SKILL.md write would silently no-op and the wiki UI would 404 on
+		// the skill, which is exactly the regression this PR fixes.
+		http.Error(w, "name, description, content, and created_by required", http.StatusBadRequest)
+		return
+	}
+
+	now := time.Now().UTC().Format(time.RFC3339)
+	// Raw emptiness first: normalizeChannelSlug("") is "general", so a missing
+	// channel used to be silently laundered into the shared room. Resolve a real
+	// home instead — while #general is enabled this still answers "general", so
+	// today is unchanged; once it is off this is the bot's DM, or a refusal.
+	//
+	// homeChannelFor is the correct variant HERE specifically: b.mu is
+	// NOT held at this point. The other variant would
+	// read the roster unsynchronised.
+	channel := ""
+	if raw := strings.TrimSpace(body.Channel); raw != "" {
+		channel = normalizeChannelSlug(raw)
+	}
+	if channel == "" {
+		home, err := b.homeChannelFor(body.CreatedBy)
+		if err != nil {
+			http.Error(w, `channel is required: there is no default room to fall back to. Name a channel, or set a member slug so the message can go to that agent's DM.`, http.StatusBadRequest)
+			return
+		}
+		channel = home
+	}
+
+	const msgKind = "skill_update"
+
+	b.mu.Lock()
+	unlocked := false
+	defer func() {
+		if !unlocked {
+			b.mu.Unlock()
+		}
+	}()
+
+	createdBy := strings.TrimSpace(body.CreatedBy)
+
+	if existing := b.findSkillByNameLocked(body.Name); existing != nil {
+		http.Error(w, "skill with this name already exists", http.StatusConflict)
+		return
+	}
+
+	title := strings.TrimSpace(body.Title)
+	if title == "" {
+		title = strings.TrimSpace(body.Name)
+	}
+
+	// Auto-assignment (core-loop step 8): seeded/installed skills are
+	// assigned to the whole office roster so they are loaded for every
+	// bot; the human narrows the assignment via the Skills tab.
+	ownerBots := b.allMemberSlugsLocked()
+
+	b.counter++
+	sk := teamSkill{
+		ID:                  b.allocateSkillIDLocked(body.Name),
+		Name:                strings.TrimSpace(body.Name),
+		Title:               title,
+		Description:         strings.TrimSpace(body.Description),
+		Content:             strings.TrimSpace(body.Content),
+		CreatedBy:           createdBy,
+		OwnerBots:           ownerBots,
+		Channel:             channel,
+		Tags:                body.Tags,
+		Trigger:             strings.TrimSpace(body.Trigger),
+		WorkflowProvider:    strings.TrimSpace(body.WorkflowProvider),
+		WorkflowKey:         strings.TrimSpace(body.WorkflowKey),
+		WorkflowDefinition:  strings.TrimSpace(body.WorkflowDefinition),
+		WorkflowSchedule:    strings.TrimSpace(body.WorkflowSchedule),
+		RelayID:             strings.TrimSpace(body.RelayID),
+		RelayPlatform:       strings.TrimSpace(body.RelayPlatform),
+		RelayEventTypes:     append([]string(nil), body.RelayEventTypes...),
+		LastExecutionAt:     strings.TrimSpace(body.LastExecutionAt),
+		LastExecutionStatus: strings.TrimSpace(body.LastExecutionStatus),
+		UsageCount:          0,
+		Status:              "active",
+		CreatedAt:           now,
+		UpdatedAt:           now,
+	}
+	b.skills = append(b.skills, sk)
+
+	b.appendMessageLocked(channelMessage{
+		ID:        fmt.Sprintf("msg-%d", b.counter),
+		From:      sk.CreatedBy,
+		Channel:   channel,
+		Kind:      msgKind,
+		Title:     sk.Title,
+		Content:   fmt.Sprintf("Skill %q created by @%s", sk.Name, sk.CreatedBy),
+		Timestamp: now,
+	})
+	b.appendActionLocked(msgKind, "office", channel, sk.CreatedBy, truncateSummary(sk.Title, 140), sk.ID)
+
+	if err := b.saveLocked(); err != nil {
+		http.Error(w, "failed to persist broker state", http.StatusInternalServerError)
+		return
+	}
+
+	// Enqueue the SKILL.md write so the wiki has the file on disk. Without
+	// this, a freshly created skill exists in broker-state.json but
+	// /wiki/article?path=team/skills/<slug>.md returns "no such file" until
+	// the skill is edited or archived. Mirrors the pattern used by every
+	// other CRUD handler in skill_crud_endpoints.go.
+	wikiWorker := b.wikiWorker
+	wikiPath := skillWikiPath(sk.Name)
+	skSnapshot := sk
+	b.mu.Unlock()
+	unlocked = true
+
+	commitMsg := fmt.Sprintf("hivex: create skill %s", skSnapshot.Name)
+	// Use the broker lifecycle context, not r.Context(): the skill is
+	// already in broker state, and a client disconnect mid-Enqueue would
+	// cancel the SKILL.md commit and recreate the very "broker has it,
+	// disk doesn't" condition this PR exists to fix.
+	enqueueCtx := b.brokerLifecycleContext()
+	if err := enqueueSkillWikiWrite(enqueueCtx, wikiWorker, skSnapshot, wikiPath, commitMsg); err != nil {
+		// Wiki enqueue failures are logged but do not fail the create — the
+		// skill still lives in broker state, and a later save (edit, archive,
+		// or boot backfill) reconciles disk. Returning 500 here would leave
+		// callers thinking the skill was not created when broker state has
+		// already been mutated.
+		slog.Warn("handlePostSkill: wiki enqueue failed",
+			"name", skSnapshot.Name, "err", err)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{"skill": skSnapshot})
+}
+
+// enqueueSkillWikiWrite renders sk into SKILL.md form (with safety scan
+// metadata) and enqueues a wiki write through the worker. Caller must NOT
+// hold b.mu — WikiWorker.Enqueue acquires b.mu via PublishWikiEvent and would
+// deadlock. Returns nil silently when worker is nil (wiki backend offline)
+// or when sk lacks the mandatory frontmatter fields.
+func enqueueSkillWikiWrite(ctx context.Context, worker *WikiWorker, sk teamSkill, wikiPath, commitMsg string) error {
+	if worker == nil {
+		return nil
+	}
+	if strings.TrimSpace(sk.Name) == "" || strings.TrimSpace(sk.Description) == "" {
+		// Intentionally retained even though handlePostSkill now rejects empty
+		// description at the HTTP layer: backfillSkillFilesFromState (and any
+		// future caller) may encounter legacy teamSkill records written before
+		// the validation existed. Removing this guard would cause those legacy
+		// skills to fail RenderSkillMarkdown and surface a write error instead
+		// of a safe, logged skip.
+		slog.Warn("enqueueSkillWikiWrite: skipping wiki write — name or description empty",
+			"name", sk.Name)
+		return nil
+	}
+	fm := teamSkillToFrontmatter(sk)
+	scan := ScanSkill(fm, sk.Content, skillTrustForCreator(sk.CreatedBy))
+	fm.Metadata.Hivex.SafetyScan = &SkillSafetyScan{
+		Verdict:    string(scan.Verdict),
+		Findings:   append([]string(nil), scan.Findings...),
+		TrustLevel: string(scan.TrustLevel),
+		Summary:    scan.Summary,
+	}
+	mdBytes, err := RenderSkillMarkdown(fm, sk.Content)
+	if err != nil {
+		return fmt.Errorf("render skill markdown: %w", err)
+	}
+	if _, _, err := worker.Enqueue(ctx, sk.Name, wikiPath, string(mdBytes), "replace", commitMsg); err != nil {
+		return fmt.Errorf("wiki enqueue: %w", err)
+	}
+	return nil
+}
+
+func (b *Broker) handlePutSkill(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Name                string   `json:"name"`
+		Title               string   `json:"title"`
+		Description         string   `json:"description"`
+		Content             string   `json:"content"`
+		Channel             string   `json:"channel"`
+		Tags                []string `json:"tags"`
+		Trigger             string   `json:"trigger"`
+		Status              string   `json:"status"`
+		WorkflowProvider    string   `json:"workflow_provider"`
+		WorkflowKey         string   `json:"workflow_key"`
+		WorkflowDefinition  string   `json:"workflow_definition"`
+		WorkflowSchedule    string   `json:"workflow_schedule"`
+		RelayID             string   `json:"relay_id"`
+		RelayPlatform       string   `json:"relay_platform"`
+		RelayEventTypes     []string `json:"relay_event_types"`
+		LastExecutionAt     string   `json:"last_execution_at"`
+		LastExecutionStatus string   `json:"last_execution_status"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "invalid json", http.StatusBadRequest)
+		return
+	}
+	if strings.TrimSpace(body.Name) == "" && strings.TrimSpace(body.WorkflowKey) == "" {
+		http.Error(w, "name or workflow_key required", http.StatusBadRequest)
+		return
+	}
+
+	now := time.Now().UTC().Format(time.RFC3339)
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	sk := b.findSkillByNameLocked(body.Name)
+	if sk == nil {
+		sk = b.findSkillByWorkflowKeyLocked(body.WorkflowKey)
+	}
+	if sk == nil {
+		http.Error(w, "skill not found", http.StatusNotFound)
+		return
+	}
+
+	if t := strings.TrimSpace(body.Title); t != "" {
+		sk.Title = t
+	}
+	if d := strings.TrimSpace(body.Description); d != "" {
+		sk.Description = d
+	}
+	if c := strings.TrimSpace(body.Content); c != "" {
+		sk.Content = c
+	}
+	if ch := normalizeChannelSlug(body.Channel); ch != "" {
+		sk.Channel = ch
+	}
+	if body.Tags != nil {
+		sk.Tags = body.Tags
+	}
+	if t := strings.TrimSpace(body.Trigger); t != "" {
+		sk.Trigger = t
+	}
+	if p := strings.TrimSpace(body.WorkflowProvider); p != "" {
+		sk.WorkflowProvider = p
+	}
+	if key := strings.TrimSpace(body.WorkflowKey); key != "" {
+		sk.WorkflowKey = key
+	}
+	if def := strings.TrimSpace(body.WorkflowDefinition); def != "" {
+		sk.WorkflowDefinition = def
+	}
+	if sched := strings.TrimSpace(body.WorkflowSchedule); sched != "" {
+		sk.WorkflowSchedule = sched
+	}
+	if relayID := strings.TrimSpace(body.RelayID); relayID != "" {
+		sk.RelayID = relayID
+	}
+	if relayPlatform := strings.TrimSpace(body.RelayPlatform); relayPlatform != "" {
+		sk.RelayPlatform = relayPlatform
+	}
+	if body.RelayEventTypes != nil {
+		sk.RelayEventTypes = append([]string(nil), body.RelayEventTypes...)
+	}
+	if ts := strings.TrimSpace(body.LastExecutionAt); ts != "" {
+		sk.LastExecutionAt = ts
+	}
+	if status := strings.TrimSpace(body.LastExecutionStatus); status != "" {
+		sk.LastExecutionStatus = status
+	}
+	if s := strings.TrimSpace(body.Status); s != "" {
+		// Legacy persisted state may still carry "proposed" skills from the
+		// retired proposal flow. Don't let PUT /skills smuggle one into
+		// "active" — the explicit /skills/{name}/approve endpoint is the
+		// only path that flips legacy proposed → active.
+		if sk.Status == "proposed" && s != "proposed" && s != "archived" {
+			http.Error(w, "legacy proposed skills must be activated via /skills/{name}/approve or archived", http.StatusForbidden)
+			return
+		}
+		sk.Status = s
+	}
+	sk.UpdatedAt = now
+
+	channel := normalizeChannelSlug(sk.Channel)
+	if channel == "" {
+		channel = "general"
+	}
+
+	b.counter++
+	b.appendMessageLocked(channelMessage{
+		ID:        fmt.Sprintf("msg-%d", b.counter),
+		From:      sk.CreatedBy,
+		Channel:   channel,
+		Kind:      "skill_update",
+		Title:     sk.Title,
+		Content:   fmt.Sprintf("Skill %q updated", sk.Name),
+		Timestamp: now,
+	})
+	b.appendActionLocked("skill_update", "office", channel, sk.CreatedBy, truncateSummary(sk.Title+" [updated]", 140), sk.ID)
+
+	if err := b.saveLocked(); err != nil {
+		http.Error(w, "failed to persist broker state", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{"skill": *sk})
+}
+
+func (b *Broker) handleDeleteSkill(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Name string `json:"name"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "invalid json", http.StatusBadRequest)
+		return
+	}
+	if strings.TrimSpace(body.Name) == "" {
+		http.Error(w, "name required", http.StatusBadRequest)
+		return
+	}
+
+	now := time.Now().UTC().Format(time.RFC3339)
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	sk := b.findSkillByNameLocked(body.Name)
+	if sk == nil {
+		http.Error(w, "skill not found", http.StatusNotFound)
+		return
+	}
+	if reason := guardSystemSkillMutation(sk, "delete"); reason != "" {
+		http.Error(w, reason, http.StatusForbidden)
+		return
+	}
+
+	sk.Status = "archived"
+	sk.UpdatedAt = now
+
+	channel := normalizeChannelSlug(sk.Channel)
+	if channel == "" {
+		channel = "general"
+	}
+
+	b.counter++
+	b.appendMessageLocked(channelMessage{
+		ID:        fmt.Sprintf("msg-%d", b.counter),
+		From:      sk.CreatedBy,
+		Channel:   channel,
+		Kind:      "skill_update",
+		Title:     sk.Title,
+		Content:   fmt.Sprintf("Skill %q archived", sk.Name),
+		Timestamp: now,
+	})
+	b.appendActionLocked("skill_update", "office", channel, sk.CreatedBy, truncateSummary(sk.Title+" [archived]", 140), sk.ID)
+
+	if err := b.saveLocked(); err != nil {
+		http.Error(w, "failed to persist broker state", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
+}
+
+func (b *Broker) handleInvokeSkill(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Extract skill name from path: /skills/{name}/invoke
+	path := strings.TrimPrefix(r.URL.Path, "/skills/")
+	skillName := strings.TrimSuffix(path, "/invoke")
+	if strings.TrimSpace(skillName) == "" {
+		http.Error(w, "skill name required in path", http.StatusBadRequest)
+		return
+	}
+
+	var body struct {
+		InvokedBy string `json:"invoked_by"`
+		Channel   string `json:"channel"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "invalid json", http.StatusBadRequest)
+		return
+	}
+
+	now := time.Now().UTC().Format(time.RFC3339)
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	sk := b.findSkillByNameLocked(skillName)
+	if sk == nil {
+		// Soft-404 (Layer 3 of skill-hallucination fix): include the
+		// active-skill slugs in the response body so the calling bot
+		// reads the actual catalog on the next turn instead of wasting
+		// another turn on another guess. Status code stays 404 so any
+		// existing client-side error UX still triggers; the catalog
+		// just rides along in the body. Mirror the locked-state read
+		// pattern by walking b.skills here rather than re-acquiring
+		// the mutex via ListActiveSkillSummaries (we already hold it).
+		available := make([]string, 0, len(b.skills))
+		for i := range b.skills {
+			if b.skills[i].Status != "active" {
+				continue
+			}
+			slug := skillSlug(b.skills[i].Name)
+			if slug == "" {
+				continue
+			}
+			available = append(available, slug)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"error":            "skill not found",
+			"requested":        skillName,
+			"available_skills": available,
+			"hint":             "Pass an exact slug from `available_skills`. If the list is empty, no skills exist yet — do not retry; proceed with the work directly. Skills are compiled from playbook articles in the wiki, not created ad hoc.",
+		})
+		return
+	}
+
+	// Security fix (Codex T3): only active skills may be invoked. Legacy
+	// proposed or archived skills must not be executable — proposed means
+	// never activated, archived means intentionally retired.
+	if sk.Status != "active" {
+		http.Error(w, "skill not active (status="+sk.Status+")", http.StatusForbidden)
+		return
+	}
+
+	sk.UsageCount++
+	sk.UpdatedAt = now
+
+	// Raw emptiness so the sk.Channel fallback can actually run: with the
+	// normalise first, an invoke with no body.Channel became "general" and the
+	// skill's OWN channel was never consulted. The final "general" default is an
+	// A_lobby site and is deliberately left for S3.
+	channel := ""
+	if raw := strings.TrimSpace(body.Channel); raw != "" {
+		channel = normalizeChannelSlug(raw)
+	}
+	if channel == "" && strings.TrimSpace(sk.Channel) != "" {
+		channel = normalizeChannelSlug(sk.Channel)
+	}
+	if channel == "" {
+		channel = "general"
+	}
+
+	invoker := strings.TrimSpace(body.InvokedBy)
+	if invoker == "" {
+		invoker = "you"
+	}
+	sk.LastExecutionAt = now
+	sk.LastExecutionStatus = "invoked"
+	sk.UpdatedAt = now
+
+	b.counter++
+	b.appendMessageLocked(channelMessage{
+		ID:        fmt.Sprintf("msg-%d", b.counter),
+		From:      invoker,
+		Channel:   channel,
+		Kind:      "skill_invocation",
+		Title:     sk.Title,
+		Content:   fmt.Sprintf("Skill %q invoked by @%s (usage #%d)", sk.Name, invoker, sk.UsageCount),
+		Timestamp: now,
+	})
+	b.appendActionLocked("skill_invocation", "office", channel, invoker, truncateSummary(sk.Title+" [invoked]", 140), sk.ID)
+
+	// Dispatch a real task so a bot picks up and executes the skill.
+	// This is best-effort: if task creation fails we log and carry on —
+	// the skill_invocation message + action are already recorded.
+	taskID, taskErr := b.createSkillRunTaskLocked(sk, channel, invoker, now)
+	if taskErr != nil {
+		log.Printf("handleInvokeSkill: createSkillRunTaskLocked failed (non-fatal): %v", taskErr)
+	}
+
+	if err := b.saveLocked(); err != nil {
+		http.Error(w, "failed to persist broker state", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	resp := map[string]any{"skill": *sk, "channel": channel}
+	if taskID != "" {
+		resp["task_id"] = taskID
+	}
+	_ = json.NewEncoder(w).Encode(resp)
+}
+
+// createSkillRunTaskLocked dispatches a task so the office lead picks up and
+// executes the skill. Caller must hold b.mu. Returns the new task ID.
+func (b *Broker) createSkillRunTaskLocked(sk *teamSkill, channel, invoker, now string) (string, error) {
+	owner := strings.TrimSpace(officeLeadSlugFrom(b.members))
+	if owner == "" {
+		owner = strings.TrimSpace(invoker)
+	}
+	if owner == "" {
+		owner = "cos"
+	}
+
+	title := strings.TrimSpace(sk.Title)
+	if title == "" {
+		title = strings.TrimSpace(sk.Name)
+	}
+	taskTitle := "Run skill: " + title
+
+	header := fmt.Sprintf("Invoked by @%s on %s. Follow the steps below.\n\n", invoker, now)
+	details := header + strings.TrimSpace(sk.Content)
+
+	b.counter++
+	task := teamTask{
+		ID:            fmt.Sprintf("task-skill-%d", b.counter),
+		Channel:       channel,
+		Title:         taskTitle,
+		Details:       details,
+		Owner:         owner,
+		status:        "in_progress",
+		CreatedBy:     invoker,
+		TaskType:      "skill_run",
+		PipelineID:    "skill_invocation",
+		ExecutionMode: "office",
+		CreatedAt:     now,
+		UpdatedAt:     now,
+	}
+
+	// Run fallible setup first so a failure doesn't leave the broker
+	// holding cross-cutting mutations (channel membership, scheduler
+	// jobs) that the caller never sees because we returned an error.
+	if err := rejectTheaterTaskForLiveBusiness(&task); err != nil {
+		return "", fmt.Errorf("rejectTheaterTask: %w", err)
+	}
+	if err := b.syncTaskWorktreeLocked(&task); err != nil {
+		return "", fmt.Errorf("syncTaskWorktree: %w", err)
+	}
+	// channel is A_lobby-sourced above and left alone; this only stops the
+	// promotion writing into a room that no longer exists once it can be empty.
+	if channel != "" {
+		b.ensureTaskOwnerChannelMembershipLocked(channel, task.Owner)
+	}
+	b.queueTaskBehindActiveOwnerLaneLocked(&task)
+	b.scheduleTaskLifecycleLocked(&task)
+	b.tasks = append(b.tasks, task)
+	b.appendActionLocked("task_created", "office", channel, invoker, truncateSummary(task.Title, 140), task.ID)
+	return task.ID, nil
+}
+
+// SeedDefaultSkills pre-populates the broker with the given skill specs.
+// It is idempotent: skills whose name already exists (by slug) are skipped.
+// No production callers remain; tests use it to set up broker skill state.
+func (b *Broker) SeedDefaultSkills(specs []bot.PackSkillSpec) {
+	if len(specs) == 0 {
+		return
+	}
+	now := time.Now().UTC().Format(time.RFC3339)
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for _, spec := range specs {
+		name := strings.TrimSpace(spec.Name)
+		if name == "" {
+			continue
+		}
+		if b.findSkillByNameLocked(name) != nil {
+			continue // already exists, skip
+		}
+		title := strings.TrimSpace(spec.Title)
+		if title == "" {
+			title = name
+		}
+		b.counter++
+		sk := teamSkill{
+			ID:          b.allocateSkillIDLocked(name),
+			Name:        name,
+			Title:       title,
+			Description: strings.TrimSpace(spec.Description),
+			Content:     strings.TrimSpace(spec.Content),
+			CreatedBy:   "system",
+			OwnerBots:   b.allMemberSlugsLocked(),
+			Tags:        append([]string(nil), spec.Tags...),
+			Trigger:     strings.TrimSpace(spec.Trigger),
+			Status:      "active",
+			CreatedAt:   now,
+			UpdatedAt:   now,
+		}
+		b.skills = append(b.skills, sk)
+	}
+	if err := b.saveLocked(); err != nil {
+		log.Printf("broker: saveLocked after seeding skills: %v", err)
+	}
+}

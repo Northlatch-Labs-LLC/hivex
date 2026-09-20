@@ -1,0 +1,645 @@
+package operations
+
+import (
+	"bytes"
+	"context"
+	"crypto/rand"
+	"embed"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"io"
+	"io/fs"
+	"net"
+	"net/http"
+	"net/url"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"sort"
+	"strings"
+	"time"
+
+	"golang.org/x/net/html"
+)
+
+// gettingStartedFS embeds the authored team/getting-started/ wiki pages so the
+// binary ships them. They are materialized into a brand-new workspace wiki at
+// the office-seed boundary (both the blueprint and scratch paths) so the office
+// is never empty: every founder lands in an office whose wiki already explains
+// how the office works. See docs/specs/office-onboarding-uplift.md section 5.
+//
+//go:embed resources/getting-started/*.md
+var gettingStartedFS embed.FS
+
+// gettingStartedEmbedDir is the directory prefix inside gettingStartedFS that
+// holds the embedded markdown pages.
+const gettingStartedEmbedDir = "resources/getting-started"
+
+// GettingStartedRelDir is the wiki-relative directory the getting-started pages
+// are materialized into. Exported so callers and tests can reference the exact
+// destination without re-deriving the path.
+const GettingStartedRelDir = "team/getting-started"
+
+// SeedGettingStarted materializes the embedded resources/getting-started/*.md
+// pages into wikiRoot/team/getting-started/. It mirrors the team/about/ seed
+// flow in SeedCompanyContext: each page is written skip-if-exists via
+// atomicWrite (temp-dir-then-rename) so a page authored by a prior seed is
+// never clobbered and a partial write is never visible. Returns the list of
+// wiki-relative paths newly written this call (empty when everything already
+// existed).
+//
+// Files are written in deterministic (sorted) filename order so the seed is
+// reproducible and the post-seed index/all.md ordering is stable.
+//
+// wikiRoot must be a non-empty path; callers gate this exactly like the
+// team/about/ seed (only run when a real wiki root is known).
+func SeedGettingStarted(wikiRoot string) ([]string, error) {
+	if strings.TrimSpace(wikiRoot) == "" {
+		return nil, fmt.Errorf("operations: SeedGettingStarted: empty wikiRoot")
+	}
+	// Clean the root at the public boundary so a caller-supplied path with
+	// embedded ".." segments cannot escape the intended wiki tree. The page
+	// names come from embed.FS (*.md literals) so they cannot traverse; this
+	// guards only the wikiRoot parameter.
+	wikiRoot = filepath.Clean(wikiRoot)
+
+	entries, err := fs.ReadDir(gettingStartedFS, gettingStartedEmbedDir)
+	if err != nil {
+		return nil, fmt.Errorf("operations: read embedded getting-started: %w", err)
+	}
+
+	names := make([]string, 0, len(entries))
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if !strings.HasSuffix(strings.ToLower(name), ".md") {
+			continue
+		}
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	if err := os.MkdirAll(filepath.Join(wikiRoot, "team", "getting-started"), 0o755); err != nil {
+		return nil, fmt.Errorf("operations: mkdir team/getting-started: %w", err)
+	}
+
+	var written []string
+	for _, name := range names {
+		relPath := "team/getting-started/" + name
+		finalPath := filepath.Join(wikiRoot, "team", "getting-started", name)
+		// Skip-if-exists: never overwrite a page a prior seed (or a human, or
+		// a bot enriching the section) already wrote. Mirrors the
+		// skip-if-exists guard on team/about/{README,company,owner}.md.
+		if _, statErr := os.Stat(finalPath); statErr == nil {
+			continue
+		} else if !os.IsNotExist(statErr) {
+			return nil, fmt.Errorf("operations: stat %s: %w", relPath, statErr)
+		}
+
+		data, readErr := gettingStartedFS.ReadFile(gettingStartedEmbedDir + "/" + name)
+		if readErr != nil {
+			return nil, fmt.Errorf("operations: read embedded %s: %w", name, readErr)
+		}
+		if err := atomicWrite(wikiRoot, relPath, data); err != nil {
+			return nil, err
+		}
+		written = append(written, relPath)
+	}
+
+	return written, nil
+}
+
+// safeUTF8Truncate returns s truncated to at most maxBytes bytes without
+// splitting a multi-byte UTF-8 sequence. If s fits, it is returned as-is.
+func safeUTF8Truncate(s string, maxBytes int) string {
+	if len(s) <= maxBytes {
+		return s
+	}
+	n := maxBytes
+	for n > 0 && s[n]&0xC0 == 0x80 {
+		n--
+	}
+	return s[:n]
+}
+
+// Completer is the minimal interface for one LLM completion call.
+// Defined locally to avoid import cycle with internal/provider.
+type Completer interface {
+	Complete(ctx context.Context, prompt string) (string, error)
+}
+
+// CompanySeedInput configures a SeedCompanyContext run.
+type CompanySeedInput struct {
+	WebsiteURL string
+	FilePaths  []string
+	// CompanyName is the user-supplied company name from onboarding
+	// (FormAnswers.CompanyName / config.CompanyName). Used to personalise
+	// the placeholder company.md so the seeded team/about/README links never
+	// dangle on day one even before the LLM extraction (which can fail or
+	// be skipped) has populated a real CompanyProfile. May be empty.
+	CompanyName string
+	OwnerName   string
+	OwnerRole   string
+	Completer   Completer
+	WikiRoot    string
+}
+
+// CompanySeedResult summarizes what SeedCompanyContext did.
+type CompanySeedResult struct {
+	Profile         CompanyProfile
+	ArticlesWritten []string
+	Facts           []string
+	Warnings        []string
+	// NeedsRetry is true when a transient external step (URL fetch, LLM
+	// extraction, JSON parse) failed. Callers that track retry intent
+	// (e.g. PendingCompanySeed) should re-arm when this is set.
+	NeedsRetry bool
+}
+
+// SeedCompanyContext fetches or reads content, runs LLM extraction, and
+// writes wiki articles under WikiRoot/team/about/.
+func SeedCompanyContext(ctx context.Context, input CompanySeedInput) (*CompanySeedResult, error) {
+	result := &CompanySeedResult{}
+	var contentBuf strings.Builder
+
+	// 1. Fetch URL
+	if input.WebsiteURL != "" {
+		u, err := url.Parse(input.WebsiteURL)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
+			result.Warnings = append(result.Warnings, "skipped URL: must be http or https")
+		} else {
+			text, err := fetchURL(ctx, input.WebsiteURL)
+			if err != nil {
+				result.Warnings = append(result.Warnings, fmt.Sprintf("URL fetch failed: %v", err))
+				result.NeedsRetry = true
+			} else {
+				contentBuf.WriteString(text)
+				contentBuf.WriteString("\n")
+			}
+		}
+	}
+
+	// 2. Extract file content
+	const maxFilePaths = 20
+	filePaths := input.FilePaths
+	if len(filePaths) > maxFilePaths {
+		result.Warnings = append(result.Warnings, fmt.Sprintf("too many files (%d); processing first %d", len(filePaths), maxFilePaths))
+		filePaths = filePaths[:maxFilePaths]
+	}
+	for _, path := range filePaths {
+		var (
+			text string
+			err  error
+		)
+		if strings.HasSuffix(strings.ToLower(path), ".pdf") {
+			text, err = extractPDF(ctx, path, &result.Warnings)
+			if err != nil {
+				result.Warnings = append(result.Warnings, err.Error())
+				continue
+			}
+		} else {
+			f, readErr := os.Open(path)
+			if readErr != nil {
+				result.Warnings = append(result.Warnings, fmt.Sprintf("read file %s: %v", path, readErr))
+				continue
+			}
+			raw, readErr := io.ReadAll(io.LimitReader(f, 8192))
+			_ = f.Close()
+			if readErr != nil {
+				result.Warnings = append(result.Warnings, fmt.Sprintf("read file %s: %v", path, readErr))
+				continue
+			}
+			text = string(raw)
+		}
+		contentBuf.WriteString(text)
+		contentBuf.WriteString("\n")
+	}
+
+	// 3. Build wiki dirs
+	if err := os.MkdirAll(filepath.Join(input.WikiRoot, "team", "about"), 0o755); err != nil {
+		return nil, fmt.Errorf("operations: mkdir team/about: %w", err)
+	}
+
+	// 4. Write README (skip if exists)
+	readmePath := filepath.Join(input.WikiRoot, "team", "about", "README.md")
+	if _, err := os.Stat(readmePath); os.IsNotExist(err) {
+		if err := atomicWrite(input.WikiRoot, "team/about/README.md", []byte(aboutReadmeContent)); err != nil {
+			return nil, err
+		}
+	}
+
+	// 4a. Seed placeholder company.md and owner.md so the links the README
+	// just promised always resolve. Both files are written skip-if-exists so
+	// a real article populated by a prior seed (or by steps 5 and 7 below in
+	// this run) is never overwritten. See issue #946.
+	companyPath := filepath.Join(input.WikiRoot, "team", "about", "company.md")
+	if _, err := os.Stat(companyPath); os.IsNotExist(err) {
+		if err := atomicWrite(input.WikiRoot, "team/about/company.md",
+			[]byte(buildCompanyPlaceholderMD(input.CompanyName))); err != nil {
+			return nil, err
+		}
+	}
+	ownerPath := filepath.Join(input.WikiRoot, "team", "about", "owner.md")
+	if _, err := os.Stat(ownerPath); os.IsNotExist(err) {
+		if err := atomicWrite(input.WikiRoot, "team/about/owner.md",
+			[]byte(buildOwnerPlaceholderMD(input.OwnerName, input.OwnerRole))); err != nil {
+			return nil, err
+		}
+	}
+
+	// 5. Write owner.md (skip if both empty) — does not depend on content.
+	if strings.TrimSpace(input.OwnerName) != "" || strings.TrimSpace(input.OwnerRole) != "" {
+		ownerMD := buildOwnerMD(input.OwnerName, input.OwnerRole)
+		if err := atomicWrite(input.WikiRoot, "team/about/owner.md", []byte(ownerMD)); err != nil {
+			return nil, err
+		}
+		result.ArticlesWritten = append(result.ArticlesWritten, "team/about/owner.md")
+	}
+
+	// 6. LLM extraction (skip if no completer or no content)
+	content := contentBuf.String()
+	if input.Completer != nil && strings.TrimSpace(content) != "" {
+		content = safeUTF8Truncate(content, 32*1024)
+		raw, err := runExtraction(ctx, input.Completer, content)
+		if err != nil {
+			result.Warnings = append(result.Warnings, fmt.Sprintf("LLM extraction failed: %v", err))
+			result.NeedsRetry = true
+		} else {
+			profile, facts, err := parseExtraction(raw)
+			if err != nil {
+				result.Warnings = append(result.Warnings, fmt.Sprintf("LLM parse failed: %v", err))
+				result.NeedsRetry = true
+			} else {
+				result.Profile = profile
+				result.Facts = facts
+				if input.WebsiteURL != "" {
+					result.Profile.Website = input.WebsiteURL
+				}
+			}
+		}
+	}
+
+	// 7. Write company.md
+	if result.Profile.Name != "" || result.Profile.Description != "" {
+		companyMD := buildCompanyMD(result.Profile)
+		if err := atomicWrite(input.WikiRoot, "team/about/company.md", []byte(companyMD)); err != nil {
+			return nil, err
+		}
+		result.ArticlesWritten = append(result.ArticlesWritten, "team/about/company.md")
+	}
+
+	return result, nil
+}
+
+// assertPublicHost resolves host and rejects loopback, private, and
+// link-local addresses to prevent SSRF against local services or metadata APIs.
+func assertPublicHost(ctx context.Context, host string) error {
+	hostname, _, err := net.SplitHostPort(host)
+	if err != nil {
+		hostname = host
+	}
+	addrs, err := net.DefaultResolver.LookupHost(ctx, hostname)
+	if err != nil {
+		return fmt.Errorf("cannot resolve %q: %w", hostname, err)
+	}
+	for _, addr := range addrs {
+		ip := net.ParseIP(addr)
+		if ip == nil {
+			continue
+		}
+		if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() ||
+			ip.Equal(net.ParseIP("169.254.169.254")) {
+			return fmt.Errorf("host %q resolves to non-public address %s", hostname, addr)
+		}
+	}
+	return nil
+}
+
+// fetchURL retrieves the text content of the given URL by walking the HTML
+// parse tree and collecting text from block-level nodes. Truncates to 4096 bytes.
+func fetchURL(ctx context.Context, urlStr string) (string, error) {
+	u, err := url.Parse(urlStr)
+	if err != nil {
+		return "", fmt.Errorf("fetch URL parse: %w", err)
+	}
+	if err := assertPublicHost(ctx, u.Host); err != nil {
+		return "", err
+	}
+	client := &http.Client{
+		Timeout: 10 * time.Second,
+		CheckRedirect: func(req *http.Request, _ []*http.Request) error {
+			return assertPublicHost(req.Context(), req.URL.Host)
+		},
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, urlStr, nil)
+	if err != nil {
+		return "", fmt.Errorf("fetch URL build request: %w", err)
+	}
+	req.Header.Set("User-Agent", "hivex-seed/1.0")
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("fetch URL: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", fmt.Errorf("fetch URL: status %d", resp.StatusCode)
+	}
+
+	doc, err := html.Parse(io.LimitReader(resp.Body, 2*1024*1024))
+	if err != nil {
+		return "", fmt.Errorf("parse HTML: %w", err)
+	}
+
+	var buf bytes.Buffer
+	var walk func(*html.Node)
+	walk = func(n *html.Node) {
+		if n.Type == html.ElementNode {
+			switch n.Data {
+			case "p", "h1", "h2", "h3", "h4", "h5", "h6", "li":
+				var textBuf bytes.Buffer
+				collectText(n, &textBuf)
+				line := strings.TrimSpace(textBuf.String())
+				if line != "" {
+					buf.WriteString(line)
+					buf.WriteString("\n")
+				}
+				return
+			case "script", "style", "noscript":
+				return
+			}
+		}
+		for c := n.FirstChild; c != nil; c = c.NextSibling {
+			walk(c)
+		}
+	}
+	walk(doc)
+
+	return safeUTF8Truncate(buf.String(), 4096), nil
+}
+
+// collectText recursively extracts text nodes from the HTML tree.
+func collectText(n *html.Node, buf *bytes.Buffer) {
+	if n.Type == html.TextNode {
+		buf.WriteString(n.Data)
+	}
+	for c := n.FirstChild; c != nil; c = c.NextSibling {
+		collectText(c, buf)
+	}
+}
+
+// extractPDF extracts text from a PDF file using pdftotext (poppler).
+// warnings receives non-fatal issues (e.g. non-zero exit with partial output).
+func extractPDF(ctx context.Context, path string, warnings *[]string) (string, error) {
+	if _, err := exec.LookPath("pdftotext"); err != nil {
+		return "", fmt.Errorf("skipped %s: pdftotext not installed; install poppler (brew install poppler on macOS)", path)
+	}
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "pdftotext", "-layout", path, "-")
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return "", fmt.Errorf("pdftotext pipe %s: %w", path, err)
+	}
+	if err := cmd.Start(); err != nil {
+		return "", fmt.Errorf("pdftotext start %s: %w", path, err)
+	}
+	data, err := io.ReadAll(io.LimitReader(stdout, 8192))
+	waitErr := cmd.Wait()
+	if err != nil {
+		return "", fmt.Errorf("read pdftotext output: %w", err)
+	}
+	if waitErr != nil {
+		if len(data) > 0 {
+			*warnings = append(*warnings, fmt.Sprintf("pdftotext %s exit non-zero: %v", path, waitErr))
+			return string(data), nil
+		}
+		return "", fmt.Errorf("pdftotext %s exit: %w", path, waitErr)
+	}
+	return string(data), nil
+}
+
+// runExtraction calls the LLM completer with a structured extraction prompt.
+func runExtraction(ctx context.Context, completer Completer, content string) (string, error) {
+	prompt := `Extract company context from the content below. Output ONLY valid JSON with
+no markdown fences, no explanation, no commentary before or after:
+{"company_name":"...","description":"...","industry":"...","audience":"...",
+ "goals":"...","key_facts":["fact 1","fact 2",...]}
+key_facts: max 8 short factual bullets. Empty string for unknown fields.
+
+Content:
+` + content
+	return completer.Complete(ctx, prompt)
+}
+
+type extractionPayload struct {
+	CompanyName string   `json:"company_name"`
+	Description string   `json:"description"`
+	Industry    string   `json:"industry"`
+	Audience    string   `json:"audience"`
+	Goals       string   `json:"goals"`
+	KeyFacts    []string `json:"key_facts"`
+}
+
+// parseExtraction strips JSON fences from the raw LLM output and unmarshals it.
+func parseExtraction(raw string) (CompanyProfile, []string, error) {
+	raw = strings.TrimSpace(raw)
+	// Strip common LLM JSON fence opening (```json, ```JSON, ``` etc.).
+	// Find the first newline to drop the entire opening fence line.
+	if strings.HasPrefix(raw, "```") {
+		if nl := strings.IndexByte(raw, '\n'); nl != -1 {
+			raw = raw[nl+1:]
+		} else {
+			raw = raw[3:]
+		}
+		if idx := strings.LastIndex(raw, "```"); idx != -1 {
+			raw = raw[:idx]
+		}
+	}
+	raw = strings.TrimSpace(raw)
+
+	var payload extractionPayload
+	if err := json.Unmarshal([]byte(raw), &payload); err != nil {
+		return CompanyProfile{}, nil, fmt.Errorf("unmarshal extraction: %w", err)
+	}
+
+	profile := CompanyProfile{
+		Name:        payload.CompanyName,
+		Description: payload.Description,
+		Industry:    payload.Industry,
+		Audience:    payload.Audience,
+	}
+	if payload.Goals != "" {
+		profile.Notes = []string{payload.Goals}
+	}
+
+	return profile, payload.KeyFacts, nil
+}
+
+// atomicWrite writes data to wikiRoot/relPath using a temp-dir-then-rename
+// pattern so partial writes are never visible. Follows the same pattern as
+// makeWikiTempDir in wiki_materialize.go.
+func atomicWrite(wikiRoot, relPath string, data []byte) error {
+	buf := make([]byte, 8)
+	if _, err := rand.Read(buf); err != nil {
+		return fmt.Errorf("operations: atomicWrite token: %w", err)
+	}
+	name := fmt.Sprintf(".wiki.tmp.%s", hex.EncodeToString(buf))
+	tempDir := filepath.Join(wikiRoot, name)
+	if err := os.MkdirAll(tempDir, 0o755); err != nil {
+		return fmt.Errorf("operations: atomicWrite tempdir %q: %w", tempDir, err)
+	}
+	defer func() { _ = os.RemoveAll(tempDir) }()
+
+	stagePath := filepath.Join(tempDir, relPath)
+	if err := os.MkdirAll(filepath.Dir(stagePath), 0o755); err != nil {
+		return fmt.Errorf("operations: atomicWrite stage dir: %w", err)
+	}
+	if err := os.WriteFile(stagePath, data, 0o644); err != nil {
+		return fmt.Errorf("operations: atomicWrite write stage: %w", err)
+	}
+
+	finalPath := filepath.Join(wikiRoot, relPath)
+	if err := os.Rename(stagePath, finalPath); err != nil {
+		return fmt.Errorf("operations: atomicWrite rename to %q: %w", finalPath, err)
+	}
+	return nil
+}
+
+// buildCompanyMD renders a markdown article for the company profile.
+func buildCompanyMD(profile CompanyProfile) string {
+	var sb strings.Builder
+	name := strings.TrimSpace(profile.Name)
+	if name == "" {
+		name = "Company"
+	}
+	sb.WriteString(fmt.Sprintf("# %s\n\n", name))
+	if d := strings.TrimSpace(profile.Description); d != "" {
+		sb.WriteString(fmt.Sprintf("%s\n\n", d))
+	}
+	if w := strings.TrimSpace(profile.Website); w != "" {
+		sb.WriteString(fmt.Sprintf("**Website:** %s\n\n", w))
+	}
+	if ind := strings.TrimSpace(profile.Industry); ind != "" {
+		sb.WriteString(fmt.Sprintf("**Industry:** %s\n\n", ind))
+	}
+	if aud := strings.TrimSpace(profile.Audience); aud != "" {
+		sb.WriteString(fmt.Sprintf("**Audience:** %s\n\n", aud))
+	}
+	if len(profile.Notes) > 0 {
+		for _, n := range profile.Notes {
+			if n = strings.TrimSpace(n); n != "" {
+				sb.WriteString(fmt.Sprintf("**Goals:** %s\n\n", n))
+			}
+		}
+	}
+	return sb.String()
+}
+
+// buildCompanyPlaceholderMD renders the initial company.md body written when
+// the team/about/ section is first seeded, so the link from README.md always
+// resolves even before LLM extraction has populated a real CompanyProfile.
+// It is overwritten by buildCompanyMD as soon as a real profile is available.
+//
+// The TODO comment is intentional — it tells the next human or bot reader
+// that this file is a stub waiting to be filled in. See issue #946.
+func buildCompanyPlaceholderMD(name string) string {
+	displayName := strings.TrimSpace(name)
+	if displayName == "" {
+		displayName = "This company"
+	}
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("# %s\n\n", displayName))
+	sb.WriteString("<!-- TODO: replace this placeholder with a short description of what the company does, who it serves, and what the current focus is. The Chief of Staff-onboarding scan or any bot with `wiki.write` permission can rewrite this file. -->\n\n")
+	sb.WriteString("This article will hold a short description of what the company does, who it serves, and what the current focus is. It is a placeholder so the link from `README.md` resolves on day one; the scan or any bot can rewrite it with the real profile.\n")
+	return sb.String()
+}
+
+// buildOwnerPlaceholderMD renders the initial owner.md body written when the
+// team/about/ section is first seeded. Mirrors buildCompanyPlaceholderMD: it
+// exists so the link from README.md never dangles, and is overwritten by
+// buildOwnerMD once a real name or role is collected.
+func buildOwnerPlaceholderMD(name, role string) string {
+	displayName := strings.TrimSpace(name)
+	if displayName == "" {
+		displayName = "Workspace owner"
+	}
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("# %s\n\n", displayName))
+	if r := strings.TrimSpace(role); r != "" {
+		sb.WriteString(fmt.Sprintf("**Role:** %s\n\n", r))
+	}
+	sb.WriteString("<!-- TODO: replace this placeholder with a short profile of the person running this workspace — name, role, and how bots should escalate to them. -->\n\n")
+	sb.WriteString("This article will hold a short profile of the person running this workspace and how bots should escalate to them. It is a placeholder so the link from `README.md` resolves on day one.\n")
+	return sb.String()
+}
+
+// buildOwnerMD renders a markdown article for the workspace owner.
+func buildOwnerMD(name, role string) string {
+	var sb strings.Builder
+	displayName := strings.TrimSpace(name)
+	if displayName == "" {
+		displayName = "Owner"
+	}
+	sb.WriteString(fmt.Sprintf("# %s\n\n", displayName))
+	if r := strings.TrimSpace(role); r != "" {
+		sb.WriteString(fmt.Sprintf("**Role:** %s\n\n", r))
+	}
+	return sb.String()
+}
+
+// aboutReadmeContent is the README placed in the team/about/ wiki section.
+const aboutReadmeContent = `# About This Team
+
+> **For agents reading this section:** The articles here describe the humans
+> and company that own and operate this hivebot workspace. This is not information
+> about external clients, customers, or contacts — that context lives elsewhere
+> in the wiki. Use this section to understand who you are working for and what
+> their goals are.
+
+- [company.md](company.md) — what this company does
+- [owner.md](owner.md) — who is running this workspace
+`
+
+// AboutReadmeContent returns the canonical README body for the team/about/
+// wiki section. Exported so the scratch-path seeder (which does not run the
+// website-scan pipeline) can drop the same shared skeleton README that
+// SeedCompanyContext writes on the with-website path.
+func AboutReadmeContent() string { return aboutReadmeContent }
+
+// AboutScratchCompanyMD returns a placeholder team/about/company.md body for
+// the skip-website scratch path. It seeds whatever onboarding captured
+// (company name + short description) so the wiki has a usable starting
+// article; bots enriching this article later can replace the body in place.
+func AboutScratchCompanyMD(companyName, description string) string {
+	name := strings.TrimSpace(companyName)
+	if name == "" {
+		name = "Company"
+	}
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("# %s\n\n", name))
+	if d := strings.TrimSpace(description); d != "" {
+		sb.WriteString(fmt.Sprintf("%s\n\n", d))
+	}
+	sb.WriteString("_No website was scanned during onboarding. Fill in details about the company here, or ask a bot to research and enrich this article._\n")
+	return sb.String()
+}
+
+// AboutScratchOwnerMD returns a placeholder team/about/owner.md body for the
+// skip-website scratch path. Mirrors the buildOwnerMD shape used by the
+// website-scan path so the two surfaces stay structurally identical.
+func AboutScratchOwnerMD(ownerName, ownerRole string) string {
+	name := strings.TrimSpace(ownerName)
+	if name == "" {
+		name = "Owner"
+	}
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("# %s\n\n", name))
+	if r := strings.TrimSpace(ownerRole); r != "" {
+		sb.WriteString(fmt.Sprintf("**Role:** %s\n\n", r))
+	}
+	sb.WriteString("_Add details about who is running this workspace here._\n")
+	return sb.String()
+}
