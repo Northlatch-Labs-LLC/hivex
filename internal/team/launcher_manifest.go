@@ -1,0 +1,132 @@
+package team
+
+// launcher_manifest.go owns the manifest + onboarding helpers
+// (PLAN.md §C14). isOnboarded probes config.json for runtime
+// presence; resetManifestToPack/Blueprint rewrites the local
+// office.yaml when the user switches packs/blueprints;
+// resolveRepoRoot finds the project root by walking up for go.mod
+// or templates/; loadRunningSessionMode queries the running broker
+// for its session mode (used by ResetSession). Split out of
+// launcher.go because these helpers operate on filesystem +
+// running broker state rather than Launcher fields.
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"github.com/Northlatch-Labs-LLC/hivex/internal/bot"
+	"github.com/Northlatch-Labs-LLC/hivex/internal/company"
+	"github.com/Northlatch-Labs-LLC/hivex/internal/onboarding"
+)
+
+// isOnboarded reports whether the user has completed the onboarding wizard.
+// Any error loading state is treated as not-onboarded so a corrupt or
+// missing ~/.hivex/onboarded.json still lets the web UI boot into the
+// wizard rather than failing at preflight.
+func isOnboarded() bool {
+	s, err := onboarding.Load()
+	if err != nil || s == nil {
+		return false
+	}
+	return s.Onboarded()
+}
+
+// resetManifestToPack overwrites company.json with the members defined in the
+// given legacy pack. Called when the user passes --pack explicitly so the flag
+// remains authoritative over any previously saved company configuration.
+func resetManifestToPack(pack *bot.PackDefinition) error {
+	members := make([]company.MemberSpec, 0, len(pack.Bots))
+	for _, cfg := range pack.Bots {
+		members = append(members, company.MemberSpec{
+			Slug:         cfg.Slug,
+			Name:         cfg.Name,
+			Role:         cfg.Name,
+			Expertise:    append([]string(nil), cfg.Expertise...),
+			Personality:  cfg.Personality,
+			AllowedTools: append([]string(nil), cfg.AllowedTools...),
+			System:       cfg.Slug == pack.LeadSlug || cfg.Slug == "cos",
+		})
+	}
+	manifest := company.Manifest{
+		Name:    pack.Name,
+		Lead:    pack.LeadSlug,
+		Members: members,
+	}
+	return company.SaveManifest(manifest)
+}
+
+func resetManifestToOperationBlueprint(repoRoot, blueprintID string) error {
+	manifest := company.Manifest{
+		BlueprintRefs: []company.BlueprintRef{{
+			Kind:   "operation",
+			ID:     blueprintID,
+			Source: "launcher",
+		}},
+	}
+	resolved, ok := company.MaterializeManifest(manifest, repoRoot)
+	if !ok {
+		return fmt.Errorf("materialize operation blueprint %q", blueprintID)
+	}
+	return company.SaveManifest(resolved)
+}
+
+func resolveRepoRoot(start string) string {
+	start = strings.TrimSpace(start)
+	if start == "" {
+		start = "."
+	}
+	current := start
+	for {
+		if _, err := os.Stat(filepath.Join(current, "go.mod")); err == nil {
+			return current
+		}
+		if _, err := os.Stat(filepath.Join(current, "templates")); err == nil {
+			return current
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return start
+		}
+		current = parent
+	}
+}
+
+func loadRunningSessionMode() (string, string) {
+	token := strings.TrimSpace(os.Getenv("HIVEX_BROKER_TOKEN"))
+	if token == "" {
+		return SessionModeOffice, DefaultOneOnOneBot
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, brokerBaseURL()+"/session-mode", nil)
+	if err != nil {
+		return SessionModeOffice, DefaultOneOnOneBot
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	client := &http.Client{Timeout: time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return SessionModeOffice, DefaultOneOnOneBot
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return SessionModeOffice, DefaultOneOnOneBot
+	}
+
+	var result struct {
+		SessionMode string `json:"session_mode"`
+		OneOnOneBot string `json:"one_on_one_agent"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return SessionModeOffice, DefaultOneOnOneBot
+	}
+	return NormalizeSessionMode(result.SessionMode), NormalizeOneOnOneBot(result.OneOnOneBot)
+}

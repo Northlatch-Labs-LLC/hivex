@@ -1,0 +1,17 @@
+{
+  "$schema": "https://wails.io/schemas/config.v2.json",
+  "name": "HIVEX",
+  "outputfilename": "HIVEX",
+  "frontend:install": "",
+  "frontend:build": "",
+  "author": {
+    "name": "Hive",
+    "email": ""
+  },
+  "info": {
+    "companyName": "Hive",
+    "productName": "hivebot",
+    "productVersion": "0.0.0",
+    "comments": "hivebot desktop shell (Wails) — in-process broker spike"
+  }
+}

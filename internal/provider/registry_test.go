@@ -1,0 +1,210 @@
+package provider_test
+
+import (
+	"context"
+	"errors"
+	"testing"
+	"time"
+
+	"github.com/Northlatch-Labs-LLC/hivex/internal/bot"
+	"github.com/Northlatch-Labs-LLC/hivex/internal/provider"
+	"github.com/Northlatch-Labs-LLC/hivex/internal/providertest"
+)
+
+// TestRegistry_FakeKindRoutesEverywhere is the epicentric red test for the
+// provider Registry: register a fake Kind, set it as the active provider, and
+// confirm that BOTH the streaming resolver and the one-shot dispatcher route
+// to the fake — not to claude-code's default fallback.
+//
+// Before the Registry exists, this test fails because:
+//   - resolver.go has a hardcoded switch that knows only "claude-code"/"codex"
+//     and falls through to CreateClaudeCodeStreamFn for unknown values.
+//   - oneshot.go has the same closed switch, falling through to RunClaudeOneShot.
+//
+// After the Registry exists and resolver+oneshot dispatch through it, the fake's
+// StreamFn and OneShot are invoked and the assertions pass.
+func TestRegistry_FakeKindRoutesEverywhere(t *testing.T) {
+	const fakeKind = "hivex-test-fake-provider"
+
+	var streamFnHits, oneShotHits int
+	providertest.RegisterForTest(t, &provider.Entry{
+		Kind: fakeKind,
+		StreamFn: func(slug string) bot.StreamFn {
+			return func([]bot.Message, []bot.BotTool) <-chan bot.StreamChunk {
+				streamFnHits++
+				ch := make(chan bot.StreamChunk)
+				close(ch)
+				return ch
+			}
+		},
+		OneShot: func(systemPrompt, prompt, cwd string) (string, error) {
+			oneShotHits++
+			return "fake-oneshot-result", nil
+		},
+		Capabilities: provider.Capabilities{SupportsOneShot: true},
+	})
+
+	t.Setenv("HIVEX_LLM_PROVIDER", fakeKind)
+
+	// Path 1: streaming resolver.
+	fn := provider.DefaultStreamFnResolver(nil)("agent-slug")
+	if fn == nil {
+		t.Fatal("resolver returned nil StreamFn for registered fake kind")
+	}
+	for range fn(nil, nil) {
+		// drain
+	}
+	if streamFnHits == 0 {
+		t.Fatal("streaming resolver did not route to fake provider via Registry — still hardcoded switch?")
+	}
+
+	// Path 2: one-shot dispatch.
+	out, err := provider.RunConfiguredOneShot("sys", "prompt", "/tmp")
+	if err != nil {
+		t.Fatalf("RunConfiguredOneShot returned error: %v", err)
+	}
+	if out != "fake-oneshot-result" {
+		t.Fatalf("RunConfiguredOneShot returned %q, want %q — did not route to fake via Registry",
+			out, "fake-oneshot-result")
+	}
+	if oneShotHits == 0 {
+		t.Fatal("one-shot dispatcher did not route to fake provider via Registry")
+	}
+}
+
+func TestRunConfiguredOneShotCtxRoutesContextToProvider(t *testing.T) {
+	const fakeKind = "hivex-test-context-provider"
+
+	started := make(chan context.Context, 1)
+	providertest.RegisterForTest(t, &provider.Entry{
+		Kind: fakeKind,
+		StreamFn: func(slug string) bot.StreamFn {
+			return func([]bot.Message, []bot.BotTool) <-chan bot.StreamChunk {
+				ch := make(chan bot.StreamChunk)
+				close(ch)
+				return ch
+			}
+		},
+		OneShotCtx: func(ctx context.Context, systemPrompt, prompt, cwd string) (string, error) {
+			started <- ctx
+			<-ctx.Done()
+			return "", ctx.Err()
+		},
+		Capabilities: provider.Capabilities{SupportsOneShot: true},
+	})
+
+	t.Setenv("HIVEX_LLM_PROVIDER", fakeKind)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := provider.RunConfiguredOneShotCtx(ctx, "sys", "prompt", "/tmp")
+		errCh <- err
+	}()
+
+	select {
+	case gotCtx := <-started:
+		if gotCtx != ctx {
+			t.Fatal("RunConfiguredOneShotCtx did not pass the caller context to provider")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for context-aware provider call")
+	}
+
+	cancel()
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("RunConfiguredOneShotCtx error = %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for cancelled provider call")
+	}
+}
+
+// TestRegistry_LookupReturnsNilForUnknown documents that a non-registered Kind
+// returns nil so dispatchers know to fall back to a default (claude-code).
+func TestRegistry_LookupReturnsNilForUnknown(t *testing.T) {
+	if e := provider.Lookup("hivex-never-registered-kind"); e != nil {
+		t.Fatalf("Lookup returned non-nil entry %+v for unregistered kind", e)
+	}
+}
+
+// TestStreamFnResolver_PerAgentKindOverridesInstallWide is the epicentric red
+// test for P0.3: a per-bot ProviderBinding must take priority over the
+// install-wide default when the streaming resolver routes a turn.
+//
+// Today the resolver ignores its botSlug argument and reads only
+// config.ResolveLLMProvider, so an Ollama-bound bot on a claude-default
+// install gets routed to claude — the broker's per-bot ProviderBinding
+// data layer (broker.MemberProviderKind / memberEffectiveProviderKind in
+// the launcher) doesn't reach the StreamFn dispatch.
+//
+// The fix threads an optional ProviderKindResolver through
+// DefaultStreamFnResolver. When set, the per-bot kind wins; when nil,
+// resolution falls back to the install-wide ResolveLLMProvider.
+func TestStreamFnResolver_PerAgentKindOverridesInstallWide(t *testing.T) {
+	const installKind = "hivex-test-install-wide-kind"
+	const botKind = "hivex-test-per-agent-kind"
+
+	var installHits, botHits int
+	providertest.RegisterForTest(t, &provider.Entry{
+		Kind: installKind,
+		StreamFn: func(slug string) bot.StreamFn {
+			return func([]bot.Message, []bot.BotTool) <-chan bot.StreamChunk {
+				installHits++
+				ch := make(chan bot.StreamChunk)
+				close(ch)
+				return ch
+			}
+		},
+	})
+	providertest.RegisterForTest(t, &provider.Entry{
+		Kind: botKind,
+		StreamFn: func(slug string) bot.StreamFn {
+			return func([]bot.Message, []bot.BotTool) <-chan bot.StreamChunk {
+				botHits++
+				ch := make(chan bot.StreamChunk)
+				close(ch)
+				return ch
+			}
+		},
+	})
+
+	t.Setenv("HIVEX_LLM_PROVIDER", installKind)
+
+	kindResolver := func(slug string) string {
+		if slug == "agent-on-per-agent-binding" {
+			return botKind
+		}
+		return "" // empty → fall back to install-wide
+	}
+
+	resolver := provider.DefaultStreamFnResolver(kindResolver)
+
+	// Bot with a per-bot binding routes to botKind, not installKind.
+	for range resolver("agent-on-per-agent-binding")(nil, nil) {
+	}
+	if botHits != 1 || installHits != 0 {
+		t.Fatalf("per-bot override did not take priority: botHits=%d installHits=%d", botHits, installHits)
+	}
+
+	// Bot without a per-bot binding falls back to install-wide kind.
+	for range resolver("agent-using-install-default")(nil, nil) {
+	}
+	if installHits != 1 {
+		t.Fatalf("fallback to install-wide kind did not work: installHits=%d", installHits)
+	}
+}
+
+// TestRegistry_BuiltinsRegistered ensures the package's init() registers the
+// shipped providers so external callers (resolver, oneshot, future capability
+// checks) can rely on Lookup("claude-code") and Lookup("codex").
+func TestRegistry_BuiltinsRegistered(t *testing.T) {
+	for _, kind := range []string{provider.KindClaudeCode, provider.KindCodex} {
+		if e := provider.Lookup(kind); e == nil {
+			t.Errorf("builtin Kind %q not registered — init() missing or out of order", kind)
+		}
+	}
+}

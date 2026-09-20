@@ -1,0 +1,1479 @@
+package team
+
+import (
+	"errors"
+	"fmt"
+	"log"
+	"net/http"
+	"strings"
+	"time"
+)
+
+type TaskMutationErrorKind string
+
+const (
+	TaskMutationInvalid        TaskMutationErrorKind = "invalid"
+	TaskMutationForbidden      TaskMutationErrorKind = "forbidden"
+	TaskMutationNotFound       TaskMutationErrorKind = "not_found"
+	TaskMutationConflict       TaskMutationErrorKind = "conflict"
+	TaskMutationWorktreeFailed TaskMutationErrorKind = "worktree_failed"
+	TaskMutationPersistFailed  TaskMutationErrorKind = "persist_failed"
+	// TaskMutationVerificationFailed marks a complete/approve blocked by a
+	// failing definition-of-done check (task_verification.go, U1.1).
+	TaskMutationVerificationFailed TaskMutationErrorKind = "verification_failed"
+	// TaskMutationArtifactRequired marks a mutation that would land a task
+	// with a Definition in done without a delivered artifact on record
+	// (core-loop B1, task_completion_hook.go). Pass artifact_path on the
+	// completing call to clear it.
+	TaskMutationArtifactRequired TaskMutationErrorKind = "artifact_required"
+)
+
+type TaskMutationError struct {
+	Kind    TaskMutationErrorKind
+	Message string
+	Cause   error
+}
+
+func (e *TaskMutationError) Error() string {
+	if e == nil {
+		return ""
+	}
+	return e.Message
+}
+
+func (e *TaskMutationError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Cause
+}
+
+func taskMutationError(kind TaskMutationErrorKind, message string, cause error) error {
+	return &TaskMutationError{Kind: kind, Message: message, Cause: cause}
+}
+
+// ErrHumanObjectionOpen marks an approve blocked by an open human
+// request-changes objection on the decision-endpoint path
+// (recordTaskDecisionInternal). The HTTP handler maps it to 409.
+var ErrHumanObjectionOpen = errors.New("human objection open")
+
+// taskObjectionActor normalizes the attribution slug stored on a
+// TaskReviewObjection. An empty actor is the local operator (the same
+// convention checkTaskActionAuthLocked uses), attributed as "human".
+func taskObjectionActor(actor string) string {
+	actor = strings.TrimSpace(actor)
+	if actor == "" {
+		return "human"
+	}
+	return actor
+}
+
+// isInternalTaskActor reports whether the actor slug is one of the broker's
+// internal recovery identities (auto-resolve safety net, self-heal, intake
+// driver, migrations). These are exempt from the pre-start gates: they own
+// legacy fold-in paths that must be able to park state. The empty slug is
+// the local operator convention (same as checkTaskActionAuthLocked).
+func isInternalTaskActor(actor string) bool {
+	switch strings.ToLower(strings.TrimSpace(actor)) {
+	case "", "system", "broker":
+		return true
+	}
+	return false
+}
+
+// humanObjectionOpenMessage names the open objection in the forbidden
+// error so the blocked bot knows exactly whose "no" stands and how to
+// proceed (revise + resubmit, then wait for the human).
+func humanObjectionOpenMessage(taskID, action string, obj *TaskReviewObjection) string {
+	excerpt := strings.TrimSpace(obj.Body)
+	if len(excerpt) > 280 {
+		excerpt = excerpt[:277] + "..."
+	}
+	msg := fmt.Sprintf("cannot %s %s: an open human objection stands — @%s requested changes at %s", action, taskID, obj.Actor, obj.At)
+	if excerpt != "" {
+		msg += fmt.Sprintf(": %q", excerpt)
+	}
+	msg += ". Only the human can approve or complete this task while their objection is open. Address the feedback, resubmit with team_task action=submit_for_review, and wait for the human's decision."
+	return msg
+}
+
+// checkTaskActionAuthLocked enforces the hybrid CEO-managed Issues
+// model. Returns nil when the actor may perform the action on the
+// (optional) target task, or a TaskMutationForbidden error with a
+// human-readable steer when not.
+//
+// Actor classes:
+//   - humanActors: "human", "you", "" (system) — the operator. Always allowed.
+//   - "system" / "broker": internal recovery (auto-resolve safety net,
+//     self-heal, intake driver) — always allowed.
+//   - leadActor: whoever holds the lead/CEO slug. Always allowed.
+//   - taskOwner: the current Owner of the target task. Allowed for
+//     status-transition actions on their own task.
+//   - everyone else: specialist — only `comment` is open.
+//
+// Caller holds b.mu.
+// checkTaskActionAuthLocked gates task mutations.
+//
+// intendedOwner is the owner the CALLER is asking for (body.Owner). It only
+// matters for `create`, where there is no existing task to read ownership
+// from: a bot may file its OWN work, but handing work to somebody else is
+// reassignment wearing a different hat and stays a CEO/human decision.
+func (b *Broker) checkTaskActionAuthLocked(action, actor, targetTaskID, intendedOwner string) error {
+	a := strings.ToLower(strings.TrimSpace(action))
+	actorSlug := strings.ToLower(strings.TrimSpace(actor))
+
+	// Comment is open to all — every bot should be able to leave a
+	// note on any Issue they can see.
+	if a == "comment" {
+		return nil
+	}
+
+	// Human + internal recovery actors are unrestricted.
+	switch actorSlug {
+	case "", "human", "you", "system", "broker":
+		return nil
+	}
+
+	leadSlug := strings.ToLower(strings.TrimSpace(officeLeadSlugFrom(b.members)))
+	// Pre-onboarding / test fixtures have no members → no lead. In
+	// that state the office isn't managed yet, so don't block — the
+	// gate only kicks in once a CEO/lead is in place.
+	if leadSlug == "" {
+		return nil
+	}
+	if actorSlug == leadSlug {
+		return nil
+	}
+	// The gate ONLY blocks slugs that are registered as specialist
+	// bots in this office. Unregistered actors (test slugs, CLI
+	// scripts, external callers that pass an arbitrary created_by)
+	// fall through — we have no basis to treat them as a specialist
+	// being managed by CEO. This keeps tests + ad-hoc tooling working
+	// while still blocking actual specialist bots from scope-editing
+	// Issues that should go through CEO.
+	if b.findMemberLocked(actorSlug) == nil {
+		return nil
+	}
+
+	// A bot files its OWN work.
+	//
+	// This used to route through the CEO, which made sense when the whole
+	// office shared one channel: the CEO saw all the work, so the hop bought
+	// dedup and prioritisation for free. Under DM-first the CEO is not in the
+	// conversation — when the human asks the designer directly, going via the
+	// CEO is three async bot turns to authorise something the human already
+	// asked for, and every hop is a place a wake can silently fail.
+	//
+	// What is NOT widened here: reassign, approve, reject, and reopening
+	// somebody else's task all fall through to the CEO/human path below.
+	// Those are decisions about another bot's work.
+	//
+	// The dedup argument for the old gate did not need a manager: an open
+	// task covering the same ground is found by findReusableTaskLocked on the
+	// create path — fuzzy title match, regardless of who is filing — so a
+	// near-duplicate collapses onto the existing task rather than spawning a
+	// second one.
+	if a == "create" {
+		owner := normalizeActorSlug(intendedOwner)
+		// Empty owner is the unassigned case, not work put on someone else;
+		// RULE ZERO tells bots to set an owner, and refusing here would add
+		// a failure mode nobody asked for.
+		if owner == "" || owner == actorSlug {
+			return nil
+		}
+		return taskMutationError(
+			TaskMutationForbidden,
+			fmt.Sprintf(
+				"you can create Issues for your own work, but not assign them to @%s. File it with owner=@%s (yourself), or ask @%s to scope it for someone else.",
+				owner, actorSlug, leadSlug,
+			),
+			nil,
+		)
+	}
+
+	// Owner-allowed actions: the task's current owner can move their
+	// own work through status transitions without going through CEO.
+	// Requires a target task id to check ownership.
+	ownerAllowed := map[string]bool{
+		"submit_for_review": true,
+		"review":            true,
+		"complete":          true,
+		"resume":            true,
+		"release":           true,
+		"claim":             true,
+		"assign":            true,
+		// block is the owner saying "I can't move because of <reason>"
+		// (sets blocked=true). Allowed for owner so they can pause
+		// their own work without going through CEO.
+		"block": true,
+		// cancel kills a task. Owner can cancel their own work; CEO
+		// can cancel anything via the lead path above. Specialists
+		// can't cancel work they don't own.
+		"cancel": true,
+		// reopen lets the owner pick their own delivered task back up —
+		// the post-done follow-up packet ("FOLLOW-UP ON DELIVERED TASK")
+		// instructs the owner to reopen when the human's post is a
+		// revision request, and an owner-scoped reopen on their own work
+		// is a status transition, not a scope edit. Reopening someone
+		// ELSE's task stays CEO/human-only.
+		"reopen": true,
+	}
+	// Reviewer-allowed actions: a bot assigned as a reviewer on the
+	// task can bounce work back with request_changes and (in PR-loop
+	// usage) approve/reject the submission. These are not "scope" edits
+	// — they're the reviewer fulfilling their assigned role.
+	reviewerAllowed := map[string]bool{
+		"request_changes": true,
+		"approve":         true,
+		"reject":          true,
+	}
+	if targetTaskID != "" {
+		if task := b.findTaskByIDLocked(strings.TrimSpace(targetTaskID)); task != nil {
+			if ownerAllowed[a] && strings.EqualFold(strings.TrimSpace(task.Owner), actorSlug) {
+				return nil
+			}
+			if reviewerAllowed[a] {
+				for _, r := range task.Reviewers {
+					if strings.EqualFold(strings.TrimSpace(r), actorSlug) {
+						return nil
+					}
+				}
+			}
+		}
+	}
+
+	// Everything else is CEO-only for specialists. Steer them at the
+	// suggestion channel so they know how to escalate scope ideas
+	// without being silently blocked.
+	return taskMutationError(
+		TaskMutationForbidden,
+		fmt.Sprintf(
+			"only @%s (or the human) can %s an Issue. To propose a change, post team_task action=comment with a [SUGGESTION] prefix on the parent Issue and @-mention %s.",
+			leadSlug, a, leadSlug,
+		),
+		nil,
+	)
+}
+
+// defaultTaskTypeForCreate is the broker safety net for RULE ZERO. When an
+// bot creates a top-level task via team_task action=create, the Tasks
+// board only renders rows with task_type="issue" (see web TasksList
+// isTaskSpecTask). Pre-fix the team_task tool schema listed example
+// values "research, feature, launch, follow_up, bugfix, incident" without
+// mentioning "issue", so LLMs picked one of those for human-asked work —
+// the task landed in broker state but never reached the user-visible
+// Tasks board, defeating RULE ZERO. The prompt was updated to instruct
+// task_type="issue", and the schema description rewritten, but we also
+// override here so a regressed prompt cannot silently break the surface.
+//
+// Override scope: empty input and the bare "follow_up" default (the value
+// LLMs reach for when the schema example lists it first) become "issue".
+// Real pipeline values picked deliberately (feature / research / launch /
+// bugfix / incident / custom) pass through — sub-tasks INSIDE an Issue
+// are allowed to carry those typed values per the canonical workflow,
+// and tests asserting pipeline-specific behaviour rely on explicit types.
+// parent_issue_id now ships; callers that set it pass an explicit task_type,
+// so the "follow_up" override rarely fires for sub-tasks in practice. The
+// override stays as a safety net for bare top-level creates.
+func defaultTaskTypeForCreate(in string) string {
+	s := strings.ToLower(strings.TrimSpace(in))
+	if s == "" {
+		return "issue"
+	}
+	switch s {
+	case "follow_up", "follow-up", "followup":
+		return "issue"
+	}
+	return strings.TrimSpace(in)
+}
+
+func writeTaskMutationHTTPError(w http.ResponseWriter, err error) {
+	var mutationErr *TaskMutationError
+	if !errors.As(err, &mutationErr) {
+		log.Printf("task mutation: unexpected error: %v", err)
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	status := http.StatusInternalServerError
+	switch mutationErr.Kind {
+	case TaskMutationInvalid:
+		status = http.StatusBadRequest
+	case TaskMutationForbidden:
+		status = http.StatusForbidden
+	case TaskMutationNotFound:
+		status = http.StatusNotFound
+	case TaskMutationConflict, TaskMutationArtifactRequired, TaskMutationVerificationFailed:
+		status = http.StatusConflict
+	case TaskMutationWorktreeFailed, TaskMutationPersistFailed:
+		status = http.StatusInternalServerError
+	}
+	http.Error(w, mutationErr.Message, status)
+}
+
+func trimTaskDependencies(deps []string) []string {
+	if len(deps) == 0 {
+		return nil
+	}
+	trimmedDeps := make([]string, 0, len(deps))
+	for _, dep := range deps {
+		if trimmed := strings.TrimSpace(dep); trimmed != "" {
+			trimmedDeps = append(trimmedDeps, trimmed)
+		}
+	}
+	return trimmedDeps
+}
+
+func markTaskDone(task *teamTask, timestamp string) {
+	if task == nil {
+		return
+	}
+	if !strings.EqualFold(strings.TrimSpace(task.status), "done") && strings.TrimSpace(task.CompletedAt) == "" {
+		task.CompletedAt = timestamp
+	}
+	task.status = "done"
+}
+
+func reconcileTaskReviewState(task *teamTask, action string) {
+	if task == nil {
+		return
+	}
+	// PR-style review-loop actions and terminal actions write reviewState
+	// directly via applyLifecycleStateLocked; the reconciler must not
+	// overwrite their authoritative value with a status-derived guess.
+	switch strings.ToLower(strings.TrimSpace(action)) {
+	case "request_changes", "submit_for_review", "comment", "reject", "archive", "define", "edit", "reopen":
+		// define is a metadata-only mutation (R4 intake contract); it must
+		// not nudge reviewState off whatever the lifecycle layer set.
+		// reopen writes the full Drafting/Running tuple via
+		// applyLifecycleStateLocked; reconciling it back to not_required
+		// breaks the inverse migration map (Drafting → Ready drift).
+		return
+	}
+	if !taskNeedsStructuredReview(task) {
+		// For new create actions, leave task.reviewState empty so downstream logic
+		// can detect an uninitialized state; other actions or pre-set values
+		// normalize to not_required when taskNeedsStructuredReview is false.
+		if strings.TrimSpace(task.reviewState) != "" || !strings.EqualFold(strings.TrimSpace(action), "create") {
+			task.reviewState = "not_required"
+		}
+		return
+	}
+
+	switch strings.ToLower(strings.TrimSpace(task.status)) {
+	case "review":
+		task.reviewState = "ready_for_review"
+	case "done":
+		switch {
+		case strings.EqualFold(strings.TrimSpace(action), "approve"),
+			strings.EqualFold(strings.TrimSpace(action), "complete"),
+			strings.EqualFold(strings.TrimSpace(task.reviewState), "approved"):
+			task.reviewState = "approved"
+		default:
+			task.reviewState = "ready_for_review"
+		}
+	default:
+		switch strings.TrimSpace(task.reviewState) {
+		case "pending_review", "ready_for_review", "approved":
+		default:
+			task.reviewState = "pending_review"
+		}
+	}
+}
+
+func (b *Broker) MutateTask(body TaskPostRequest) (TaskResponse, error) {
+	action := strings.TrimSpace(body.Action)
+	actor := strings.TrimSpace(body.CreatedBy)
+	// Live FE payload shim (v3 fix family #2, [17:47→17:50]): the task
+	// toolbar's reason-bearing verbs send the typed text as override_reason
+	// (web/src/api/tasks.ts updateTaskStatus), NOT as details. Every
+	// feedback consumer below reads body.Details, so the human's
+	// "What needs to change?" text was dropped on the live path three runs
+	// in a row ("No written feedback came through"). Fold the reason into
+	// Details for the verbs whose semantics are "feedback text", so the
+	// objection stamp, the wake notification, and the packet all carry it.
+	if strings.TrimSpace(body.Details) == "" {
+		switch action {
+		case "request_changes", "reject", "block", "cancel":
+			if reason := strings.TrimSpace(body.OverrideReason); reason != "" {
+				body.Details = reason
+			}
+		}
+	}
+	now := time.Now().UTC().Format(time.RFC3339)
+	// Raw emptiness first: normalizeChannelSlug("") is "general". Unchanged while
+	// #general is enabled.
+	//
+	// MutateTask returns an error rather than writing a response, so the refusal
+	// is a typed TaskMutationInvalid naming the field — the caller turns it into
+	// whatever its surface needs. homeChannelFor is the lock-TAKING variant and
+	// is correct here: b.mu is not taken until further down this function.
+	channel := ""
+	if raw := strings.TrimSpace(body.Channel); raw != "" {
+		channel = normalizeChannelSlug(raw)
+	}
+	// Resolve a home ONLY for create, and resolve it from the OWNER before the
+	// creator.
+	//
+	// Both halves of that were wrong before and each broke a real flow:
+	//
+	//   - Demanding a channel for every action broke every non-create mutation
+	//     the web sends. Reject / resume / status / edit all address a task by
+	//     id and legitimately carry no channel, because the task already knows
+	//     where it lives — the else branch below reads task.Channel and treats
+	//     a homeless task as legal. This gate errored out ~400 lines before
+	//     that code could run, so "omit the channel and let the broker resolve
+	//     it" (the documented pattern in web/src/api/tasks.ts) returned
+	//     "channel is required" every time.
+	//
+	//   - Resolving from CreatedBy alone fails for exactly the caller that
+	//     matters. The web creates tasks as created_by="human", and "human" is
+	//     not a roster member, so homeChannelFor could never resolve it. The
+	//     owner is the bot that will actually do the work and is on the
+	//     roster by construction, which makes its DM the task's natural home.
+	//
+	// Order is owner, then creator, then a loud refusal naming the field. The
+	// creator is also the WRITER, so a candidate it cannot post in is skipped —
+	// otherwise a CEO-created, planner-owned task would route into the
+	// planner's private DM and be refused by the access check. No "" fallback:
+	// an empty slug is laundered back into the retired #general by
+	// normalizeChannelSlug downstream, which is the leak this retirement closes.
+	if channel == "" && strings.EqualFold(strings.TrimSpace(action), "create") {
+		home, err := b.homeChannelForWriter(actor, body.Owner, body.CreatedBy)
+		if err != nil {
+			return TaskResponse{}, taskMutationError(TaskMutationInvalid,
+				"channel is required: there is no default room to fall back to. Name a channel, or set a member slug so the message can go to that bot's DM.", nil)
+		}
+		channel = home
+	}
+
+	// Permission preflight must run before any gate with external side
+	// effects. The locked auth check below still runs again after these
+	// pre-phases, so a task whose owner/reviewer changes while a verification
+	// command runs is rechecked before mutation.
+	b.mu.Lock()
+	if err := b.checkTaskActionAuthLocked(action, actor, body.ID, body.Owner); err != nil {
+		b.mu.Unlock()
+		return TaskResponse{}, err
+	}
+	b.mu.Unlock()
+
+	// Pre-scaffold a new App Builder app (outside b.mu — the app store has its
+	// own lock) so its live preview boots a running scaffold in seconds. This
+	// also appends the pre-created app id to the task brief so the bot
+	// publishes onto the same app. No-op for every non-app create. Runs AFTER the
+	// auth check above: the scaffold writes ~a dozen files to disk, so an
+	// unauthorized create must not leave an orphan draft behind.
+	body = b.maybePrescaffoldAppForCreate(action, channel, body)
+
+	// Resubmission artifact-delta gate (done-integrity): a bot re-landing
+	// changes-requested work must have actually changed the delivered
+	// artifact. Runs BEFORE the lock below because it reads artifact files
+	// (lock discipline in task_verification.go), and before the verification
+	// gate so a blocked resubmission never pays for a command check.
+	if err := b.gateTaskResubmissionArtifactDelta(body); err != nil {
+		return TaskResponse{}, err
+	}
+
+	// U1.1 verification gate: a complete/approve on a task with a required
+	// definition-of-done check must pass that check first. Runs BEFORE the
+	// lock below because checks execute external commands (lock discipline
+	// in task_verification.go).
+	if err := b.gateTaskCompletionVerification(body); err != nil {
+		return TaskResponse{}, err
+	}
+
+	// Artifact-hash capture for request_changes (done-integrity): hash the
+	// delivered artifact NOW, outside the lock, so the objection stamped
+	// below can carry it. Empty when the task has no artifact or the file
+	// is unreadable — the resubmission gate then degrades to an audit stamp.
+	var requestChangesArtifact, requestChangesArtifactHash string
+	if action == "request_changes" {
+		requestChangesArtifact, requestChangesArtifactHash = b.computeTaskArtifactHash(body.ID)
+	}
+
+	// B5 done-artifact existence pre-phase: stat the artifact this mutation
+	// would land done with OUTSIDE the lock (file I/O discipline), so the
+	// reachedDone gate below can reject phantom paths without holding b.mu
+	// across an os.Stat. The locked gate compares the checked reference
+	// against the task's artifact at gate time to stay race-safe.
+	var doneArtifactRef string
+	doneArtifactExists := true
+	switch action {
+	case "complete", "approve":
+		doneArtifactRef, doneArtifactExists = b.peekTaskDoneArtifact(body)
+	}
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	// Issues gate. Split on WHERE THE WORK CAME FROM, not on who may file:
+	//   - create is open to any bot FOR ITS OWN WORK (owner = itself or
+	//     unassigned). The human asking a bot directly in its DM is the
+	//     authorization; routing that through the CEO is three async turns
+	//     for permission the human already gave.
+	//   - decisions about SOMEBODY ELSE's work (reassign / approve / reject /
+	//     reopen another's, and create with a different owner) stay CEO +
+	//     human. They change WHAT the Issue is or WHO carries it.
+	//   - owner status-transition actions (submit_for_review / complete /
+	//     request_changes / resume / release / claim / assign / block /
+	//     cancel) are allowed for CEO + human OR the task's current owner.
+	//     They report WHERE the owner's own work is.
+	//   - comment is always open — every bot can leave a note.
+	//
+	// Specialists who try to act on another bot's work get a clear error
+	// naming the CEO. The auto-resolve / broker-internal create path passes
+	// actor="system" or the broker's own slug, which the gate allow-lists so
+	// safety-net Issue creation keeps working.
+	if err := b.checkTaskActionAuthLocked(action, actor, body.ID, body.Owner); err != nil {
+		return TaskResponse{}, err
+	}
+
+	if action == "create" {
+		// A create with no resolved channel is legal once tasks can be
+		// homeless; nothing to look up. `channel` is A_lobby-sourced upstream
+		// and deliberately left alone — this only stops the lookup 404ing on
+		// an empty value.
+		if channel != "" && b.findChannelLocked(channel) == nil {
+			return TaskResponse{}, taskMutationError(TaskMutationNotFound, "channel not found", nil)
+		}
+		if strings.TrimSpace(body.Title) == "" || actor == "" {
+			return TaskResponse{}, taskMutationError(TaskMutationInvalid, "title and created_by required", nil)
+		}
+		if channel != "" && !b.canAccessChannelLocked(actor, channel) {
+			return TaskResponse{}, taskMutationError(TaskMutationForbidden, "channel access denied", nil)
+		}
+
+		mutationSnapshot := snapshotBrokerTaskMutationLocked(b)
+		rollbackTask := func() {
+			mutationSnapshot.restore(b)
+		}
+		// Sub-issue creates skip the channel-agnostic reuse-merge: with fuzzy
+		// title matching it could otherwise merge a sub-issue into its own
+		// (similarly-titled) parent or a sibling, silently dropping the
+		// parent_issue_id. Sub-issue dedup is owned by the sibling / shallow
+		// guards below, which return a clear rejection instead of a silent merge.
+		var existing *teamTask
+		if strings.TrimSpace(body.ParentIssueID) == "" {
+			existing = b.findReusableTaskLocked(taskReuseMatch{
+				Channel:          channel,
+				Title:            strings.TrimSpace(body.Title),
+				ThreadID:         strings.TrimSpace(body.ThreadID),
+				Owner:            strings.TrimSpace(body.Owner),
+				PipelineID:       strings.TrimSpace(body.PipelineID),
+				SourceSignalID:   strings.TrimSpace(body.SourceSignalID),
+				SourceDecisionID: strings.TrimSpace(body.SourceDecisionID),
+			})
+		}
+		if existing != nil {
+			beforeStatus := existing.status
+			if details := strings.TrimSpace(body.Details); details != "" {
+				existing.Details = details
+			}
+			if owner := strings.TrimSpace(body.Owner); owner != "" {
+				// TODO(#general-flip): reassignment must MOVE the task's home,
+				// not widen it. Once a task's channel is a 1:1 DM slug (see
+				// preferredTaskChannelLocked), handing this task from designer
+				// to engineer and then running the owner promotion below adds
+				// engineer to the human<->designer DM — reconstructing the
+				// three-participant room that retiring group DMs exists to
+				// prevent, and putting the new owner in front of a
+				// conversation history they were never party to.
+				//
+				// Decided shape: on reassign the task's home becomes the NEW
+				// owner's DM; the old conversation stays where it is, with its
+				// two original participants, as history. Deliberately NOT
+				// built here — it is downstream of the flip and needs an
+				// answer for what happens to the existing conversation when a
+				// task's home moves. Do not flip #general without resolving it.
+				existing.Owner = owner
+				existing.status = "in_progress"
+			}
+			if taskType := strings.TrimSpace(body.TaskType); taskType != "" {
+				existing.TaskType = defaultTaskTypeForCreate(taskType)
+			}
+			if pipelineID := strings.TrimSpace(body.PipelineID); pipelineID != "" {
+				existing.PipelineID = pipelineID
+			}
+			if executionMode := strings.TrimSpace(body.ExecutionMode); executionMode != "" {
+				existing.ExecutionMode = executionMode
+			}
+			if reviewState := strings.TrimSpace(body.ReviewState); reviewState != "" {
+				existing.reviewState = reviewState
+			}
+			if sourceSignalID := strings.TrimSpace(body.SourceSignalID); sourceSignalID != "" {
+				existing.SourceSignalID = sourceSignalID
+			}
+			if sourceDecisionID := strings.TrimSpace(body.SourceDecisionID); sourceDecisionID != "" {
+				existing.SourceDecisionID = sourceDecisionID
+			}
+			if worktreePath := strings.TrimSpace(body.WorktreePath); worktreePath != "" {
+				existing.WorktreePath = worktreePath
+			}
+			if worktreeBranch := strings.TrimSpace(body.WorktreeBranch); worktreeBranch != "" {
+				existing.WorktreeBranch = worktreeBranch
+			}
+			if existing.ThreadID == "" && strings.TrimSpace(body.ThreadID) != "" {
+				existing.ThreadID = strings.TrimSpace(body.ThreadID)
+			}
+			reconcileTaskReviewState(existing, action)
+			b.reindexTaskLifecycleFromLegacyLocked(existing)
+			syncTaskMemoryWorkflow(existing, now)
+			b.ensureTaskOwnerChannelMembershipLocked(channel, existing.Owner)
+			existing.UpdatedAt = now
+			if err := rejectTheaterTaskForLiveBusiness(existing); err != nil {
+				rollbackTask()
+				return TaskResponse{}, taskMutationError(TaskMutationConflict, err.Error(), err)
+			}
+			b.scheduleTaskLifecycleLocked(existing)
+			if err := b.syncTaskWorktreeLocked(existing); err != nil {
+				rollbackTask()
+				return TaskResponse{}, taskMutationError(TaskMutationWorktreeFailed, "failed to manage task worktree", err)
+			}
+			b.appendActionLocked("task_updated", "office", channel, actor, truncateSummary(existing.Title+" ["+existing.status+"]", 140), existing.ID)
+			if err := b.saveLocked(); err != nil {
+				rollbackTask()
+				return TaskResponse{}, taskMutationError(TaskMutationPersistFailed, "failed to persist broker state", err)
+			}
+			b.emitTaskTransitionAutoNotebook(existing, beforeStatus, actor)
+			return TaskResponse{Task: *existing}, nil
+		}
+		// Allocate the task ID before choosing the channel so we can
+		// name the per-task channel "task-<id>" deterministically.
+		b.counter++
+		taskID := b.allocateIssueIDLocked()
+		// Mint a dedicated task-<id> channel so each goal runs in isolation.
+		// This fires when the task defaulted to "general" AND when it was
+		// created from inside another task's chat (channelOwnedByAnotherTask) —
+		// otherwise a new Issue spun up from an existing Issue's chat would
+		// silently share that chat. System / incident tasks stay in "general"
+		// (shouldMintPerTaskChannel guards all that).
+		if shouldMintPerTaskChannel(channel, b.channelOwnedByAnotherTaskLocked(channel), &teamTask{
+			Title:         strings.TrimSpace(body.Title),
+			Details:       strings.TrimSpace(body.Details),
+			Owner:         strings.TrimSpace(body.Owner),
+			TaskType:      defaultTaskTypeForCreate(body.TaskType),
+			PipelineID:    strings.TrimSpace(body.PipelineID),
+			ExecutionMode: strings.TrimSpace(body.ExecutionMode),
+			ParentIssueID: strings.TrimSpace(body.ParentIssueID),
+		}) {
+			if ch := b.createPerTaskChannelLocked(taskID, strings.TrimSpace(body.Title), strings.TrimSpace(body.Owner), actor); ch != nil {
+				channel = ch.Slug
+			}
+		}
+		// Bind the owning app to its own edit thread and MOVE this task there.
+		//
+		// The binding used to be derived from whatever channel the task already
+		// had. Once per-task channels stopped being minted, app builds landed in
+		// the shared room, which no app binds — so the App Builder's own task was
+		// homeless. That broke more than the edit panel: acceptance evaluation
+		// resolves the app FROM the task's channel, found nothing, and logged
+		// "no app bound to channel — treating as non-delivery", quietly REOPENING
+		// every completed app build. The edit thread also had no task living in
+		// it, so a human typing in the app panel woke nobody.
+		//
+		// So the app id now decides the thread rather than the other way round,
+		// and the task follows it. Still a no-op for non-app-builder creates, and
+		// still best-effort: a parse miss leaves the channel as it was and never
+		// blocks task creation.
+		if appCh := b.stampAppEditChannelForTaskLocked(strings.TrimSpace(body.Owner), body.Details); appCh != "" {
+			channel = appCh
+		}
+		verification, verr := normalizeTaskVerification(body.VerificationKind, body.VerificationSpec, body.VerificationRequired)
+		if verr != nil {
+			rollbackTask()
+			return TaskResponse{}, taskMutationError(TaskMutationInvalid, verr.Error(), nil)
+		}
+		// DoD→verification at intake (done-integrity, task_dod_derive.go):
+		// when the creating text states an explicit machine-checkable
+		// definition of done and no verification was passed, encode it now —
+		// the human's check gates done from the first turn.
+		dodDerived := false
+		if verification == nil {
+			if derived := deriveTaskVerificationFromDetails(body.Details); derived != nil {
+				verification = derived
+				dodDerived = true
+			}
+		}
+		task := teamTask{
+			ID:               taskID,
+			Channel:          channel,
+			Title:            strings.TrimSpace(body.Title),
+			Details:          strings.TrimSpace(body.Details),
+			Owner:            strings.TrimSpace(body.Owner),
+			status:           "open",
+			CreatedBy:        actor,
+			ThreadID:         strings.TrimSpace(body.ThreadID),
+			TaskType:         defaultTaskTypeForCreate(body.TaskType),
+			PipelineID:       strings.TrimSpace(body.PipelineID),
+			ExecutionMode:    strings.TrimSpace(body.ExecutionMode),
+			reviewState:      strings.TrimSpace(body.ReviewState),
+			SourceSignalID:   strings.TrimSpace(body.SourceSignalID),
+			SourceDecisionID: strings.TrimSpace(body.SourceDecisionID),
+			WorktreePath:     strings.TrimSpace(body.WorktreePath),
+			WorktreeBranch:   strings.TrimSpace(body.WorktreeBranch),
+			DependsOn:        trimTaskDependencies(body.DependsOn),
+			WikiRefs:         dedupePaths(body.WikiRefs),
+			ParentIssueID:    strings.TrimSpace(body.ParentIssueID),
+			Verification:     verification,
+			CreatedAt:        now,
+			UpdatedAt:        now,
+		}
+		// Sub-issue create rules (force issue type, one-level-deep nesting,
+		// plan-gate, shallow + sibling-dedup guards) live in
+		// applySubIssueCreateRulesLocked to keep this file under the size budget.
+		if err := b.applySubIssueCreateRulesLocked(&task, actor); err != nil {
+			rollbackTask()
+			return TaskResponse{}, err
+		}
+		if len(task.DependsOn) > 0 && b.hasUnresolvedDepsLocked(&task) {
+			task.blocked = true
+		} else if task.Owner != "" {
+			task.status = "in_progress"
+		}
+		reconcileTaskReviewState(&task, action)
+		syncTaskMemoryWorkflow(&task, now)
+		b.ensureTaskOwnerChannelMembershipLocked(channel, task.Owner)
+		b.queueTaskBehindActiveOwnerLaneLocked(&task)
+		if err := rejectTheaterTaskForLiveBusiness(&task); err != nil {
+			rollbackTask()
+			return TaskResponse{}, taskMutationError(TaskMutationConflict, err.Error(), err)
+		}
+		b.scheduleTaskLifecycleLocked(&task)
+		if err := b.syncTaskWorktreeLocked(&task); err != nil {
+			rollbackTask()
+			return TaskResponse{}, taskMutationError(TaskMutationWorktreeFailed, "failed to manage task worktree", err)
+		}
+		b.reindexTaskLifecycleFromLegacyLocked(&task)
+		b.tasks = append(b.tasks, task)
+		// Creating an Issue IS the authorization to work it — there is no
+		// start-approval ceremony (founder directive, 2026-06: "the approval
+		// layer is still there inside a task which should have been
+		// removed"). An Issue with a real owner lands RUNNING and the
+		// task_created action below dispatches that owner; an ownerless (or
+		// auto-triage) Issue lands READY and dispatches on assignment.
+		// Unresolved dependencies park the Issue in QueuedBehindOwner until
+		// the unblock cascade releases it (completion of the upstream, never
+		// an approval click). The human's controls are the ones that matter
+		// mid-flight: interviews, review/decision on completion,
+		// request-changes objections, reopen, and stop notes.
+		// LifecycleStateDrafting remains ONLY for explicitly parked tasks
+		// (the composer's Backlog/park path) — nothing defaults into it.
+		if strings.EqualFold(task.TaskType, "issue") {
+			created := &b.tasks[len(b.tasks)-1]
+			target := LifecycleStateReady
+			switch {
+			case created.blocked:
+				target = LifecycleStateQueuedBehindOwner
+			case strings.TrimSpace(created.Owner) != "" && !isAutoOwner(created.Owner):
+				// Structured-planning default: a top-level work Issue with a
+				// real owner enters Planning so the owner plans (read-only) and
+				// the human approves before execution / sub-task creation; only
+				// then does it run. Sub-issues and internal recovery actors skip
+				// planning (issueShouldPlanFirstLocked) and land Running.
+				if b.issueShouldPlanFirstLocked(created, actor) {
+					target = LifecycleStatePlanning
+				} else {
+					target = LifecycleStateRunning
+				}
+			}
+			// Blank the legacy-derived LifecycleState before applying the
+			// landing state so the prev=="" guard in applyLifecycleStateLocked
+			// suppresses the (otherwise) redundant issue_lifecycle chat
+			// card on Issue creation — postIssueCreatedCardLocked below
+			// is the one card we want for the create event.
+			created.LifecycleState = ""
+			_ = b.applyLifecycleStateLocked(created, target)
+			task = *created
+		}
+		b.appendActionLocked("task_created", "office", channel, task.CreatedBy, truncateSummary(task.Title, 140), task.ID)
+		if dodDerived {
+			b.appendActionLocked("verification_derived", "office", channel, "system",
+				truncateSummary("verification auto-derived from DoD: "+verification.Spec, 140), task.ID)
+		}
+		// Seed a Decision Packet for Issues so the /tasks/{id} read path
+		// returns 200 immediately instead of 404 "decision packet not yet
+		// available". Pre-fix: tasks created via team_task action=create
+		// had no packet until Lane B's intake driver ran SetSpec, so the
+		// Issue detail surface failed to load and the user saw "Could not
+		// load issue" even though the row was on the board. The packet
+		// starts empty; intake fills spec.goal / context / approach /
+		// acceptance as CEO streams them. Only seed for task_type=issue
+		// so internal types (skill_review_nudge, incident self-heal) keep
+		// their legacy no-packet behaviour.
+		if strings.EqualFold(task.TaskType, "issue") {
+			packet := b.getOrInitPacketLocked(task.ID)
+			if packet != nil {
+				b.stampLifecycleStateLocked(packet)
+				b.persistDecisionPacketLocked(task.ID, *packet)
+			}
+			// Post the issue card into the channel so the human (and
+			// other bots) see the new Issue land in chat with a
+			// one-click link to the detail view. Independent of any
+			// chat reply the creating bot posts itself.
+			b.postIssueCreatedCardLocked(actor, &task)
+		}
+		if err := b.saveLocked(); err != nil {
+			rollbackTask()
+			return TaskResponse{}, taskMutationError(TaskMutationPersistFailed, "failed to persist broker state", err)
+		}
+		// Treat creation as a transition from "" → task.status so the owner's
+		// shelf records the moment a task lands in their lane.
+		b.emitTaskTransitionAutoNotebook(&task, "", actor)
+		return TaskResponse{Task: task}, nil
+	}
+
+	requestedID := strings.TrimSpace(body.ID)
+	for i := range b.tasks {
+		if b.tasks[i].ID != requestedID {
+			continue
+		}
+		task := &b.tasks[i]
+		// Shallow copy of the pre-edit task so a human's manual change can be
+		// described back to the channel (postHumanTaskChangeLocked). Taken
+		// before any mutation runs; slices are shared but the fields diffed
+		// (title/status/owner/details) are value types.
+		preEditTask := *task
+		mutationSnapshot := snapshotBrokerTaskMutationLocked(b)
+		rollbackTask := func() {
+			mutationSnapshot.restore(b)
+		}
+		// Raw emptiness first, so the fallback below can actually fire. With
+		// the normalise in front of it, a task carrying NO channel arrived
+		// here as "general" and this fallback was dead — which is why editing
+		// a channel-less task would have returned "channel not found" the
+		// moment #general stopped existing, six callers away from the switch.
+		// The author's intent (fall back to the request's channel) is
+		// preserved; `channel` itself is an A_lobby site and stays untouched.
+		taskChannel := ""
+		if raw := strings.TrimSpace(task.Channel); raw != "" {
+			taskChannel = normalizeChannelSlug(raw)
+		}
+		if taskChannel == "" {
+			taskChannel = channel
+		}
+		// A task with no home at all is legal; there is nothing to look up or
+		// authorize against, so skip rather than 404.
+		if taskChannel != "" && b.findChannelLocked(taskChannel) == nil {
+			return TaskResponse{}, taskMutationError(TaskMutationNotFound, "channel not found", nil)
+		}
+		// Authorize against the task's actual channel, not caller-supplied body.Channel.
+		if taskChannel != "" && !b.canAccessChannelLocked(actor, taskChannel) {
+			return TaskResponse{}, taskMutationError(TaskMutationForbidden, "channel access denied", nil)
+		}
+		appendDetails := false
+		reassignPrevOwner := ""
+		reassignTriggered := false
+		cancelTriggered := false
+		cancelPrevOwner := ""
+		requestChangesTriggered := false
+		rejectTriggered := false
+		submitForReviewTriggered := false
+		beforeStatus := task.status
+		// Human-sovereignty gate (core-loop grader fix family #1): while a
+		// human request-changes objection is open on this task, no bot —
+		// including the CEO/lead and internal system actors — may land it.
+		// Only a human actor can approve/complete, which also clears the
+		// objection; a human request_changes below refreshes it. ICP-eval
+		// v2 J2: the CEO approved its subordinate's blind revision one
+		// message after the human's standing rejection.
+		if action == "approve" || action == "complete" {
+			if obj := task.HumanObjection; obj != nil {
+				if !isHumanMessageSender(actor) {
+					return TaskResponse{}, taskMutationError(
+						TaskMutationForbidden,
+						humanObjectionOpenMessage(task.ID, action, obj),
+						nil,
+					)
+				}
+				task.HumanObjection = nil
+			}
+			// Any actor that legitimately reaches approve/complete also
+			// retires the latest request-changes stamp: the rework cycle
+			// it described is over, so the next packet must not carry a
+			// stale "CHANGES REQUESTED" banner. (Bot-reviewer verdicts
+			// have no HumanObjection, so this is the only clear they get.)
+			// Rollback safety: the pre-mutation snapshot restores both
+			// pointers if a later gate in this mutation fails.
+			task.ChangesRequested = nil
+		}
+		// Parked-task gate: Drafting now means "explicitly parked" — the
+		// human filed the task in the backlog on purpose (composer Backlog
+		// path, or a legacy persisted draft). Work cannot be completed or
+		// submitted from a parked state by any non-internal actor; tasks
+		// that should run land RUNNING at creation and never hit this.
+		// Internal recovery actors (system/broker/hive, empty) are exempt —
+		// they own migration/fold-in paths that park legacy state.
+		if action == "complete" || action == "submit_for_review" {
+			if task.LifecycleState == LifecycleStateDrafting && !isInternalTaskActor(actor) {
+				return TaskResponse{}, taskMutationError(
+					TaskMutationConflict,
+					fmt.Sprintf("task %s is parked — it has not been started. Work cannot be %sd from a parked state; the human can start it from the task page.", task.ID, strings.ReplaceAll(action, "_", " ")),
+					nil,
+				)
+			}
+			// A planning task has produced a plan, not delivered work — it cannot
+			// be completed/submitted until its plan is approved and it starts
+			// running. Internal actors are exempt (recovery paths).
+			if task.LifecycleState == LifecycleStatePlanning && !isInternalTaskActor(actor) {
+				return TaskResponse{}, taskMutationError(
+					TaskMutationConflict,
+					fmt.Sprintf("task %s is still in planning — its plan must be approved before work can be %sd.", task.ID, strings.ReplaceAll(action, "_", " ")),
+					nil,
+				)
+			}
+		}
+		// Approve on a parked task means "start the work", never "accept
+		// delivered work" — there is no work. A HUMAN approve starts the
+		// task (Drafting→Running, the one remaining start affordance for
+		// parked tasks); a bot approve is refused because un-parking a
+		// deliberately parked task belongs to the human (v3 J2 [19:04]:
+		// zero-work tasks closed terminally at the click).
+		// Planning shares the "approve = start the work" semantics: approving a
+		// task's plan is the human's go-ahead to execute (Planning→Running). It
+		// is human-only for the same reason parked starts are — a bot must
+		// not green-light its own plan. The plan-approval human_interview drives
+		// this too (applyPlanApprovalAnswerLocked); this is the direct-action path.
+		if action == "approve" && (task.LifecycleState == LifecycleStateDrafting || task.LifecycleState == LifecycleStatePlanning) {
+			if !isHumanMessageSender(actor) && !isInternalTaskActor(actor) {
+				return TaskResponse{}, taskMutationError(
+					TaskMutationForbidden,
+					fmt.Sprintf("task %s is parked — only the human can start it.", task.ID),
+					nil,
+				)
+			}
+			if err := b.applyLifecycleStateLocked(task, LifecycleStateRunning); err != nil {
+				return TaskResponse{}, taskMutationError(TaskMutationConflict, "could not start task", err)
+			}
+			task.UpdatedAt = now
+			b.ensureTaskOwnerChannelMembershipLocked(taskChannel, task.Owner)
+			b.queueTaskBehindActiveOwnerLaneLocked(task)
+			b.scheduleTaskLifecycleLocked(task)
+			if err := b.syncTaskWorktreeLocked(task); err != nil {
+				rollbackTask()
+				return TaskResponse{}, taskMutationError(TaskMutationWorktreeFailed, "failed to manage task worktree", err)
+			}
+			// Wake the owner through the same notify path the decision
+			// endpoint's Drafting→Running activation uses.
+			b.appendActionLocked("task_updated", "office", taskChannel, actor, truncateSummary(task.Title+" [approved]", 140), task.ID)
+			if err := b.saveLocked(); err != nil {
+				rollbackTask()
+				return TaskResponse{}, taskMutationError(TaskMutationPersistFailed, "failed to persist broker state", err)
+			}
+			b.emitTaskTransitionAutoNotebook(task, beforeStatus, actor)
+			return TaskResponse{Task: *task}, nil
+		}
+		// Stop-order backstop (anti-fabrication fix family #2, ICP-eval v2
+		// [00:50]): a human message that led with stop/wait/hold in this
+		// task's channel blocks submit_for_review and complete by bots
+		// until a packet build has consumed the note — a bot cannot land
+		// work past a stop order it never read. A human performing the
+		// action clears the note (they know what they said). Non-halt notes
+		// never block; they only ride the next packet's top.
+		if action == "complete" || action == "submit_for_review" {
+			if note := task.HumanNotePending; note != nil {
+				if isHumanMessageSender(actor) {
+					task.HumanNotePending = nil
+				} else if note.Halt {
+					return TaskResponse{}, taskMutationError(
+						TaskMutationForbidden,
+						humanNoteHaltMessage(task.ID, action, note),
+						nil,
+					)
+				}
+			}
+		}
+		switch action {
+		// "assign" here is a legacy alias of "claim" — same body, two names. The
+		// MCP no longer routes to it: tool-level assign means "hand this to
+		// someone else", which is reassign's job (it keeps a done/review task
+		// where it is and tells the previous owner). Kept only so a stored or
+		// in-flight call using the old spelling still lands somewhere sane.
+		case "claim", "assign":
+			if strings.TrimSpace(body.Owner) == "" {
+				return TaskResponse{}, taskMutationError(TaskMutationInvalid, "owner required", nil)
+			}
+			task.Owner = strings.TrimSpace(body.Owner)
+			task.status = "in_progress"
+			if taskNeedsStructuredReview(task) {
+				task.reviewState = "pending_review"
+			} else {
+				task.reviewState = "not_required"
+			}
+		case "reassign":
+			if strings.TrimSpace(body.Owner) == "" {
+				return TaskResponse{}, taskMutationError(TaskMutationInvalid, "owner required", nil)
+			}
+			reassignPrevOwner = strings.TrimSpace(task.Owner)
+			newOwner := strings.TrimSpace(body.Owner)
+			task.Owner = newOwner
+			status := strings.ToLower(strings.TrimSpace(task.status))
+			if status != "done" && status != "review" {
+				task.status = "in_progress"
+			}
+			if taskNeedsStructuredReview(task) && strings.TrimSpace(task.reviewState) == "" {
+				task.reviewState = "pending_review"
+			}
+			reassignTriggered = reassignPrevOwner != newOwner
+		case "complete":
+			if strings.EqualFold(strings.TrimSpace(task.status), "done") {
+				if taskNeedsStructuredReview(task) {
+					task.reviewState = "approved"
+				}
+				task.blocked = false
+			} else if strings.EqualFold(strings.TrimSpace(task.status), "review") ||
+				strings.EqualFold(strings.TrimSpace(task.reviewState), "ready_for_review") {
+				markTaskDone(task, now)
+				if taskNeedsStructuredReview(task) {
+					task.reviewState = "approved"
+				}
+				task.blocked = false
+			} else if taskNeedsStructuredReview(task) {
+				task.status = "review"
+				task.reviewState = "ready_for_review"
+			} else {
+				markTaskDone(task, now)
+				task.blocked = false
+			}
+		case "review":
+			task.status = "review"
+			task.reviewState = "ready_for_review"
+		case "approve":
+			markTaskDone(task, now)
+			task.blocked = false
+			if taskNeedsStructuredReview(task) {
+				task.reviewState = "approved"
+			}
+		case "block":
+			if err := rejectFalseLocalWorktreeBlock(task, body.Details); err != nil {
+				return TaskResponse{}, taskMutationError(TaskMutationConflict, err.Error(), err)
+			}
+			task.status = "blocked"
+			task.blocked = true
+		case "resume":
+			if task.blocked {
+				task.blocked = false
+			}
+			if strings.EqualFold(strings.TrimSpace(task.status), "blocked") {
+				if strings.TrimSpace(task.Owner) != "" {
+					task.status = "in_progress"
+				} else {
+					task.status = "open"
+				}
+			}
+			appendDetails = true
+		case "reopen":
+			// Reopen a closed (rejected/cancelled/approved) Issue. When the
+			// task still has a real owner, reopen straight into Running so
+			// the owner is RE-ENGAGED through the same wake path a fresh
+			// assignment uses: the task_updated action appended below routes
+			// through notifyTaskActionsLoop → deliverTaskNotification →
+			// enqueueHeadlessCodexTurn, and sendTaskUpdate only dispatches
+			// executable lifecycle states. Reopening into Drafting left
+			// reopened tasks as conversational dead zones (core-loop B1 /
+			// ICP-eval finding) — the human's reopen click IS the restart
+			// authorization, and reopen is already CEO/human-scoped.
+			// Ownerless (or auto-triage) tasks land Ready and dispatch on
+			// assignment — the same landing a fresh ownerless create uses.
+			reopenTarget := LifecycleStateReady
+			if owner := strings.TrimSpace(task.Owner); owner != "" && !isAutoOwner(owner) {
+				reopenTarget = LifecycleStateRunning
+			}
+			task.CompletedAt = ""
+			// Apply with the REAL previous state. The old pre-set
+			// (task.LifecycleState = reopenTarget before apply) made
+			// prev==new to suppress the lifecycle chat card, but it also
+			// broke the inverse index: indexLifecycleLocked never removed
+			// the task from its terminal (approved/rejected) bucket, so a
+			// reopened task stayed listed as approved on every index-backed
+			// surface while its page said running — one more board/page
+			// state split (ICP-eval v3 fix family #1). The card a real
+			// transition emits is honest signal: the human reopened work.
+			if err := b.applyLifecycleStateLocked(task, reopenTarget); err != nil {
+				return TaskResponse{}, taskMutationError(TaskMutationConflict, "could not reopen issue", err)
+			}
+			appendDetails = true
+		case "release":
+			task.Owner = ""
+			task.status = "open"
+			task.blocked = false
+		case "cancel":
+			cancelPrevOwner = strings.TrimSpace(task.Owner)
+			task.status = "canceled"
+			task.blocked = false
+			task.FollowUpAt = ""
+			task.ReminderAt = ""
+			task.RecheckAt = ""
+			cancelTriggered = true
+		case "request_changes":
+			// PR-like revision loop. Reviewer rejects the current
+			// submission and bounces the task back to its existing
+			// owner with feedback. Owner stays unchanged; status
+			// resets so the owner picks up the rework.
+			task.status = "in_progress"
+			task.reviewState = "changes_requested"
+			task.blocked = false
+			appendDetails = true
+			requestChangesTriggered = true
+			// Stamp the feedback TEXT on the task itself so it renders in
+			// the owner's next execution packet and wake notification —
+			// the Decision Packet feedback log alone is invisible to the
+			// reworking bot (ICP-eval v2 J2). A HUMAN reviewer's
+			// request additionally arms (or refreshes) the sovereignty
+			// gate above. Fresh struct each time: rollback safety.
+			objection := &TaskReviewObjection{
+				Actor: taskObjectionActor(actor),
+				Body:  strings.TrimSpace(body.Details),
+				At:    now,
+			}
+			// Pin the artifact's content hash (computed outside the lock
+			// above) so the resubmission gate can require a real delta.
+			// Only stamp when the artifact reference is still the one we
+			// hashed — a concurrent mutation may have swapped it.
+			if requestChangesArtifactHash != "" && strings.TrimSpace(task.Artifact) == requestChangesArtifact {
+				objection.ArtifactHash = requestChangesArtifactHash
+			}
+			task.ChangesRequested = objection
+			if isHumanMessageSender(actor) {
+				task.HumanObjection = objection
+			}
+		case "submit_for_review":
+			// Explicit "hand off to reviewer" action so executor
+			// bots have a verb that matches PR-review intent
+			// instead of overloading "complete". The Details field
+			// (if present) carries the submitted artifact (code,
+			// copy, plan) which we capture below as a FeedbackItem
+			// so it shows up in the unified Inbox Discussion thread.
+			// appendDetails preserves prior task details (planner
+			// spec, earlier submission notes) instead of clobbering
+			// them with each resubmit.
+			task.status = "review"
+			task.reviewState = "ready_for_review"
+			appendDetails = true
+			submitForReviewTriggered = true
+		case "comment":
+			// Append-only comment with no state change. Used by both
+			// humans and bots to leave PR-style notes on a task
+			// before anyone decides to approve / request changes /
+			// reject. The actual append happens below via the
+			// appendDetails branch.
+			appendDetails = true
+		case "define":
+			// R4 intake contract: the CEO (or human) sets/updates the
+			// structured Definition — goal, deliverables (+format),
+			// success criteria, access needed — BEFORE the task is
+			// staffed. Auth: define is not owner- or reviewer-allowed,
+			// so checkTaskActionAuthLocked above already restricted it
+			// to CEO + human (same class as the scope-shaping actions).
+			// No status change: this is metadata the execution packet
+			// renders as the contract the owner works against.
+			def, derr := normalizeTaskDefinition(body.Definition, now)
+			if derr != nil {
+				return TaskResponse{}, taskMutationError(TaskMutationInvalid, derr.Error(), nil)
+			}
+			// Validate the optional verification BEFORE mutating the
+			// task so an invalid spec cannot leave a half-applied define.
+			var defVerification *TaskVerification
+			if strings.TrimSpace(body.VerificationKind) != "" {
+				v, verr := normalizeTaskVerification(body.VerificationKind, body.VerificationSpec, body.VerificationRequired)
+				if verr != nil {
+					return TaskResponse{}, taskMutationError(TaskMutationInvalid, verr.Error(), nil)
+				}
+				defVerification = v
+			}
+			task.Definition = def
+			// Machine-checkable success criteria arrive WITH their check
+			// in the same call. Only set when no check exists yet so a
+			// re-define cannot silently replace an established gate. When
+			// the CEO dropped a human-stated DoD anyway, the conservative
+			// deriver (task_dod_derive.go) backstops it from the criteria
+			// text and stamps the action log.
+			if task.Verification == nil {
+				if defVerification != nil {
+					task.Verification = defVerification
+				} else if derived := deriveTaskVerificationFromDefinition(def); derived != nil {
+					task.Verification = derived
+					b.appendActionLocked("verification_derived", "office", taskChannel, "system",
+						truncateSummary("verification auto-derived from DoD: "+derived.Spec, 140), task.ID)
+				}
+			}
+			appendDetails = true
+		case "reject":
+			// Terminal "this work cannot land" outcome. Distinct from
+			// block (recoverable, waiting on upstream) and from
+			// request_changes (revise + resubmit). LifecycleStateRejected
+			// keeps Blocked=true so unblockDependentsLocked treats the
+			// upstream as unresolved and downstream tasks STAY blocked.
+			//
+			// Reject must carry a reason — a terminal "this won't land"
+			// without context is hostile to the bot that has to
+			// pivot. Enforce that contract at the API boundary so the
+			// "@human reviewer rejected without saying why" failure
+			// mode can't happen.
+			if strings.TrimSpace(body.Details) == "" {
+				return TaskResponse{}, taskMutationError(TaskMutationInvalid, "reject reason required", nil)
+			}
+			if err := b.applyLifecycleStateLocked(task, LifecycleStateRejected); err != nil {
+				return TaskResponse{}, taskMutationError(TaskMutationInvalid, err.Error(), err)
+			}
+			appendDetails = true
+			rejectTriggered = true
+		case "archive":
+			// Move the task off the active board. Archived tasks are
+			// terminal (excluded from default active listings, included
+			// with include_done=true for the Archive board column). An
+			// optional note is captured via appendDetails so the actor
+			// can document why the work was archived. Unlike reject,
+			// no reason is required — archiving is a housekeeping act,
+			// not a quality judgement. The task can be reopened via
+			// the reopen action which resets it to Drafting.
+			if err := b.applyLifecycleStateLocked(task, LifecycleStateArchived); err != nil {
+				return TaskResponse{}, taskMutationError(TaskMutationInvalid, err.Error(), err)
+			}
+			appendDetails = true
+		case "edit":
+			// A human editing a task's name or description in the Tasks
+			// surface. Until this existed there was no way to do either over
+			// the wire: Title was read only on create, and the only verb open
+			// to every human (comment) APPENDS to Details, so saving an edited
+			// description duplicated the text on every save. Every other verb
+			// that replaces Details also moves status, so renaming a task
+			// silently restarted it.
+			//
+			// Form-save semantics, not patch: title and details are both
+			// authoritative and carry the complete value the form holds. That
+			// is what makes clearing a description expressible — send "" — and
+			// it is why Details is assigned here rather than left to the
+			// generic append/replace block below, which skips empty strings.
+			//
+			// No status change. Renaming a task must never move it.
+			//
+			// Auth: not owner-allowed and not `comment`, so
+			// checkTaskActionAuthLocked above already restricted this to the
+			// human and the CEO — a specialist calling it is rejected.
+			newTitle := strings.TrimSpace(body.Title)
+			if newTitle == "" {
+				return TaskResponse{}, taskMutationError(TaskMutationInvalid, "title required", nil)
+			}
+			task.Title = newTitle
+			task.Details = strings.TrimSpace(body.Details)
+			appendDetails = false
+		default:
+			return TaskResponse{}, taskMutationError(TaskMutationInvalid, "unknown action", nil)
+		}
+		if strings.TrimSpace(body.Details) != "" {
+			if appendDetails {
+				if err := appendTaskDetailLocked(task, body.Details); err != nil {
+					rollbackTask()
+					return TaskResponse{}, taskMutationError(TaskMutationInvalid, err.Error(), err)
+				}
+			} else {
+				task.Details = strings.TrimSpace(body.Details)
+			}
+		}
+		if taskType := strings.TrimSpace(body.TaskType); taskType != "" {
+			task.TaskType = taskType
+		}
+		if len(body.WikiRefs) > 0 {
+			// Wiki links shape a task's wiki-egress boundary, so mutating them is
+			// a CURATOR action (CEO / human / Librarian) — the same authority the
+			// link_task_wiki tool requires. This generic update path is reachable
+			// via the universally-open `comment` action, so without a gate here a
+			// specialist could relabel a task's wiki egress by attaching WikiRefs
+			// to a note. Non-curators' WikiRefs are ignored (the other optional
+			// fields here follow the same silently-skip pattern). Replace
+			// semantics: the caller sends the full set; dedupePaths normalizes.
+			actorSlug := strings.ToLower(strings.TrimSpace(actor))
+			if isHumanMessageSender(actorSlug) || actorSlug == "cos" || isLibrarianSlug(actorSlug) {
+				task.WikiRefs = dedupePaths(body.WikiRefs)
+			}
+		}
+		if pipelineID := strings.TrimSpace(body.PipelineID); pipelineID != "" {
+			task.PipelineID = pipelineID
+		}
+		if executionMode := strings.TrimSpace(body.ExecutionMode); executionMode != "" {
+			task.ExecutionMode = executionMode
+		}
+		if reviewState := strings.TrimSpace(body.ReviewState); reviewState != "" {
+			task.reviewState = reviewState
+		}
+		if sourceSignalID := strings.TrimSpace(body.SourceSignalID); sourceSignalID != "" {
+			task.SourceSignalID = sourceSignalID
+		}
+		if sourceDecisionID := strings.TrimSpace(body.SourceDecisionID); sourceDecisionID != "" {
+			task.SourceDecisionID = sourceDecisionID
+		}
+		if worktreePath := strings.TrimSpace(body.WorktreePath); worktreePath != "" {
+			task.WorktreePath = worktreePath
+		}
+		if worktreeBranch := strings.TrimSpace(body.WorktreeBranch); worktreeBranch != "" {
+			task.WorktreeBranch = worktreeBranch
+		}
+		if artifactPath := strings.TrimSpace(body.ArtifactPath); artifactPath != "" {
+			if err := validateTaskArtifactPath(artifactPath); err != nil {
+				rollbackTask()
+				return TaskResponse{}, taskMutationError(TaskMutationInvalid, err.Error(), err)
+			}
+			task.Artifact = artifactPath
+		}
+		if !strings.EqualFold(strings.TrimSpace(task.status), "done") {
+			task.CompletedAt = ""
+		}
+		reconcileTaskReviewState(task, action)
+		b.reindexTaskLifecycleFromLegacyLocked(task)
+		syncTaskMemoryWorkflow(task, now)
+		reachedDone := strings.EqualFold(strings.TrimSpace(task.status), "done") &&
+			!strings.EqualFold(strings.TrimSpace(beforeStatus), "done")
+		// Artifact gate (core-loop B1): a task with a Definition cannot land
+		// in done without a delivered artifact on record. Tasks without a
+		// Definition keep legacy behavior — additive rollout.
+		if reachedDone && task.Definition != nil && strings.TrimSpace(task.Artifact) == "" {
+			rollbackTask()
+			return TaskResponse{}, taskMutationError(
+				TaskMutationArtifactRequired,
+				fmt.Sprintf(
+					"task %s has a Definition, so it cannot reach done without a delivered artifact. Publish the deliverable to the wiki, then retry this %s with artifact_path set to the wiki-relative path (e.g. \"team/playbooks/launch.md\") or the visual-artifact id.",
+					task.ID, action,
+				),
+				nil,
+			)
+		}
+		// B5 knowledge-integrity: the artifact must EXIST, not merely be a
+		// non-empty string — phantom paths are how the v3 run shipped
+		// chat-only deliverables past the gate (V3-N10). Existence was
+		// checked outside the lock in the pre-phase; binding here only when
+		// the reference matches what was checked keeps the gate race-safe
+		// against concurrent artifact rewrites.
+		if reachedDone && task.Definition != nil &&
+			strings.TrimSpace(task.Artifact) == doneArtifactRef && !doneArtifactExists {
+			rollbackTask()
+			return TaskResponse{}, taskMutationError(
+				TaskMutationArtifactRequired,
+				fmt.Sprintf(
+					"task %s cannot reach done: artifact %q does not exist in the wiki (or the task worktree). Publish the deliverable first, then retry this %s with artifact_path pointing at the real file.",
+					task.ID, doneArtifactRef, action,
+				),
+				nil,
+			)
+		}
+		if strings.EqualFold(strings.TrimSpace(task.status), "done") {
+			overrideActor := strings.TrimSpace(body.MemoryWorkflowOverrideActor)
+			if overrideActor == "" {
+				overrideActor = actor
+			}
+			overrideReason := strings.TrimSpace(body.MemoryWorkflowOverrideReason)
+			if overrideReason == "" {
+				overrideReason = strings.TrimSpace(body.OverrideReason)
+			}
+			if err := applyMemoryWorkflowCompletionGate(task, overrideActor, overrideReason, body.MemoryWorkflowOverride, now); err != nil {
+				rollbackTask()
+				return TaskResponse{}, taskMutationError(TaskMutationConflict, err.Error(), err)
+			}
+		}
+		b.ensureTaskOwnerChannelMembershipLocked(taskChannel, task.Owner)
+		b.queueTaskBehindActiveOwnerLaneLocked(task)
+		task.UpdatedAt = now
+		if err := rejectTheaterTaskForLiveBusiness(task); err != nil {
+			rollbackTask()
+			return TaskResponse{}, taskMutationError(TaskMutationConflict, err.Error(), err)
+		}
+		// Any terminal status releases waiting dependents. isTerminalTeamTaskStatus
+		// matches hasUnresolvedDepsLocked so cancelled parents do not orphan dependents.
+		var pendingCascade []pendingTaskTransition
+		if isTerminalTeamTaskStatus(task.status) {
+			pendingCascade = b.unblockDependentsLocked(task.ID)
+		}
+		b.scheduleTaskLifecycleLocked(task)
+		if err := b.syncTaskWorktreeLocked(task); err != nil {
+			rollbackTask()
+			return TaskResponse{}, taskMutationError(TaskMutationWorktreeFailed, "failed to manage task worktree", err)
+		}
+		b.appendActionLocked("task_updated", "office", taskChannel, actor, truncateSummary(task.Title+" ["+task.status+"]", 140), task.ID)
+		// A human editing a task in the Tasks surface is addressing the team:
+		// say so in the channel and wake the owner. Skipped for the actions
+		// that post their own richer notification just below, so an edit never
+		// double-announces.
+		if !reassignTriggered && !cancelTriggered && !requestChangesTriggered && !rejectTriggered {
+			b.postHumanTaskChangeLocked(actor, task, describeTaskChanges(&preEditTask, task))
+		}
+		if action == "block" {
+			b.requestCapabilitySelfHealingLocked(task, actor, body.Details)
+		}
+		if reassignTriggered {
+			b.postTaskReassignNotificationsLocked(actor, task, reassignPrevOwner)
+		}
+		if cancelTriggered {
+			b.postTaskCancelNotificationsLocked(actor, task, cancelPrevOwner)
+		}
+		if requestChangesTriggered {
+			feedback := strings.TrimSpace(body.Details)
+			b.postTaskRequestChangesNotificationsLocked(actor, task, feedback)
+			b.AppendPacketFeedbackLocked(task.ID, actor, feedback)
+		}
+		if action == "comment" {
+			b.AppendPacketFeedbackLocked(task.ID, actor, strings.TrimSpace(body.Details))
+		}
+		if action == "define" {
+			// E5 intake gate (ten-out-of-ten): a Definition that lands with
+			// placeholder markers or access needs raises the batched human
+			// interview deterministically — before any subtask dispatch can
+			// write around the holes. Runs before saveLocked so the request
+			// persists with the define mutation.
+			b.raiseDefinitionGapInterviewLocked(task, actor)
+		}
+		if submitForReviewTriggered {
+			// Capture the submitted artifact (code, copy, plan) into
+			// the Decision Packet's feedback thread so reviewers see
+			// the exact submission inline in the unified Inbox.
+			artifact := strings.TrimSpace(body.Details)
+			if artifact != "" {
+				b.AppendPacketFeedbackLocked(task.ID, actor, "📤 Submitted for review:\n"+artifact)
+			}
+		}
+		if rejectTriggered {
+			feedback := strings.TrimSpace(body.Details)
+			b.postTaskRejectedNotificationsLocked(actor, task, feedback)
+			b.AppendPacketFeedbackLocked(task.ID, actor, feedback)
+		}
+		if reachedDone {
+			// Self-heal parent attach (ten-out-of-ten A1): a repair lane that
+			// lands done with a deliverable routes the artifact + completion
+			// back onto the stalled PARENT through the legitimate path
+			// (artifact recorded, parent into Review for the human decision).
+			// Runs before the done-post so the announcement reflects the
+			// final ownership. Same locked section — persisted together.
+			b.attachSelfHealCompletionToParentLocked(task)
+			// Deterministic done-post (core-loop B1): announce the delivery
+			// in the task channel and raise a non-blocking Inbox notice.
+			// Runs before saveLocked so the message + notice persist with
+			// the completing mutation. No LLM, no I/O — string assembly only.
+			b.postTaskDeliveredLocked(task)
+		}
+		if err := b.saveLocked(); err != nil {
+			rollbackTask()
+			return TaskResponse{}, taskMutationError(TaskMutationPersistFailed, "failed to persist broker state", err)
+		}
+		b.emitTaskTransitionAutoNotebook(task, beforeStatus, actor)
+		b.flushPendingAutoNotebookTransitionsLocked(pendingCascade, "system")
+		// U4.1 auto-distillation + B1 entity extraction: a task that just
+		// reached done becomes a learning (when machine-verified) and its
+		// entities/associations land in the team knowledge graph. Queued as
+		// a goroutine so the learning-log + fact-log writes run after b.mu
+		// releases (same hazard class that killed the old auto-notebook-writer).
+		if reachedDone {
+			b.queueTaskDistillation(task.ID)
+			// Post-task App discovery: a deterministic, broker-actuated judge that
+			// proposes an App only when the completed work looks repeatable. No-op
+			// unless enabled (production web path).
+			b.queueWorkflowAppDetection(task.ID)
+			// App acceptance gate: for an App Builder build task, verify the built
+			// app actually meets the brief (regular checks + an LLM judge) BEFORE
+			// "done" sticks; on a shortfall it reopens the task with the gaps for an
+			// auto-fix. No-op for non-app-build tasks and when detection is off.
+			b.queueAppAcceptanceEval(task.ID)
+		}
+		return TaskResponse{Task: *task}, nil
+	}
+
+	return TaskResponse{}, taskMutationError(TaskMutationNotFound, "task not found", nil)
+}

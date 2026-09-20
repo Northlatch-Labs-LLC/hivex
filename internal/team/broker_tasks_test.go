@@ -1,0 +1,4109 @@
+package team
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/Northlatch-Labs-LLC/hivex/internal/bot"
+	"github.com/Northlatch-Labs-LLC/hivex/internal/config"
+)
+
+// TestHasUnresolvedDepsLocked_TerminalStatusesResolve pins the contract:
+// any terminal status — done, completed, canceled, cancelled — counts
+// as a resolved dependency. Active statuses (in_progress, blocked) and
+// missing IDs are unresolved. This mirrors requestIsResolvedLocked for
+// humanInterview deps so a parent's cancellation no longer permanently
+// orphans every dependent task.
+func TestHasUnresolvedDepsLocked_TerminalStatusesResolve(t *testing.T) {
+	b := newTestBroker(t)
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	b.tasks = []teamTask{
+		{ID: "dep-done", status: "done"},
+		{ID: "dep-completed", status: "completed"},
+		{ID: "dep-canceled", status: "canceled"},
+		{ID: "dep-cancelled", status: "cancelled"},
+		{ID: "dep-in-progress", status: "in_progress"},
+		{ID: "dep-blocked", status: "blocked"},
+	}
+
+	cases := []struct {
+		name string
+		dep  string
+		want bool
+	}{
+		{"resolved when done", "dep-done", false},
+		{"resolved when completed", "dep-completed", false},
+		{"resolved when canceled", "dep-canceled", false},
+		{"resolved when cancelled", "dep-cancelled", false},
+		{"unresolved when in_progress", "dep-in-progress", true},
+		{"unresolved when blocked", "dep-blocked", true},
+		{"unresolved when missing", "ghost-id", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			task := &teamTask{DependsOn: []string{tc.dep}}
+			if got := b.hasUnresolvedDepsLocked(task); got != tc.want {
+				t.Errorf("dep=%q: want %v, got %v", tc.dep, tc.want, got)
+			}
+		})
+	}
+
+	// Mixed: any unresolved among many returns true.
+	mixed := &teamTask{DependsOn: []string{"dep-done", "dep-in-progress"}}
+	if !b.hasUnresolvedDepsLocked(mixed) {
+		t.Error("mixed deps with one in_progress: expected unresolved=true")
+	}
+
+	// Mixed terminals only: all resolved.
+	terminals := &teamTask{DependsOn: []string{"dep-done", "dep-cancelled", "dep-completed"}}
+	if b.hasUnresolvedDepsLocked(terminals) {
+		t.Error("all-terminal deps: expected unresolved=false")
+	}
+}
+
+// TestReconcileOrphanedBlockedTasksLocked_UnblocksCancelledParent
+// pins the persisted-state migration that fixes orphaned dependents
+// from before the cancelled-dep fix landed. A task that was Blocked=
+// true while its parent was cancelled now resumes on broker reload —
+// previously it stayed blocked forever because the old
+// unblockDependentsLocked only fired on Status="done". The migration
+// is idempotent: running a second time has no effect.
+func TestReconcileOrphanedBlockedTasksLocked_UnblocksCancelledParent(t *testing.T) {
+	b := newTestBroker(t)
+	b.mu.Lock()
+	b.tasks = []teamTask{
+		{ID: "parent-canceled", status: "canceled", Channel: "general"},
+		{ID: "parent-done", status: "done", Channel: "general"},
+		{ID: "parent-active", status: "in_progress", Channel: "general"},
+		{
+			ID: "orphan-1", status: "blocked", blocked: true, Channel: "general",
+			DependsOn: []string{"parent-canceled"},
+		},
+		{
+			ID: "stuck", status: "blocked", blocked: true, Channel: "general",
+			DependsOn: []string{"parent-active"},
+		},
+		{
+			ID: "orphan-multi", status: "blocked", blocked: true, Channel: "general",
+			DependsOn: []string{"parent-canceled", "parent-done"},
+		},
+	}
+
+	b.reconcileOrphanedBlockedTasksLocked()
+
+	byID := map[string]*teamTask{}
+	for i := range b.tasks {
+		byID[b.tasks[i].ID] = &b.tasks[i]
+	}
+
+	if got := byID["orphan-1"]; got.Blocked() || got.Status() != "in_progress" {
+		t.Errorf("orphan-1 should be unblocked, got Blocked=%v Status=%q", got.Blocked(), got.Status())
+	}
+	if got := byID["orphan-multi"]; got.Blocked() || got.Status() != "in_progress" {
+		t.Errorf("orphan-multi should be unblocked, got Blocked=%v Status=%q", got.Blocked(), got.Status())
+	}
+	if got := byID["stuck"]; !got.Blocked() || got.Status() != "blocked" {
+		t.Errorf("stuck (parent still active) must remain blocked, got Blocked=%v Status=%q", got.Blocked(), got.Status())
+	}
+
+	// Idempotent: running again should be a no-op for previously
+	// reconciled tasks.
+	beforeSecond := make(map[string]string, len(b.tasks))
+	for i := range b.tasks {
+		beforeSecond[b.tasks[i].ID] = b.tasks[i].UpdatedAt
+	}
+	b.reconcileOrphanedBlockedTasksLocked()
+	for i := range b.tasks {
+		if b.tasks[i].UpdatedAt != beforeSecond[b.tasks[i].ID] {
+			t.Errorf("task %s UpdatedAt changed on second reconcile run", b.tasks[i].ID)
+		}
+	}
+	b.mu.Unlock()
+}
+
+// TestReconcileSharedTaskChannelsLocked_RehomesSquatters pins the one-shot
+// migration that splits already-shared per-task channels. Reproduces the live
+// OFFICE-22 / OFFICE-28 case: OFFICE-28 (created from inside OFFICE-22's chat)
+// shares OFFICE-22's "task-office-22" channel. After the migration OFFICE-28
+// owns its own "task-office-28"; OFFICE-22 is untouched; #general and
+// non-per-task channels are left alone; and a second pass is a no-op.
+func TestReconcileSharedTaskChannelsLocked_RehomesSquatters(t *testing.T) {
+	b := newTestBroker(t)
+	ensureTestMemberAccess(b, "general", "eng", "Eng")
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	// task-office-22 is OFFICE-22's dedicated per-task channel.
+	b.channels = append(b.channels, teamChannel{
+		Slug: "task-office-22", Name: "Daily Digest", TaskID: "OFFICE-22",
+		Members: []string{"eng"}, CreatedBy: "system",
+		CreatedAt: time.Now().UTC().Format(time.RFC3339),
+	})
+	// A genuinely shared, non-per-task channel (no TaskID) — must be left alone.
+	b.channels = append(b.channels, teamChannel{
+		Slug: "project-loop", Name: "project-loop",
+		Members: []string{"eng"}, CreatedBy: "system",
+		CreatedAt: time.Now().UTC().Format(time.RFC3339),
+	})
+	b.tasks = []teamTask{
+		{ID: "OFFICE-22", Title: "Daily Digest from email", Owner: "eng", status: "in_progress", Channel: "task-office-22"},
+		{ID: "OFFICE-28", Title: "Outbound email reply bot", Owner: "eng", status: "in_progress", Channel: "task-office-22"},
+		{ID: "OFFICE-30", Title: "Backup", Owner: "eng", status: "open", Channel: "general"},
+		{ID: "OFFICE-31", Title: "Shared project work", Owner: "eng", status: "open", Channel: "project-loop"},
+	}
+
+	b.reconcileSharedTaskChannelsLocked()
+
+	byID := map[string]*teamTask{}
+	for i := range b.tasks {
+		byID[b.tasks[i].ID] = &b.tasks[i]
+	}
+	// The owner keeps its channel.
+	if got := byID["OFFICE-22"].Channel; got != "task-office-22" {
+		t.Fatalf("OFFICE-22 (owner) channel must be unchanged, got %q", got)
+	}
+	// The squatter gets its own channel.
+	wantChild := normalizeChannelSlug("task-OFFICE-28")
+	if got := byID["OFFICE-28"].Channel; got != wantChild {
+		t.Fatalf("OFFICE-28 must be re-homed to %q, got %q", wantChild, got)
+	}
+	if got := byID["OFFICE-28"].Channel; got == byID["OFFICE-22"].Channel {
+		t.Fatalf("OFFICE-28 must not share OFFICE-22's channel %q", got)
+	}
+	// The minted channel exists and links back to the squatter.
+	newCh := b.findChannelLocked(wantChild)
+	if newCh == nil || newCh.TaskID != "OFFICE-28" {
+		t.Fatalf("expected channel %q linked to OFFICE-28, got %+v", wantChild, newCh)
+	}
+	// #general and non-per-task shared channels are untouched.
+	if got := byID["OFFICE-30"].Channel; got != "general" {
+		t.Fatalf("OFFICE-30 in #general must be untouched, got %q", got)
+	}
+	if got := byID["OFFICE-31"].Channel; got != "project-loop" {
+		t.Fatalf("OFFICE-31 in a non-per-task shared channel must be untouched, got %q", got)
+	}
+
+	// Idempotent: a second pass changes nothing.
+	before := map[string]string{}
+	for i := range b.tasks {
+		before[b.tasks[i].ID] = b.tasks[i].Channel + "|" + b.tasks[i].UpdatedAt
+	}
+	b.reconcileSharedTaskChannelsLocked()
+	for i := range b.tasks {
+		if got := b.tasks[i].Channel + "|" + b.tasks[i].UpdatedAt; got != before[b.tasks[i].ID] {
+			t.Errorf("task %s changed on second pass: %q -> %q", b.tasks[i].ID, before[b.tasks[i].ID], got)
+		}
+	}
+}
+
+// TestTaskReuseMatch_HasScopedIdentity pins the precondition for
+// scoped-identity dedupe in findReusableTaskLocked: a match counts as
+// scoped only when SourceSignalID or SourceDecisionID is non-empty.
+// Empty strings (including whitespace) must NOT register as scoped.
+func TestTaskReuseMatch_HasScopedIdentity(t *testing.T) {
+	cases := []struct {
+		name string
+		m    taskReuseMatch
+		want bool
+	}{
+		{"empty", taskReuseMatch{}, false},
+		{"whitespace signal", taskReuseMatch{SourceSignalID: "   "}, false},
+		{"signal set", taskReuseMatch{SourceSignalID: "sig-1"}, true},
+		{"decision set", taskReuseMatch{SourceDecisionID: "dec-1"}, true},
+		{"both set", taskReuseMatch{SourceSignalID: "sig-1", SourceDecisionID: "dec-1"}, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.m.hasScopedIdentity(); got != tc.want {
+				t.Errorf("hasScopedIdentity(%+v): want %v, got %v", tc.m, tc.want, got)
+			}
+		})
+	}
+}
+
+func TestTaskAndRequestViewsRejectNonMembers(t *testing.T) {
+	b := newTestBroker(t)
+	if err := b.StartOnPort(0); err != nil {
+		t.Fatalf("failed to start broker: %v", err)
+	}
+	defer b.Stop()
+
+	base := fmt.Sprintf("http://%s", b.Addr())
+	createBody, _ := json.Marshal(map[string]any{
+		"action":      "create",
+		"slug":        "deals",
+		"name":        "deals",
+		"description": "Deal strategy and pipeline work.",
+		"created_by":  "cos",
+	})
+	req, _ := http.NewRequest(http.MethodPost, base+"/channels", bytes.NewReader(createBody))
+	req.Header.Set("Authorization", "Bearer "+b.Token())
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("create channel failed: %v", err)
+	}
+	resp.Body.Close()
+
+	req, _ = http.NewRequest(http.MethodGet, base+"/tasks?channel=deals&viewer_slug=fe", nil)
+	req.Header.Set("Authorization", "Bearer "+b.Token())
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("get tasks as non-member failed: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected 403 for non-member task access, got %d", resp.StatusCode)
+	}
+
+	req, _ = http.NewRequest(http.MethodGet, base+"/requests?channel=deals&viewer_slug=fe", nil)
+	req.Header.Set("Authorization", "Bearer "+b.Token())
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("get requests as non-member failed: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected 403 for non-member request access, got %d", resp.StatusCode)
+	}
+}
+
+func TestBrokerTaskLifecycle(t *testing.T) {
+	b := newTestBroker(t)
+	if err := b.StartOnPort(0); err != nil {
+		t.Fatalf("failed to start broker: %v", err)
+	}
+	defer b.Stop()
+
+	base := fmt.Sprintf("http://%s", b.Addr())
+	post := func(payload map[string]any) teamTask {
+		// No default room any more: a mutation that names no channel is
+		// refused on purpose. These cases are not testing that rule, so the
+		// helper supplies the fixture's room.
+		if _, ok := payload["channel"]; !ok {
+			payload["channel"] = GeneralChannelSlug
+		}
+		body, _ := json.Marshal(payload)
+		req, _ := http.NewRequest(http.MethodPost, base+"/tasks", bytes.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+b.Token())
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("task post failed: %v", err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			raw, _ := io.ReadAll(resp.Body)
+			t.Fatalf("unexpected status %d: %s", resp.StatusCode, raw)
+		}
+		var result struct {
+			Task teamTask `json:"task"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+			t.Fatalf("decode task response: %v", err)
+		}
+		return result.Task
+	}
+
+	created := post(map[string]any{
+		"action":     "create",
+		"title":      "Own the landing page",
+		"details":    "Frontend only",
+		"created_by": "cos",
+		"owner":      "fe",
+		"thread_id":  "msg-1",
+	})
+	// Owner-set top-level issues now land in Planning (structured planning):
+	// the owner plans read-only and the human approves before execution.
+	// Planning's derived status is in_progress (the owner is actively planning).
+	if created.Status() != "in_progress" || created.Owner != "fe" {
+		t.Fatalf("unexpected created task: %+v", created)
+	}
+	if created.LifecycleState != LifecycleStatePlanning {
+		t.Fatalf("expected planning lifecycle for new owner-set issue, got %q", created.LifecycleState)
+	}
+	// Approve the plan (human) so it transitions to Running for the rest of
+	// this lifecycle test.
+	started := post(map[string]any{
+		"action":     "approve",
+		"id":         created.ID,
+		"created_by": "human",
+	})
+	if started.LifecycleState != LifecycleStateRunning {
+		t.Fatalf("expected running after plan approval, got %q", started.LifecycleState)
+	}
+	if created.FollowUpAt == "" || created.ReminderAt == "" || created.RecheckAt == "" {
+		t.Fatalf("expected follow-up timestamps on task create, got %+v", created)
+	}
+	req, _ := http.NewRequest(http.MethodGet, base+"/queue", nil)
+	req.Header.Set("Authorization", "Bearer "+b.Token())
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("queue request failed: %v", err)
+	}
+	defer resp.Body.Close()
+	var queue struct {
+		Actions   []officeActionLog `json:"actions"`
+		Scheduler []schedulerJob    `json:"scheduler"`
+		Due       []schedulerJob    `json:"due"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&queue); err != nil {
+		t.Fatalf("decode queue response: %v", err)
+	}
+	if len(queue.Scheduler) == 0 {
+		t.Fatalf("expected queue to expose scheduler state, got %+v", queue)
+	}
+
+	completed := post(map[string]any{
+		"action": "complete",
+		"id":     created.ID,
+	})
+	if completed.Status() != "done" {
+		t.Fatalf("expected done task, got %+v", completed)
+	}
+	if completed.FollowUpAt != "" || completed.ReminderAt != "" || completed.RecheckAt != "" {
+		t.Fatalf("expected completion to clear follow-up timestamps, got %+v", completed)
+	}
+
+	req, _ = http.NewRequest(http.MethodGet, base+"/tasks", nil)
+	req.Header.Set("Authorization", "Bearer "+b.Token())
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("tasks get failed: %v", err)
+	}
+	defer resp.Body.Close()
+	var listing struct {
+		Tasks []teamTask `json:"tasks"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&listing); err != nil {
+		t.Fatalf("decode tasks list: %v", err)
+	}
+	if len(listing.Tasks) != 0 {
+		t.Fatalf("expected done task to be hidden by default, got %+v", listing.Tasks)
+	}
+}
+
+func TestBrokerTaskReassignNotifies(t *testing.T) {
+	b := newTestBroker(t)
+	if err := b.StartOnPort(0); err != nil {
+		t.Fatalf("failed to start broker: %v", err)
+	}
+	defer b.Stop()
+
+	base := fmt.Sprintf("http://%s", b.Addr())
+	post := func(payload map[string]any) teamTask {
+		// No default room any more: a mutation that names no channel is
+		// refused on purpose. These cases are not testing that rule, so the
+		// helper supplies the fixture's room.
+		if _, ok := payload["channel"]; !ok {
+			payload["channel"] = GeneralChannelSlug
+		}
+		body, _ := json.Marshal(payload)
+		req, _ := http.NewRequest(http.MethodPost, base+"/tasks", bytes.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+b.Token())
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("task post failed: %v", err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			raw, _ := io.ReadAll(resp.Body)
+			t.Fatalf("unexpected status %d: %s", resp.StatusCode, raw)
+		}
+		var result struct {
+			Task teamTask `json:"task"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+			t.Fatalf("decode task response: %v", err)
+		}
+		return result.Task
+	}
+
+	created := post(map[string]any{
+		"action":     "create",
+		"title":      "Ship reassign flow",
+		"created_by": "human",
+		"owner":      "engineering",
+	})
+	if created.Owner != "engineering" {
+		t.Fatalf("expected initial owner engineering, got %+v", created)
+	}
+
+	before := len(b.Messages())
+
+	// Reassign engineering → ops.
+	updated := post(map[string]any{
+		"action":     "reassign",
+		"id":         created.ID,
+		"owner":      "ops",
+		"created_by": "human",
+	})
+	if updated.Owner != "ops" {
+		t.Fatalf("expected owner=ops after reassign, got %q", updated.Owner)
+	}
+	if updated.Status() != "in_progress" {
+		t.Fatalf("expected status=in_progress after reassign, got %q", updated.Status())
+	}
+
+	msgs := b.Messages()[before:]
+	if len(msgs) != 3 {
+		for i, m := range msgs {
+			t.Logf("msg[%d] channel=%s from=%s content=%q", i, m.Channel, m.From, m.Content)
+		}
+		t.Fatalf("expected 3 reassign messages (channel + new + prev), got %d", len(msgs))
+	}
+
+	taskChannel := normalizeChannelSlug(updated.Channel)
+	if taskChannel == "" {
+		taskChannel = "general"
+	}
+	newDM := channelDirectSlug("human", "ops")
+	prevDM := channelDirectSlug("human", "engineering")
+
+	seen := map[string]channelMessage{}
+	for _, m := range msgs {
+		seen[m.Channel] = m
+		if m.Kind != "task_reassigned" {
+			t.Fatalf("expected kind=task_reassigned, got %q", m.Kind)
+		}
+		if m.From != "human" {
+			t.Fatalf("expected from=human, got %q", m.From)
+		}
+	}
+	chMsg, ok := seen[taskChannel]
+	if !ok {
+		t.Fatalf("expected channel message in %q; saw %v", taskChannel, keys(seen))
+	}
+	if !containsAll(chMsg.Tagged, []string{"cos", "ops", "engineering"}) {
+		t.Fatalf("expected channel message tagged cos+ops+engineering, got %v", chMsg.Tagged)
+	}
+	if !strings.Contains(chMsg.Content, "@engineering") || !strings.Contains(chMsg.Content, "@ops") {
+		t.Fatalf("expected channel content to name both owners, got %q", chMsg.Content)
+	}
+	if _, ok := seen[newDM]; !ok {
+		t.Fatalf("expected DM to new owner in %q; saw %v", newDM, keys(seen))
+	}
+	if _, ok := seen[prevDM]; !ok {
+		t.Fatalf("expected DM to prev owner in %q; saw %v", prevDM, keys(seen))
+	}
+
+	// Re-posting with the same owner should be a no-op on notifications.
+	before2 := len(b.Messages())
+	post(map[string]any{
+		"action":     "reassign",
+		"id":         created.ID,
+		"owner":      "ops",
+		"created_by": "human",
+	})
+	after2 := b.Messages()[before2:]
+	for _, m := range after2 {
+		if m.Kind == "task_reassigned" {
+			t.Fatalf("expected no new task_reassigned messages for same-owner reassign, got %+v", m)
+		}
+	}
+}
+
+func TestBrokerTaskCancelNotifies(t *testing.T) {
+	b := newTestBroker(t)
+	if err := b.StartOnPort(0); err != nil {
+		t.Fatalf("failed to start broker: %v", err)
+	}
+	defer b.Stop()
+
+	base := fmt.Sprintf("http://%s", b.Addr())
+	post := func(payload map[string]any) teamTask {
+		// No default room any more: a mutation that names no channel is
+		// refused on purpose. These cases are not testing that rule, so the
+		// helper supplies the fixture's room.
+		if _, ok := payload["channel"]; !ok {
+			payload["channel"] = GeneralChannelSlug
+		}
+		body, _ := json.Marshal(payload)
+		req, _ := http.NewRequest(http.MethodPost, base+"/tasks", bytes.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+b.Token())
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("task post failed: %v", err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			raw, _ := io.ReadAll(resp.Body)
+			t.Fatalf("unexpected status %d: %s", resp.StatusCode, raw)
+		}
+		var result struct {
+			Task teamTask `json:"task"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+			t.Fatalf("decode task response: %v", err)
+		}
+		return result.Task
+	}
+
+	created := post(map[string]any{
+		"action":     "create",
+		"title":      "Pilot the new onboarding deck",
+		"created_by": "human",
+		"owner":      "design",
+	})
+	before := len(b.Messages())
+
+	canceled := post(map[string]any{
+		"action":     "cancel",
+		"id":         created.ID,
+		"created_by": "human",
+	})
+	if canceled.Status() != "canceled" {
+		t.Fatalf("expected status=canceled, got %q", canceled.Status())
+	}
+	if canceled.FollowUpAt != "" || canceled.ReminderAt != "" || canceled.RecheckAt != "" {
+		t.Fatalf("expected cleared follow-up timestamps on cancel, got %+v", canceled)
+	}
+
+	all := b.Messages()[before:]
+	msgs := make([]channelMessage, 0, len(all))
+	for _, m := range all {
+		if m.Kind == "task_canceled" {
+			msgs = append(msgs, m)
+		}
+	}
+	if len(msgs) != 2 {
+		for i, m := range all {
+			t.Logf("all[%d] channel=%s kind=%s content=%q", i, m.Channel, m.Kind, m.Content)
+		}
+		t.Fatalf("expected 2 task_canceled messages (channel + owner DM), got %d", len(msgs))
+	}
+	taskChannel := normalizeChannelSlug(canceled.Channel)
+	if taskChannel == "" {
+		taskChannel = "general"
+	}
+	ownerDM := channelDirectSlug("human", "design")
+	found := map[string]bool{}
+	for _, m := range msgs {
+		found[m.Channel] = true
+	}
+	if !found[taskChannel] {
+		t.Fatalf("missing channel cancel message in %q", taskChannel)
+	}
+	if !found[ownerDM] {
+		t.Fatalf("missing owner DM cancel message in %q", ownerDM)
+	}
+}
+
+func channelDirectSlug(a, b string) string {
+	if a > b {
+		a, b = b, a
+	}
+	return a + "__" + b
+}
+
+func keys(m map[string]channelMessage) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
+}
+
+func containsAll(got, want []string) bool {
+	set := make(map[string]struct{}, len(got))
+	for _, g := range got {
+		set[g] = struct{}{}
+	}
+	for _, w := range want {
+		if _, ok := set[w]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func TestBrokerOfficeFeatureTaskForGTMCompletesWithoutReviewAndUnblocksDependents(t *testing.T) {
+	b := newTestBroker(t)
+	if err := b.StartOnPort(0); err != nil {
+		t.Fatalf("failed to start broker: %v", err)
+	}
+	defer b.Stop()
+
+	base := fmt.Sprintf("http://%s", b.Addr())
+	post := func(payload map[string]any) teamTask {
+		// No default room any more: a mutation that names no channel is
+		// refused on purpose. These cases are not testing that rule, so the
+		// helper supplies the fixture's room.
+		if _, ok := payload["channel"]; !ok {
+			payload["channel"] = GeneralChannelSlug
+		}
+		body, _ := json.Marshal(payload)
+		req, _ := http.NewRequest(http.MethodPost, base+"/tasks", bytes.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+b.Token())
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("task post failed: %v", err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			raw, _ := io.ReadAll(resp.Body)
+			t.Fatalf("unexpected status %d: %s", resp.StatusCode, raw)
+		}
+		var result struct {
+			Task teamTask `json:"task"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+			t.Fatalf("decode task response: %v", err)
+		}
+		return result.Task
+	}
+
+	thesis := post(map[string]any{
+		"action":         "create",
+		"title":          "Define the YouTube business thesis",
+		"details":        "Pick the niche and monetization ladder.",
+		"created_by":     "cos",
+		"owner":          "gtm",
+		"thread_id":      "msg-1",
+		"task_type":      "feature",
+		"execution_mode": "office",
+	})
+	if thesis.ReviewState() != "not_required" {
+		t.Fatalf("expected GTM office feature task to skip review, got %+v", thesis)
+	}
+
+	launch := post(map[string]any{
+		"action":         "create",
+		"title":          "Create the launch package",
+		"details":        "Build the 30-video slate.",
+		"created_by":     "cos",
+		"owner":          "gtm",
+		"thread_id":      "msg-1",
+		"task_type":      "launch",
+		"execution_mode": "office",
+		"depends_on":     []string{thesis.ID},
+	})
+	if !launch.Blocked() {
+		t.Fatalf("expected dependent launch task to start blocked, got %+v", launch)
+	}
+
+	completed := post(map[string]any{
+		"action": "complete",
+		"id":     thesis.ID,
+	})
+	if completed.Status() != "done" || completed.ReviewState() != "not_required" {
+		t.Fatalf("expected thesis task to complete directly without review, got %+v", completed)
+	}
+
+	var unblocked teamTask
+	for _, task := range b.AllTasks() {
+		if task.ID == launch.ID {
+			unblocked = task
+			break
+		}
+	}
+	if unblocked.ID == "" {
+		t.Fatalf("expected to find dependent task %s", launch.ID)
+	}
+	if unblocked.Blocked() {
+		t.Fatalf("expected dependent task to unblock after thesis completion, got %+v", unblocked)
+	}
+}
+
+func TestBrokerTaskCreateReusesExistingOpenTask(t *testing.T) {
+	b := newTestBroker(t)
+	if err := b.StartOnPort(0); err != nil {
+		t.Fatalf("failed to start broker: %v", err)
+	}
+	defer b.Stop()
+
+	base := fmt.Sprintf("http://%s", b.Addr())
+	post := func(payload map[string]any) teamTask {
+		// No default room any more: a mutation that names no channel is
+		// refused on purpose. These cases are not testing that rule, so the
+		// helper supplies the fixture's room.
+		if _, ok := payload["channel"]; !ok {
+			payload["channel"] = GeneralChannelSlug
+		}
+		body, _ := json.Marshal(payload)
+		req, _ := http.NewRequest(http.MethodPost, base+"/tasks", bytes.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+b.Token())
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("task post failed: %v", err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			raw, _ := io.ReadAll(resp.Body)
+			t.Fatalf("unexpected status %d: %s", resp.StatusCode, raw)
+		}
+		var result struct {
+			Task teamTask `json:"task"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+			t.Fatalf("decode task response: %v", err)
+		}
+		return result.Task
+	}
+
+	first := post(map[string]any{
+		"action":     "create",
+		"title":      "Own the landing page",
+		"details":    "Initial FE pass",
+		"created_by": "cos",
+		"owner":      "fe",
+		"thread_id":  "msg-1",
+	})
+	second := post(map[string]any{
+		"action":     "create",
+		"title":      "Own the landing page",
+		"details":    "Updated details",
+		"created_by": "cos",
+		"owner":      "fe",
+		"thread_id":  "msg-1",
+	})
+
+	if first.ID != second.ID {
+		t.Fatalf("expected task reuse, got %s and %s", first.ID, second.ID)
+	}
+	if second.Details != "Updated details" {
+		t.Fatalf("expected task details to update, got %+v", second)
+	}
+	// "Own the landing page" qualifies as a business objective and gets its
+	// own per-task channel, so AllTasks (not ChannelTasks("general")) is the
+	// right way to assert deduplication.
+	if got := len(b.AllTasks()); got != 1 {
+		t.Fatalf("expected one open task after reuse, got %d", got)
+	}
+}
+
+func TestBrokerEnsurePlannedTaskKeepsScopedDuplicateTitlesDistinct(t *testing.T) {
+	setPrepareTaskWorktreeForTest(t, func(taskID string) (string, string, error) {
+		return "/tmp/hivex-task-" + taskID, "hivex-" + taskID, nil
+	})
+	setCleanupTaskWorktreeForTest(t, func(path, branch string) error { return nil })
+	b := newTestBroker(t)
+
+	first, reused, err := b.EnsurePlannedTask(plannedTaskInput{
+		Channel:          "general",
+		Title:            "Publish faceless AI ops episode",
+		Details:          "Episode 1 pipeline task",
+		Owner:            "eng",
+		CreatedBy:        "cos",
+		TaskType:         "feature",
+		PipelineID:       "youtube-factory",
+		SourceDecisionID: "decision-episode-1",
+	})
+	if err != nil || reused {
+		t.Fatalf("first ensure planned task: %v reused=%v", err, reused)
+	}
+
+	second, reused, err := b.EnsurePlannedTask(plannedTaskInput{
+		Channel:          "general",
+		Title:            "Publish faceless AI ops episode",
+		Details:          "Episode 2 pipeline task",
+		Owner:            "eng",
+		CreatedBy:        "cos",
+		TaskType:         "feature",
+		PipelineID:       "youtube-factory",
+		SourceDecisionID: "decision-episode-2",
+	})
+	if err != nil || reused {
+		t.Fatalf("second ensure planned task: %v reused=%v", err, reused)
+	}
+	if first.ID == second.ID {
+		t.Fatalf("expected distinct tasks for duplicate scoped titles, got %s", first.ID)
+	}
+	// Both tasks are business objectives ("publish" + "youtube" keywords)
+	// so they each get their own per-task channel; AllTasks covers both.
+	if got := len(b.AllTasks()); got != 2 {
+		t.Fatalf("expected two planned tasks after duplicate scoped titles, got %d", got)
+	}
+
+	retry, reused, err := b.EnsurePlannedTask(plannedTaskInput{
+		Channel:          "general",
+		Title:            "Publish faceless AI ops episode",
+		Details:          "Episode 2 retry",
+		Owner:            "eng",
+		CreatedBy:        "cos",
+		TaskType:         "feature",
+		PipelineID:       "youtube-factory",
+		SourceDecisionID: "decision-episode-2",
+	})
+	if err != nil || !reused {
+		t.Fatalf("retry ensure planned task: %v reused=%v", err, reused)
+	}
+	if retry.ID != second.ID {
+		t.Fatalf("expected scoped retry to reuse second task, got %s want %s", retry.ID, second.ID)
+	}
+}
+
+// TestBrokerTaskCreateKeepsDistinctTasksInSameThread pins the non-dedup
+// invariant: two creates anchored to the SAME thread are two tasks, not one
+// reused row.
+//
+// It used to prove that by checking the two tasks landed in two DIFFERENT
+// per-task channels. That proof is gone — tasks no longer mint channels, so both
+// land in the channel they were created from. Distinctness is now pinned where
+// it actually lives: two task ids, and that channel listing both of them.
+func TestBrokerTaskCreateKeepsDistinctTasksInSameThread(t *testing.T) {
+	b := newTestBroker(t)
+	if err := b.StartOnPort(0); err != nil {
+		t.Fatalf("failed to start broker: %v", err)
+	}
+	defer b.Stop()
+
+	base := fmt.Sprintf("http://%s", b.Addr())
+	post := func(payload map[string]any) teamTask {
+		// No default room any more: a mutation that names no channel is
+		// refused on purpose. These cases are not testing that rule, so the
+		// helper supplies the fixture's room.
+		if _, ok := payload["channel"]; !ok {
+			payload["channel"] = GeneralChannelSlug
+		}
+		body, _ := json.Marshal(payload)
+		req, _ := http.NewRequest(http.MethodPost, base+"/tasks", bytes.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+b.Token())
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("task post failed: %v", err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			raw, _ := io.ReadAll(resp.Body)
+			t.Fatalf("unexpected status %d: %s", resp.StatusCode, raw)
+		}
+		var result struct {
+			Task teamTask `json:"task"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+			t.Fatalf("decode task response: %v", err)
+		}
+		return result.Task
+	}
+
+	// The channel both creates are made from. Named rather than repeated as a
+	// literal because #general is scheduled for removal (conversation moves to
+	// per-bot DMs); what these assertions pin is "the channel it was created
+	// from", not that room's name.
+	createdFrom := "general"
+	first := post(map[string]any{
+		"action":     "create",
+		"channel":    createdFrom,
+		"title":      "Build the operating system",
+		"details":    "Engineering lane",
+		"created_by": "cos",
+		"owner":      "eng",
+		"thread_id":  "msg-1",
+	})
+	second := post(map[string]any{
+		"action":     "create",
+		"channel":    createdFrom,
+		"title":      "Lock the channel thesis",
+		"details":    "GTM lane",
+		"created_by": "cos",
+		"owner":      "gtm",
+		"thread_id":  "msg-1",
+	})
+
+	if first.ID == second.ID {
+		t.Fatalf("expected distinct tasks in the same thread, got reused task id %q", first.ID)
+	}
+	// Both stay in the channel they were created from — sharing a room is the
+	// point, not a dedup failure.
+	if first.Channel != createdFrom || second.Channel != createdFrom {
+		t.Fatalf("both tasks must stay in %q, got %q and %q", createdFrom, first.Channel, second.Channel)
+	}
+	assertNoPerTaskChannels(t, b)
+	if got := len(b.ChannelTasks(createdFrom)); got != 2 {
+		t.Fatalf("expected both tasks listed in %q, got %d", createdFrom, got)
+	}
+}
+
+// assertNoPerTaskChannels fails the test when any `task-<id>` channel exists.
+// The one-room model mints none, so this is the shared guard every task-channel
+// regression test uses.
+func assertNoPerTaskChannels(t *testing.T, b *Broker) {
+	t.Helper()
+	b.mu.Lock()
+	var minted []string
+	for i := range b.channels {
+		if strings.HasPrefix(b.channels[i].Slug, "task-") {
+			minted = append(minted, b.channels[i].Slug)
+		}
+	}
+	b.mu.Unlock()
+	if len(minted) > 0 {
+		t.Fatalf("no per-task channels may be minted, got %v", minted)
+	}
+}
+
+// TestBrokerSubtaskStaysInTheOfficeChannel pins the one-room contract.
+//
+// This test used to assert the opposite: every Issue and sub-Issue minted its
+// own task-<id> channel so their chatter stayed separate. That model is gone.
+// It split the roster across rooms nobody was reading — a human @-mentioning a
+// teammate in one task channel could not be answered by a teammate who was not
+// a member of it, which is exactly how the @designer hand-off failed on
+// 2026-08-22. Work is now discussed in the office channel it was created from,
+// where the whole roster is present; Tasks remains the place to see status.
+//
+// So: a parent Issue created in #general stays in #general, a sub-Issue stays
+// with its parent, and no task-<id> channel is created for either.
+func TestBrokerSubtaskStaysInTheOfficeChannel(t *testing.T) {
+	b := newTestBroker(t)
+	ensureTestMemberAccess(b, "general", "eng", "Eng")
+	if err := b.StartOnPort(0); err != nil {
+		t.Fatalf("failed to start broker: %v", err)
+	}
+	defer b.Stop()
+
+	base := fmt.Sprintf("http://%s", b.Addr())
+	post := func(payload map[string]any) teamTask {
+		// No default room any more: a mutation that names no channel is
+		// refused on purpose. These cases are not testing that rule, so the
+		// helper supplies the fixture's room.
+		if _, ok := payload["channel"]; !ok {
+			payload["channel"] = GeneralChannelSlug
+		}
+		body, _ := json.Marshal(payload)
+		req, _ := http.NewRequest(http.MethodPost, base+"/tasks", bytes.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+b.Token())
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("task post failed: %v", err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			raw, _ := io.ReadAll(resp.Body)
+			t.Fatalf("unexpected status %d: %s", resp.StatusCode, raw)
+		}
+		var result struct {
+			Task teamTask `json:"task"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+			t.Fatalf("decode task response: %v", err)
+		}
+		return result.Task
+	}
+
+	parent := post(map[string]any{
+		"action":     "create",
+		"title":      "Ship the Q3 launch",
+		"details":    "Top-level launch objective",
+		"created_by": "cos",
+		"owner":      "eng",
+	})
+	if parent.Channel != "general" {
+		t.Fatalf("parent must stay in the channel it was created from, got %q", parent.Channel)
+	}
+	post(map[string]any{"action": "approve", "id": parent.ID, "created_by": "human"})
+
+	child := post(map[string]any{
+		"action":          "create",
+		"title":           "Draft the launch announcement copy",
+		"details":         "Sub-issue of the launch",
+		"created_by":      "cos",
+		"owner":           "eng",
+		"channel":         parent.Channel,
+		"parent_issue_id": parent.ID,
+	})
+	if child.ParentIssueID != parent.ID {
+		t.Fatalf("expected child parent_issue_id %q, got %q", parent.ID, child.ParentIssueID)
+	}
+	if child.Channel != parent.Channel {
+		t.Fatalf("sub-issue must stay with its parent in %q, got %q", parent.Channel, child.Channel)
+	}
+
+	// No task-<id> room was created for either task.
+	b.mu.Lock()
+	var minted []string
+	for i := range b.channels {
+		if strings.HasPrefix(b.channels[i].Slug, "task-") {
+			minted = append(minted, b.channels[i].Slug)
+		}
+	}
+	b.mu.Unlock()
+	if len(minted) > 0 {
+		t.Fatalf("no per-task channels may be minted, got %v", minted)
+	}
+
+	// Both tasks are visible from the one room.
+	if got := len(b.ChannelTasks("general")); got != 2 {
+		t.Fatalf("expected both tasks in #general, got %d", got)
+	}
+}
+
+// TestBrokerSecondTopLevelTaskStaysInTheOfficeChannel pins the one-room
+// contract for a SECOND top-level Issue.
+//
+// This test used to assert the opposite. Under the per-task-channel model each
+// Issue owned a room, so a second Issue created while the CEO was talking in the
+// first Issue's chat arrived carrying that chat's slug and had to be pushed out
+// into a room of its own (the live OFFICE-22 / OFFICE-28 case). With one room
+// there is nothing to be pushed out of: both Issues are created from #general,
+// both stay there, and sharing that timeline is the intent — the whole roster is
+// present for both conversations. Exercised through the HTTP /tasks path, not
+// the internal call.
+func TestBrokerSecondTopLevelTaskStaysInTheOfficeChannel(t *testing.T) {
+	b := newTestBroker(t)
+	if err := b.StartOnPort(0); err != nil {
+		t.Fatalf("failed to start broker: %v", err)
+	}
+	defer b.Stop()
+
+	base := fmt.Sprintf("http://%s", b.Addr())
+	post := func(payload map[string]any) teamTask {
+		// No default room any more: a mutation that names no channel is
+		// refused on purpose. These cases are not testing that rule, so the
+		// helper supplies the fixture's room.
+		if _, ok := payload["channel"]; !ok {
+			payload["channel"] = GeneralChannelSlug
+		}
+		body, _ := json.Marshal(payload)
+		req, _ := http.NewRequest(http.MethodPost, base+"/tasks", bytes.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+b.Token())
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("task post failed: %v", err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			raw, _ := io.ReadAll(resp.Body)
+			t.Fatalf("unexpected status %d: %s", resp.StatusCode, raw)
+		}
+		var result struct {
+			Task teamTask `json:"task"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+			t.Fatalf("decode task response: %v", err)
+		}
+		return result.Task
+	}
+
+	// The office channel both Issues are created from. Named rather than
+	// hardcoded per assertion: #general is scheduled for removal, and what these
+	// checks pin is "stays where it was created", not that room's name.
+	createdFrom := "general"
+	first := post(map[string]any{
+		"action":     "create",
+		"channel":    createdFrom,
+		"title":      "Daily Digest from email",
+		"details":    "Top-level issue one",
+		"created_by": "cos",
+	})
+	if first.Channel != createdFrom {
+		t.Fatalf("first issue must stay in the channel it was created from, got %q", first.Channel)
+	}
+
+	// Second top-level Issue (NO parent_issue_id) created from the same chat.
+	second := post(map[string]any{
+		"action":     "create",
+		"title":      "Outbound email reply bot",
+		"details":    "Top-level issue two",
+		"created_by": "cos",
+		"channel":    first.Channel,
+	})
+	if strings.TrimSpace(second.ParentIssueID) != "" {
+		t.Fatalf("expected a top-level issue (no parent), got parent %q", second.ParentIssueID)
+	}
+	if second.Channel != first.Channel {
+		t.Fatalf("second issue must stay with the first in %q, got %q", first.Channel, second.Channel)
+	}
+	assertNoPerTaskChannels(t, b)
+	// One room, both Issues: the channel lists them together and each is still
+	// its own task row.
+	if first.ID == second.ID {
+		t.Fatalf("expected two distinct issues, got the same id %q", first.ID)
+	}
+	if got := len(b.ChannelTasks(createdFrom)); got != 2 {
+		t.Fatalf("expected both issues listed in %q, got %d", createdFrom, got)
+	}
+}
+
+func TestBrokerTaskPlanAssignsWorktreeForLocalWorktreeTask(t *testing.T) {
+	setPrepareTaskWorktreeForTest(t, func(taskID string) (string, string, error) {
+		return "/tmp/hivex-task-" + taskID, "hivex-" + taskID, nil
+	})
+	setCleanupTaskWorktreeForTest(t, func(path, branch string) error { return nil })
+	b := newTestBroker(t)
+	ensureTestMemberAccess(b, "general", "operator", "Operator")
+	ensureTestMemberAccess(b, "general", "builder", "Builder")
+	if err := b.StartOnPort(0); err != nil {
+		t.Fatalf("failed to start broker: %v", err)
+	}
+	defer b.Stop()
+
+	base := fmt.Sprintf("http://%s", b.Addr())
+	body, _ := json.Marshal(map[string]any{
+		"channel":    "general",
+		"created_by": "cos",
+		"tasks": []map[string]any{
+			{
+				"title":          "Build intake dry-run review bundle",
+				"details":        "Produce the first dry-run consulting artifact bundle.",
+				"assignee":       "builder",
+				"task_type":      "feature",
+				"execution_mode": "local_worktree",
+			},
+		},
+	})
+	req, _ := http.NewRequest(http.MethodPost, base+"/task-plan", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+b.Token())
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("task plan request failed: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Fatalf("unexpected status %d: %s", resp.StatusCode, raw)
+	}
+
+	var result struct {
+		Tasks []teamTask `json:"tasks"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		t.Fatalf("decode task plan response: %v", err)
+	}
+	if len(result.Tasks) != 1 {
+		t.Fatalf("expected one task, got %+v", result.Tasks)
+	}
+	if result.Tasks[0].ExecutionMode != "local_worktree" {
+		t.Fatalf("expected local_worktree task, got %+v", result.Tasks[0])
+	}
+	if result.Tasks[0].WorktreePath == "" || result.Tasks[0].WorktreeBranch == "" {
+		t.Fatalf("expected task plan to assign worktree metadata, got %+v", result.Tasks[0])
+	}
+}
+
+func TestBrokerTaskPlanPersistsConfiguredProvider(t *testing.T) {
+	t.Setenv("HIVEX_CONFIG_PATH", filepath.Join(t.TempDir(), "config.json"))
+	if err := config.Save(config.Config{
+		LLMProvider:         "claude-code",
+		LLMProviderPriority: []string{"claude-code", "codex"},
+	}); err != nil {
+		t.Fatalf("save config: %v", err)
+	}
+	b := newTestBroker(t)
+	ensureTestMemberAccess(b, "general", "operator", "Operator")
+	ensureTestMemberAccess(b, "general", "builder", "Builder")
+	if err := b.StartOnPort(0); err != nil {
+		t.Fatalf("failed to start broker: %v", err)
+	}
+	defer b.Stop()
+
+	base := fmt.Sprintf("http://%s", b.Addr())
+	body, _ := json.Marshal(map[string]any{
+		"channel":    "general",
+		"created_by": "operator",
+		"tasks": []map[string]any{
+			{
+				"title":    "Wire provider picker",
+				"assignee": "builder",
+				"provider": "codex",
+			},
+		},
+	})
+	req, _ := http.NewRequest(http.MethodPost, base+"/task-plan", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+b.Token())
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("task plan request failed: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Fatalf("unexpected status %d: %s", resp.StatusCode, raw)
+	}
+
+	var result struct {
+		Tasks []teamTask `json:"tasks"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		t.Fatalf("decode task plan response: %v", err)
+	}
+	if len(result.Tasks) != 1 || result.Tasks[0].Provider != "codex" {
+		t.Fatalf("expected codex provider on created task, got %+v", result.Tasks)
+	}
+}
+
+func TestBrokerTaskPlanRejectsUnconfiguredProvider(t *testing.T) {
+	t.Setenv("HIVEX_CONFIG_PATH", filepath.Join(t.TempDir(), "config.json"))
+	if err := config.Save(config.Config{
+		LLMProvider:         "claude-code",
+		LLMProviderPriority: []string{"claude-code"},
+	}); err != nil {
+		t.Fatalf("save config: %v", err)
+	}
+	b := newTestBroker(t)
+	ensureTestMemberAccess(b, "general", "operator", "Operator")
+	ensureTestMemberAccess(b, "general", "builder", "Builder")
+	if err := b.StartOnPort(0); err != nil {
+		t.Fatalf("failed to start broker: %v", err)
+	}
+	defer b.Stop()
+
+	base := fmt.Sprintf("http://%s", b.Addr())
+	body, _ := json.Marshal(map[string]any{
+		"channel":    "general",
+		"created_by": "operator",
+		"tasks": []map[string]any{
+			{
+				"title":    "Wire provider picker",
+				"assignee": "builder",
+				"provider": "codex",
+			},
+		},
+	})
+	req, _ := http.NewRequest(http.MethodPost, base+"/task-plan", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+b.Token())
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("task plan request failed: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected bad request for unconfigured provider, got %d: %s", resp.StatusCode, raw)
+	}
+}
+
+func TestBrokerTaskCreateAddsAssignedOwnerToChannelMembers(t *testing.T) {
+	b := newTestBroker(t)
+	ensureTestMemberAccess(b, "youtube-factory", "operator", "Operator")
+	if existing := b.findMemberLocked("builder"); existing == nil {
+		member := officeMember{Slug: "builder", Name: "Builder"}
+		applyOfficeMemberDefaults(&member)
+		b.members = append(b.members, member)
+	}
+	if err := b.StartOnPort(0); err != nil {
+		t.Fatalf("failed to start broker: %v", err)
+	}
+	defer b.Stop()
+
+	base := fmt.Sprintf("http://%s", b.Addr())
+	body, _ := json.Marshal(map[string]any{
+		"action":     "create",
+		"channel":    "youtube-factory",
+		"title":      "Restore remotion dependency path",
+		"details":    "Unblock the real render lane.",
+		"created_by": "cos",
+		"owner":      "builder",
+		"task_type":  "feature",
+	})
+	req, _ := http.NewRequest(http.MethodPost, base+"/tasks", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+b.Token())
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("task create request failed: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Fatalf("unexpected status %d: %s", resp.StatusCode, raw)
+	}
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	ch := b.findChannelLocked("youtube-factory")
+	if ch == nil {
+		t.Fatal("expected youtube-factory channel to exist")
+	}
+	if !containsString(ch.Members, "builder") {
+		t.Fatalf("expected assigned owner to be added to channel members, got %v", ch.Members)
+	}
+	if containsString(ch.Disabled, "builder") {
+		t.Fatalf("expected assigned owner to be enabled in channel, got disabled=%v", ch.Disabled)
+	}
+}
+
+func TestBrokerResumeTaskUnblocksAndSchedulesOwnerLane(t *testing.T) {
+	b := newTestBroker(t)
+	ensureTestMemberAccess(b, "client-loop", "operator", "Operator")
+	ensureTestMemberAccess(b, "client-loop", "builder", "Builder")
+	task, reused, err := b.EnsurePlannedTask(plannedTaskInput{
+		Channel:       "client-loop",
+		Title:         "Retry kickoff send",
+		Details:       "429 RESOURCE_EXHAUSTED. Retry after 2026-04-15T22:00:29.610Z.",
+		Owner:         "builder",
+		CreatedBy:     "cos",
+		TaskType:      "follow_up",
+		ExecutionMode: "live_external",
+	})
+	if err != nil || reused {
+		t.Fatalf("ensure planned task: %v reused=%v", err, reused)
+	}
+	if _, changed, err := b.BlockTask(task.ID, "operator", "Provider cooldown", ""); err != nil || !changed {
+		t.Fatalf("block task: %v changed=%v", err, changed)
+	}
+
+	resumed, changed, err := b.ResumeTask(task.ID, "watchdog", "Retry window passed")
+	if err != nil {
+		t.Fatalf("resume task: %v", err)
+	}
+	if !changed {
+		t.Fatalf("expected resume to change task state, got %+v", resumed)
+	}
+	if resumed.Blocked() || resumed.Status() != "in_progress" {
+		t.Fatalf("expected resumed task to be active, got %+v", resumed)
+	}
+	if resumed.FollowUpAt == "" {
+		t.Fatalf("expected resumed task to have follow-up lifecycle timestamps, got %+v", resumed)
+	}
+}
+
+// TestBrokerResumeTaskStripsRateLimitMarker guards against the phantom
+// notification loop where the watchdog re-resumes a task indefinitely because
+// a stale "Retry after <ts>" line is left in task.Details after the first
+// resume. The fix: ResumeTask must call stripExternalRetryMarker so the
+// marker cannot be detected on the next scheduler tick.
+//
+// Also asserts pre-block context that does NOT contain a parseable
+// retry-after timestamp survives the resume — over-stripping would silently
+// destroy operator notes on every Blocked→false transition (manual unblocks,
+// dependency releases, capability self-healing, not just cooldown recovery).
+func TestBrokerResumeTaskStripsRateLimitMarker(t *testing.T) {
+	b := newTestBroker(t)
+	ensureTestMemberAccess(b, "client-loop", "operator", "Operator")
+	ensureTestMemberAccess(b, "client-loop", "builder", "Builder")
+
+	const preBlockContext = "Investigate ticket SUP-4290 about login failures"
+	const rateLimitLine = "429 RESOURCE_EXHAUSTED. Retry after 2026-04-15T22:00:29.610Z."
+	task, _, err := b.EnsurePlannedTask(plannedTaskInput{
+		Channel:       "client-loop",
+		Title:         "Retry kickoff send",
+		Details:       preBlockContext + "\n" + rateLimitLine,
+		Owner:         "builder",
+		CreatedBy:     "cos",
+		TaskType:      "follow_up",
+		ExecutionMode: "live_external",
+	})
+	if err != nil {
+		t.Fatalf("ensure planned task: %v", err)
+	}
+	if _, changed, err := b.BlockTask(task.ID, "watchdog", "Provider cooldown", ""); err != nil || !changed {
+		t.Fatalf("block task: %v changed=%v", err, changed)
+	}
+
+	resumed, _, err := b.ResumeTask(task.ID, "watchdog", "Retry window passed")
+	if err != nil {
+		t.Fatalf("resume task: %v", err)
+	}
+	if resumed.Blocked() {
+		t.Fatalf("expected task to be unblocked after resume, got blocked=true")
+	}
+
+	// The rate-limit marker must be gone so the watchdog's
+	// externalWorkflowRetryAfter check cannot re-trigger the resume loop.
+	if externalRetryAfterPattern.MatchString(resumed.Details) {
+		t.Fatalf("stale rate-limit marker still present in Details after resume: %q", resumed.Details)
+	}
+	// The pre-block operator context must survive — it has no parseable
+	// retry-after timestamp, so over-stripping would be a regression.
+	if !strings.Contains(resumed.Details, preBlockContext) {
+		t.Fatalf("expected resume to preserve pre-block context %q in Details, got %q", preBlockContext, resumed.Details)
+	}
+}
+
+// TestBrokerResumeTaskPreservesDetailsWithoutMarker asserts that a task
+// resume on a non-cooldown path (operator manual unblock, dependency-resolved
+// release, capability self-healing) does not touch Details when there is no
+// rate-limit marker present. Strip is scoped to the actual loop trigger.
+func TestBrokerResumeTaskPreservesDetailsWithoutMarker(t *testing.T) {
+	b := newTestBroker(t)
+	ensureTestMemberAccess(b, "client-loop", "operator", "Operator")
+	ensureTestMemberAccess(b, "client-loop", "builder", "Builder")
+
+	const detailsNoMarker = "queued behind active lane on task-4290; awaiting dependency resolution"
+	task, _, err := b.EnsurePlannedTask(plannedTaskInput{
+		Channel:   "client-loop",
+		Title:     "Dependent kickoff",
+		Details:   detailsNoMarker,
+		Owner:     "builder",
+		CreatedBy: "cos",
+		TaskType:  "follow_up",
+	})
+	if err != nil {
+		t.Fatalf("ensure planned task: %v", err)
+	}
+	if _, changed, err := b.BlockTask(task.ID, "operator", "Manual hold", ""); err != nil || !changed {
+		t.Fatalf("block task: %v changed=%v", err, changed)
+	}
+	resumed, _, err := b.ResumeTask(task.ID, "operator", "Manual unblock")
+	if err != nil {
+		t.Fatalf("resume task: %v", err)
+	}
+	// Block/Resume append their own reason text to Details (existing behavior);
+	// what matters here is that strip did not destroy the pre-block context
+	// and that the substring "task-4290" containing "429" survives the
+	// strip's predicate (which requires a parseable retry-after timestamp).
+	if !strings.Contains(resumed.Details, detailsNoMarker) {
+		t.Fatalf("resume dropped pre-block context: got %q", resumed.Details)
+	}
+	if externalRetryAfterPattern.MatchString(resumed.Details) {
+		t.Fatalf("resume should not introduce a retry-after marker: got %q", resumed.Details)
+	}
+}
+
+// TestBrokerUnblockDependentsStripsRateLimitMarker covers the second
+// Blocked→false transition path: when a dependency completion clears the
+// blocked flag, a stale rate-limit marker would otherwise survive in
+// Details, the watchdog's externalWorkflowRetryAfter check would re-detect
+// it on the next tick, and ResumeTask's existing strip would fire — but
+// before this test was added, ResumeTask only stripped on the
+// blocked-true→false transition, so a marker present after
+// unblockDependentsLocked would persist indefinitely. The fix strips both
+// at the source (unblockDependentsLocked) and unconditionally in
+// ResumeTask, so either path now closes the loop.
+func TestBrokerUnblockDependentsStripsRateLimitMarker(t *testing.T) {
+	b := newTestBroker(t)
+	ensureTestMemberAccess(b, "client-loop", "operator", "Operator")
+	ensureTestMemberAccess(b, "client-loop", "builder", "Builder")
+
+	now := time.Now().UTC().Format(time.RFC3339)
+	b.tasks = []teamTask{
+		{
+			ID: "task-parent", Channel: "client-loop", Title: "Prereq",
+			Owner: "builder", status: "done", CreatedBy: "cos",
+			TaskType: "feature", ExecutionMode: "local_worktree",
+			reviewState: "approved", CreatedAt: now, UpdatedAt: now,
+		},
+		{
+			ID: "task-child", Channel: "client-loop", Title: "Dependent kickoff",
+			Owner: "builder", status: "blocked", blocked: true,
+			CreatedBy: "cos", TaskType: "feature", ExecutionMode: "live_external",
+			DependsOn: []string{"task-parent"},
+			Details:   "Original goal: ship dependent kickoff.\n429 RESOURCE_EXHAUSTED. Retry after 2026-04-15T22:00:29.610Z.",
+			CreatedAt: now, UpdatedAt: now,
+		},
+	}
+
+	b.mu.Lock()
+	b.unblockDependentsLocked("task-parent")
+	got := append([]teamTask(nil), b.tasks...)
+	b.mu.Unlock()
+
+	child := got[1]
+	if child.Blocked() {
+		t.Fatalf("expected child task to be unblocked after dependency completion, got blocked=true")
+	}
+	if externalRetryAfterPattern.MatchString(child.Details) {
+		t.Fatalf("dependency-unblock did not strip the stale rate-limit marker: %q", child.Details)
+	}
+	if !strings.Contains(child.Details, "Original goal: ship dependent kickoff.") {
+		t.Fatalf("dependency-unblock should preserve pre-block context, got %q", child.Details)
+	}
+}
+
+// TestBrokerResumeKeepsTaskBlockedByRealDependency: resume must honor a real
+// declared dependency. A task that depends on an unfinished task stays blocked
+// even after a transient block (a cooldown) is cleared — only the dependency
+// completing activates it. This is the inverse of "non-dependent tasks run
+// together": dependent tasks do NOT. (Previously the now-removed exclusive-owner
+// lane re-blocked here; the gate is now the real dependency itself.)
+func TestBrokerResumeKeepsTaskBlockedByRealDependency(t *testing.T) {
+	b := newTestBroker(t)
+	ensureTestMemberAccess(b, "client-loop", "operator", "Operator")
+	ensureTestMemberAccess(b, "client-loop", "builder", "Builder")
+
+	active, reused, err := b.EnsurePlannedTask(plannedTaskInput{
+		Channel:       "client-loop",
+		Title:         "Send kickoff email",
+		Owner:         "builder",
+		CreatedBy:     "cos",
+		TaskType:      "follow_up",
+		ExecutionMode: "live_external",
+	})
+	if err != nil || reused {
+		t.Fatalf("ensure active task: %v reused=%v", err, reused)
+	}
+	task, reused, err := b.EnsurePlannedTask(plannedTaskInput{
+		Channel:       "client-loop",
+		Title:         "Send second kickoff email",
+		Owner:         "builder",
+		CreatedBy:     "cos",
+		TaskType:      "follow_up",
+		ExecutionMode: "live_external",
+		DependsOn:     []string{active.ID},
+	})
+	if err != nil || reused {
+		t.Fatalf("ensure dependent task: %v reused=%v", err, reused)
+	}
+	if !task.blocked {
+		t.Fatalf("expected dependent task to start blocked on its dependency, got %+v", task)
+	}
+	if _, changed, err := b.BlockTask(task.ID, "operator", "provider cooldown", ""); err != nil || !changed {
+		t.Fatalf("block task: %v changed=%v", err, changed)
+	}
+
+	resumed, _, err := b.ResumeTask(task.ID, "watchdog", "Retry window passed")
+	if err != nil {
+		t.Fatalf("resume task: %v", err)
+	}
+	// The real dependency (active) is still in_progress, so resume must NOT
+	// activate the dependent — it stays blocked.
+	if !resumed.Blocked() {
+		t.Fatalf("expected dependent task to stay blocked while its dependency runs, got %+v", resumed)
+	}
+	if resumed.Status() == "in_progress" {
+		t.Fatalf("expected dependent task NOT to be in_progress while its dependency runs, got %+v", resumed)
+	}
+	if !containsString(resumed.DependsOn, active.ID) {
+		t.Fatalf("expected resumed task to remain dependent on %s, got %+v", active.ID, resumed)
+	}
+}
+
+// TestBrokerUnblockDependentsActivatesAllNonDependentLanes: when a task
+// completes, ALL of its dependents activate at once — they depend on the
+// completed task, not on each other, so "non-dependent tasks run together"
+// applies. (Previously the exclusive-owner lane serialized them per owner; that
+// synthetic serialization is gone.)
+func TestBrokerUnblockDependentsActivatesAllNonDependentLanes(t *testing.T) {
+	b := newTestBroker(t)
+	ensureTestMemberAccess(b, "youtube-factory", "cos", "CEO")
+	ensureTestMemberAccess(b, "youtube-factory", "executor", "Executor")
+
+	now := time.Now().UTC().Format(time.RFC3339)
+	b.tasks = []teamTask{
+		{
+			ID:            "task-setup",
+			Channel:       "youtube-factory",
+			Title:         "Finish prerequisite slice",
+			Owner:         "executor",
+			status:        "done",
+			CreatedBy:     "cos",
+			TaskType:      "feature",
+			ExecutionMode: "local_worktree",
+			reviewState:   "approved",
+			CreatedAt:     now,
+			UpdatedAt:     now,
+		},
+		{
+			ID:            "task-32",
+			Channel:       "youtube-factory",
+			Title:         "First dependent lane",
+			Owner:         "executor",
+			status:        "blocked",
+			blocked:       true,
+			CreatedBy:     "cos",
+			TaskType:      "feature",
+			ExecutionMode: "live_external",
+			DependsOn:     []string{"task-setup"},
+			CreatedAt:     now,
+			UpdatedAt:     now,
+		},
+		{
+			ID:            "task-34",
+			Channel:       "youtube-factory",
+			Title:         "Second dependent lane",
+			Owner:         "executor",
+			status:        "blocked",
+			blocked:       true,
+			CreatedBy:     "cos",
+			TaskType:      "feature",
+			ExecutionMode: "live_external",
+			DependsOn:     []string{"task-setup"},
+			CreatedAt:     now,
+			UpdatedAt:     now,
+		},
+		{
+			ID:            "task-80",
+			Channel:       "youtube-factory",
+			Title:         "Third dependent lane",
+			Owner:         "executor",
+			status:        "blocked",
+			blocked:       true,
+			CreatedBy:     "cos",
+			TaskType:      "feature",
+			ExecutionMode: "live_external",
+			DependsOn:     []string{"task-setup"},
+			CreatedAt:     now,
+			UpdatedAt:     now,
+		},
+	}
+
+	b.mu.Lock()
+	b.unblockDependentsLocked("task-setup")
+	got := append([]teamTask(nil), b.tasks...)
+	b.mu.Unlock()
+
+	// All three dependents only depended on task-setup, so all three activate
+	// concurrently once it completes — none is queued behind another.
+	for _, task := range got[1:] {
+		if task.Status() != "in_progress" || task.Blocked() {
+			t.Fatalf("expected dependent %s to activate concurrently (in_progress, not blocked), got %+v", task.ID, task)
+		}
+		if task.LifecycleState == LifecycleStateQueuedBehindOwner {
+			t.Fatalf("expected dependent %s NOT to be queued behind owner, got %q", task.ID, task.LifecycleState)
+		}
+	}
+}
+
+func TestBrokerTaskPlanRejectsTheaterTaskInLiveDeliveryLane(t *testing.T) {
+	b := newTestBroker(t)
+	ensureTestMemberAccess(b, "client-delivery", "operator", "Operator")
+	ensureTestMemberAccess(b, "client-delivery", "builder", "Builder")
+	if err := b.StartOnPort(0); err != nil {
+		t.Fatalf("failed to start broker: %v", err)
+	}
+	defer b.Stop()
+
+	base := fmt.Sprintf("http://%s", b.Addr())
+	body, _ := json.Marshal(map[string]any{
+		"channel":    "client-delivery",
+		"created_by": "cos",
+		"tasks": []map[string]any{
+			{
+				"title":          "Generate consulting review packet artifact from the updated blueprint",
+				"details":        "Post the exact local artifact path for the reviewer.",
+				"assignee":       "builder",
+				"task_type":      "feature",
+				"execution_mode": "local_worktree",
+			},
+		},
+	})
+	req, _ := http.NewRequest(http.MethodPost, base+"/task-plan", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+b.Token())
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("task plan request failed: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusConflict {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Fatalf("unexpected status %d: %s", resp.StatusCode, raw)
+	}
+}
+
+func TestBrokerTaskCreateRejectsLiveBusinessTheater(t *testing.T) {
+	b := newTestBroker(t)
+	ensureTestMemberAccess(b, "general", "operator", "Operator")
+	ensureTestMemberAccess(b, "general", "builder", "Builder")
+	if err := b.StartOnPort(0); err != nil {
+		t.Fatalf("failed to start broker: %v", err)
+	}
+	defer b.Stop()
+
+	base := fmt.Sprintf("http://%s", b.Addr())
+	body, _ := json.Marshal(map[string]any{
+		"action":         "create",
+		"channel":        "general",
+		"title":          "Create one new Notion proof packet for the client handoff",
+		"details":        "Use live external execution and keep the review bundle in sync.",
+		"created_by":     "cos",
+		"owner":          "builder",
+		"task_type":      "launch",
+		"execution_mode": "live_external",
+	})
+	req, _ := http.NewRequest(http.MethodPost, base+"/tasks", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+b.Token())
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("task create request failed: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusConflict {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected theater rejection, got status %d: %s", resp.StatusCode, raw)
+	}
+}
+
+func TestBrokerTaskCompleteRejectsLiveBusinessTheater(t *testing.T) {
+	b := newTestBroker(t)
+	ensureTestMemberAccess(b, "general", "operator", "Operator")
+	ensureTestMemberAccess(b, "general", "builder", "Builder")
+	if err := b.StartOnPort(0); err != nil {
+		t.Fatalf("failed to start broker: %v", err)
+	}
+	defer b.Stop()
+	t.Cleanup(func() { b.Purge() })
+	b.mu.Lock()
+	b.tasks = []teamTask{{
+		ID:            "task-1",
+		Channel:       "general",
+		Title:         "Create one new Notion proof packet for the client handoff",
+		Details:       "Use live external execution and keep the review bundle in sync.",
+		Owner:         "builder",
+		status:        "in_progress",
+		CreatedBy:     "cos",
+		TaskType:      "launch",
+		ExecutionMode: "live_external",
+		CreatedAt:     "2026-04-15T00:00:00Z",
+		UpdatedAt:     "2026-04-15T00:00:00Z",
+	}}
+	b.counter = 1
+	b.mu.Unlock()
+
+	base := fmt.Sprintf("http://%s", b.Addr())
+	body, _ := json.Marshal(map[string]any{
+		"action":     "complete",
+		"channel":    "general",
+		"id":         "task-1",
+		"created_by": "cos",
+	})
+	req, _ := http.NewRequest(http.MethodPost, base+"/tasks", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+b.Token())
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("task complete request failed: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusConflict {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected theater rejection on completion, got status %d: %s", resp.StatusCode, raw)
+	}
+	b.mu.Lock()
+	gotStatus := b.tasks[0].status
+	b.mu.Unlock()
+	if gotStatus != "in_progress" {
+		t.Fatalf("failed completion should roll back task status, got %q", gotStatus)
+	}
+}
+
+func TestBrokerTaskUpdateRollsBackBrokerSideEffectsOnSaveFailure(t *testing.T) {
+	b := newTestBroker(t)
+	ensureTestMemberAccess(b, "general", "operator", "Operator")
+	ensureTestMemberAccess(b, "general", "builder", "Builder")
+	if err := b.StartOnPort(0); err != nil {
+		t.Fatalf("failed to start broker: %v", err)
+	}
+	defer b.Stop()
+	t.Cleanup(func() { b.Purge() })
+	b.mu.Lock()
+	b.tasks = []teamTask{
+		{
+			ID:        "task-1",
+			Channel:   "general",
+			Title:     "Implement reusable importer",
+			Owner:     "builder",
+			status:    "in_progress",
+			CreatedBy: "cos",
+			TaskType:  "feature",
+			CreatedAt: "2026-04-15T00:00:00Z",
+			UpdatedAt: "2026-04-15T00:00:00Z",
+		},
+		{
+			ID:        "task-2",
+			Channel:   "general",
+			Title:     "Follow-up importer docs",
+			status:    "open",
+			CreatedBy: "cos",
+			TaskType:  "feature",
+			DependsOn: []string{"task-1"},
+			blocked:   true,
+			CreatedAt: "2026-04-15T00:00:00Z",
+			UpdatedAt: "2026-04-15T00:00:00Z",
+		},
+	}
+	b.counter = 7
+	b.statePath = t.TempDir()
+	b.mu.Unlock()
+
+	body, _ := json.Marshal(map[string]any{
+		"action":     "complete",
+		"channel":    "general",
+		"id":         "task-1",
+		"created_by": "cos",
+	})
+	req, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("http://%s/tasks", b.Addr()), bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+b.Token())
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("task complete request failed: %v", err)
+	}
+	raw, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("expected save failure, got status %d: %s", resp.StatusCode, raw)
+	}
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.tasks[0].status != "in_progress" {
+		t.Fatalf("failed save should roll back completed task, got %+v", b.tasks[0])
+	}
+	if !b.tasks[1].blocked || b.tasks[1].status != "open" {
+		t.Fatalf("failed save should roll back dependent unblock, got %+v", b.tasks[1])
+	}
+	if b.counter != 7 {
+		t.Fatalf("failed save should roll back broker counter, got %d", b.counter)
+	}
+	if got := len(b.actions); got != 0 {
+		t.Fatalf("failed save should roll back action log, got %+v", b.actions[:got])
+	}
+}
+
+func TestBrokerStoresLedgerAndReviewLifecycle(t *testing.T) {
+	setPrepareTaskWorktreeForTest(t, func(taskID string) (string, string, error) {
+		return "/tmp/hivex-task-" + taskID, "hivex-" + taskID, nil
+	})
+	setCleanupTaskWorktreeForTest(t, func(path, branch string) error { return nil })
+	b := newTestBroker(t)
+	if err := b.StartOnPort(0); err != nil {
+		t.Fatalf("failed to start broker: %v", err)
+	}
+	defer b.Stop()
+
+	signals, err := b.RecordSignals([]officeSignal{{
+		ID:         "hive-1",
+		Source:     "hive_insights",
+		Kind:       "risk",
+		Title:      "Hive insight",
+		Content:    "Signup conversion is slipping.",
+		Channel:    "general",
+		Owner:      "fe",
+		Confidence: "high",
+		Urgency:    "high",
+	}})
+	if err != nil || len(signals) != 1 {
+		t.Fatalf("record signals: %v %v", err, signals)
+	}
+	decision, err := b.RecordDecision("create_task", "general", "Open a frontend follow-up.", "High-signal conversion risk.", "fe", []string{signals[0].ID}, false, false)
+	if err != nil {
+		t.Fatalf("record decision: %v", err)
+	}
+	task, reused, err := b.EnsurePlannedTask(plannedTaskInput{
+		Channel:          "general",
+		Title:            "Build signup conversion fix",
+		Details:          "Own the CTA and onboarding flow.",
+		Owner:            "fe",
+		CreatedBy:        "cos",
+		ThreadID:         "msg-1",
+		TaskType:         "feature",
+		SourceSignalID:   signals[0].ID,
+		SourceDecisionID: decision.ID,
+	})
+	if err != nil || reused {
+		t.Fatalf("ensure planned task: %v reused=%v", err, reused)
+	}
+	if task.pipelineStage != "implement" || task.ExecutionMode != "local_worktree" || task.SourceDecisionID != decision.ID {
+		t.Fatalf("expected structured task metadata, got %+v", task)
+	}
+	if task.WorktreePath == "" || task.WorktreeBranch == "" {
+		t.Fatalf("expected planned task worktree metadata, got %+v", task)
+	}
+
+	base := fmt.Sprintf("http://%s", b.Addr())
+	body, _ := json.Marshal(map[string]any{
+		"action":     "complete",
+		"channel":    "general",
+		"id":         task.ID,
+		"created_by": "you",
+	})
+	req, _ := http.NewRequest(http.MethodPost, base+"/tasks", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+b.Token())
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("complete task: %v", err)
+	}
+	defer resp.Body.Close()
+	var result struct {
+		Task teamTask `json:"task"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		t.Fatalf("decode completed task: %v", err)
+	}
+	if result.Task.Status() != "review" || result.Task.ReviewState() != "ready_for_review" {
+		t.Fatalf("expected review-ready task, got %+v", result.Task)
+	}
+
+	if _, _, err := b.CreateWatchdogAlert("task_stalled", "general", "task", task.ID, "fe", "Task is waiting for movement."); err != nil {
+		t.Fatalf("create watchdog: %v", err)
+	}
+	if len(b.Decisions()) != 1 || len(b.Signals()) != 1 || len(b.Watchdogs()) != 1 {
+		t.Fatalf("expected ledger state, got signals=%d decisions=%d watchdogs=%d", len(b.Signals()), len(b.Decisions()), len(b.Watchdogs()))
+	}
+}
+
+func TestBrokerReleaseTaskCleansWorktree(t *testing.T) {
+	var cleanedPath, cleanedBranch string
+	setPrepareTaskWorktreeForTest(t, func(taskID string) (string, string, error) {
+		return "/tmp/hivex-task-" + taskID, "hivex-" + taskID, nil
+	})
+	setCleanupTaskWorktreeForTest(t, func(path, branch string) error {
+		cleanedPath = path
+		cleanedBranch = branch
+		return nil
+	})
+	b := newTestBroker(t)
+	if err := b.StartOnPort(0); err != nil {
+		t.Fatalf("failed to start broker: %v", err)
+	}
+	defer b.Stop()
+
+	task, reused, err := b.EnsurePlannedTask(plannedTaskInput{
+		Channel:   "general",
+		Title:     "Build signup conversion fix",
+		Owner:     "fe",
+		CreatedBy: "cos",
+		TaskType:  "feature",
+	})
+	if err != nil || reused {
+		t.Fatalf("ensure planned task: %v reused=%v", err, reused)
+	}
+
+	base := fmt.Sprintf("http://%s", b.Addr())
+	body, _ := json.Marshal(map[string]any{
+		"action":     "release",
+		"channel":    "general",
+		"id":         task.ID,
+		"created_by": "cos",
+	})
+	req, _ := http.NewRequest(http.MethodPost, base+"/tasks", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+b.Token())
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("release task: %v", err)
+	}
+	defer resp.Body.Close()
+
+	var result struct {
+		Task teamTask `json:"task"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		t.Fatalf("decode released task: %v", err)
+	}
+	if cleanedPath == "" || cleanedBranch == "" {
+		t.Fatalf("expected cleanup to run, got path=%q branch=%q", cleanedPath, cleanedBranch)
+	}
+	if result.Task.WorktreePath != "" || result.Task.WorktreeBranch != "" {
+		t.Fatalf("expected released task worktree metadata to clear, got %+v", result.Task)
+	}
+}
+
+func TestBrokerApproveRetainsLocalWorktree(t *testing.T) {
+	cleanupCalls := 0
+	worktreeRoot := t.TempDir()
+	setPrepareTaskWorktreeForTest(t, func(taskID string) (string, string, error) {
+		path := filepath.Join(worktreeRoot, "hivex-task-"+taskID)
+		initUsableGitWorktree(t, path)
+		return path, "hivex-" + taskID, nil
+	})
+	setCleanupTaskWorktreeForTest(t, func(path, branch string) error {
+		cleanupCalls++
+		return nil
+	})
+	b := newTestBroker(t)
+	if err := b.StartOnPort(0); err != nil {
+		t.Fatalf("failed to start broker: %v", err)
+	}
+	defer b.Stop()
+
+	task, reused, err := b.EnsurePlannedTask(plannedTaskInput{
+		Channel:   "general",
+		Title:     "Build signup conversion fix",
+		Owner:     "fe",
+		CreatedBy: "cos",
+		TaskType:  "feature",
+	})
+	if err != nil || reused {
+		t.Fatalf("ensure planned task: %v reused=%v", err, reused)
+	}
+
+	base := fmt.Sprintf("http://%s", b.Addr())
+	completeBody, _ := json.Marshal(map[string]any{
+		"action":     "complete",
+		"channel":    "general",
+		"id":         task.ID,
+		"created_by": "cos",
+	})
+	req, _ := http.NewRequest(http.MethodPost, base+"/tasks", bytes.NewReader(completeBody))
+	req.Header.Set("Authorization", "Bearer "+b.Token())
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("complete task: %v", err)
+	}
+	resp.Body.Close()
+
+	approveBody, _ := json.Marshal(map[string]any{
+		"action":     "approve",
+		"channel":    "general",
+		"id":         task.ID,
+		"created_by": "cos",
+	})
+	req, _ = http.NewRequest(http.MethodPost, base+"/tasks", bytes.NewReader(approveBody))
+	req.Header.Set("Authorization", "Bearer "+b.Token())
+	req.Header.Set("Content-Type", "application/json")
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("approve task: %v", err)
+	}
+	defer resp.Body.Close()
+
+	var result struct {
+		Task teamTask `json:"task"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		t.Fatalf("decode approved task: %v", err)
+	}
+	if result.Task.Status() != "done" || result.Task.ReviewState() != "approved" {
+		t.Fatalf("expected approved task to be done/approved, got %+v", result.Task)
+	}
+	if result.Task.WorktreePath == "" || result.Task.WorktreeBranch == "" {
+		t.Fatalf("expected approved task to retain worktree metadata, got %+v", result.Task)
+	}
+	if cleanupCalls != 0 {
+		t.Fatalf("expected approved task to retain worktree without cleanup, got %d cleanup calls", cleanupCalls)
+	}
+}
+
+func ensureTestMemberAccess(b *Broker, channel, slug, name string) {
+	if b == nil {
+		return
+	}
+	slug = normalizeChannelSlug(slug)
+	if slug == "" {
+		return
+	}
+	if existing := b.findMemberLocked(slug); existing == nil {
+		member := officeMember{Slug: slug, Name: name}
+		applyOfficeMemberDefaults(&member)
+		b.members = append(b.members, member)
+	}
+	for i := range b.channels {
+		if normalizeChannelSlug(b.channels[i].Slug) != normalizeChannelSlug(channel) {
+			continue
+		}
+		if !containsString(b.channels[i].Members, slug) {
+			b.channels[i].Members = append(b.channels[i].Members, slug)
+		}
+		if !containsString(b.channels[i].Members, "cos") {
+			b.channels[i].Members = append(b.channels[i].Members, "cos")
+		}
+		return
+	}
+	b.channels = append(b.channels, teamChannel{
+		Slug: normalizeChannelSlug(channel),
+		Name: normalizeChannelSlug(channel),
+		// Mirror production: createChannel seeds every non-DM channel with
+		// the CEO (broker_office_channels.go, `final := append([]string{"cos"},
+		// …)`). Fixtures used to omit it and still work because the CEO held a
+		// blanket channel-access bypass; membership is authoritative for every
+		// bot now, so a fixture without the CEO is a fixture that does not
+		// look like a real workspace. DMs are the deliberate exception and are
+		// built explicitly elsewhere — never through this helper.
+		Members: []string{slug, "cos"},
+	})
+}
+
+func TestBrokerHandlePostTaskRejectsFalseReadOnlyBlockForWritableWorktree(t *testing.T) {
+	worktreeDir := t.TempDir()
+	setPrepareTaskWorktreeForTest(t, func(taskID string) (string, string, error) {
+		return worktreeDir, "hivex-" + taskID, nil
+	})
+	setCleanupTaskWorktreeForTest(t, func(path, branch string) error { return nil })
+	setVerifyTaskWorktreeWritableForTest(t, func(path string) error {
+		if path != worktreeDir {
+			t.Fatalf("expected probe path %q, got %q", worktreeDir, path)
+		}
+		return nil
+	})
+	b := newTestBroker(t)
+	ensureTestMemberAccess(b, "general", "eng", "Engineer")
+	if err := b.StartOnPort(0); err != nil {
+		t.Fatalf("failed to start broker: %v", err)
+	}
+	defer b.Stop()
+
+	task, reused, err := b.EnsurePlannedTask(plannedTaskInput{
+		Channel:       "general",
+		Title:         "Implement the first runnable generator slice",
+		Owner:         "eng",
+		CreatedBy:     "cos",
+		TaskType:      "feature",
+		ExecutionMode: "local_worktree",
+	})
+	if err != nil || reused {
+		t.Fatalf("ensure planned task: %v reused=%v", err, reused)
+	}
+
+	base := fmt.Sprintf("http://%s", b.Addr())
+	body, _ := json.Marshal(map[string]any{
+		"action":     "block",
+		"channel":    "general",
+		"id":         task.ID,
+		"created_by": "cos",
+		"details":    "This turn is running in a read-only filesystem sandbox. Need a writable workspace.",
+	})
+	req, _ := http.NewRequest(http.MethodPost, base+"/tasks", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+b.Token())
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("post block task: %v", err)
+	}
+	defer resp.Body.Close()
+
+	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("expected 409 rejecting bogus workspace block, got %d: %s", resp.StatusCode, raw)
+	}
+	if !strings.Contains(string(raw), "assigned local worktree is writable") {
+		t.Fatalf("expected writable-worktree guidance, got %s", raw)
+	}
+
+	var updated teamTask
+	for _, candidate := range b.AllTasks() {
+		if candidate.ID == task.ID {
+			updated = candidate
+			break
+		}
+	}
+	if updated.ID == "" {
+		t.Fatalf("expected to find task %s", task.ID)
+	}
+	if updated.Status() != "in_progress" || updated.Blocked() {
+		t.Fatalf("expected task to remain active after rejected block, got %+v", updated)
+	}
+	if strings.Contains(strings.ToLower(updated.Details), "read-only") {
+		t.Fatalf("expected false read-only detail to stay out of task state, got %+v", updated)
+	}
+}
+
+func TestBrokerHandlePostTaskCapabilityGapCreatesSelfHealingTask(t *testing.T) {
+	b := newTestBroker(t)
+	ensureTestMemberAccess(b, "general", "eng", "Engineer")
+	if err := b.StartOnPort(0); err != nil {
+		t.Fatalf("failed to start broker: %v", err)
+	}
+	defer b.Stop()
+
+	task, reused, err := b.EnsurePlannedTask(plannedTaskInput{
+		Channel:       "general",
+		Title:         "Post client launch update to Slack",
+		Owner:         "eng",
+		CreatedBy:     "cos",
+		TaskType:      "follow_up",
+		ExecutionMode: "office",
+	})
+	if err != nil || reused {
+		t.Fatalf("ensure planned task: %v reused=%v", err, reused)
+	}
+
+	detail := "Unable to continue: missing Slack integration tool path for posting the client update."
+	body, _ := json.Marshal(map[string]any{
+		"action":  "block",
+		"channel": "general",
+		"id":      task.ID,
+		// Owner ("eng") signals they're blocked — owner-allowed for
+		// block action per Slice 7. The self-heal task gets named
+		// after them so the recovery path attributes correctly.
+		"created_by": "eng",
+		"details":    detail,
+	})
+	req, _ := http.NewRequest(http.MethodPost, "http://"+b.Addr()+"/tasks", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+b.Token())
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("post block task: %v", err)
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 blocking task, got %d: %s", resp.StatusCode, raw)
+	}
+
+	var blocked teamTask
+	var healing teamTask
+	for _, candidate := range b.AllTasks() {
+		if candidate.ID == task.ID {
+			blocked = candidate
+			continue
+		}
+		if isSelfHealingTask(&candidate) {
+			healing = candidate
+		}
+	}
+	if !blocked.Blocked() || blocked.Status() != "blocked" {
+		t.Fatalf("expected original task blocked, got %+v", blocked)
+	}
+	if healing.ID == "" {
+		t.Fatalf("expected capability-gap self-healing task, got %+v", b.AllTasks())
+	}
+	// Self-heal records render as Issues in the FE; PipelineID stays
+	// "incident" so isSelfHealingTask still recognises them.
+	if healing.Owner != "cos" || healing.TaskType != "issue" || healing.PipelineID != "incident" || healing.ExecutionMode != "office" {
+		t.Fatalf("expected office issue/incident owned by cos, got %+v", healing)
+	}
+	// The self-heal title should follow the new "[@<bot>] <verb>: <parent>"
+	// shape with the parent title carried through.
+	wantTitle := selfHealingTaskTitle("eng", task.ID, blocked.Title, bot.EscalationCapabilityGap)
+	if healing.Title != wantTitle {
+		t.Fatalf("expected self-heal title %q, got %q", wantTitle, healing.Title)
+	}
+	if !strings.Contains(healing.Details, "capability_gap") ||
+		!strings.Contains(healing.Details, detail) ||
+		!strings.Contains(healing.Details, "Repair the missing capability first") {
+		t.Fatalf("expected capability repair loop details, got %q", healing.Details)
+	}
+}
+
+func TestBrokerHandlePostTaskNonCapabilityBlockDoesNotCreateSelfHealingTask(t *testing.T) {
+	b := newTestBroker(t)
+	ensureTestMemberAccess(b, "general", "eng", "Engineer")
+	if err := b.StartOnPort(0); err != nil {
+		t.Fatalf("failed to start broker: %v", err)
+	}
+	defer b.Stop()
+
+	task, _, err := b.EnsurePlannedTask(plannedTaskInput{
+		Channel:   "general",
+		Title:     "Wait for customer approval",
+		Owner:     "eng",
+		CreatedBy: "cos",
+		TaskType:  "follow_up",
+	})
+	if err != nil {
+		t.Fatalf("ensure planned task: %v", err)
+	}
+
+	body, _ := json.Marshal(map[string]any{
+		"action":     "block",
+		"channel":    "general",
+		"id":         task.ID,
+		"created_by": "cos",
+		"details":    "Waiting on customer approval before sending the update.",
+	})
+	req, _ := http.NewRequest(http.MethodPost, "http://"+b.Addr()+"/tasks", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+b.Token())
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("post block task: %v", err)
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 blocking task, got %d: %s", resp.StatusCode, raw)
+	}
+
+	for _, candidate := range b.AllTasks() {
+		if isSelfHealingTaskTitle(candidate.Title) {
+			t.Fatalf("did not expect self-healing task for non-capability blocker, got %+v", candidate)
+		}
+	}
+}
+
+func TestBrokerHandlePostTaskResumeUnblocksAfterCapabilityRepair(t *testing.T) {
+	b := newTestBroker(t)
+	ensureTestMemberAccess(b, "general", "eng", "Engineer")
+	if err := b.StartOnPort(0); err != nil {
+		t.Fatalf("failed to start broker: %v", err)
+	}
+	defer b.Stop()
+
+	task, _, err := b.EnsurePlannedTask(plannedTaskInput{
+		Channel:   "general",
+		Title:     "Send the launch update",
+		Owner:     "eng",
+		CreatedBy: "cos",
+		TaskType:  "follow_up",
+	})
+	if err != nil {
+		t.Fatalf("ensure planned task: %v", err)
+	}
+	if _, changed, err := b.BlockTask(task.ID, "eng", "Unable to continue: missing Slack integration.", ""); err != nil || !changed {
+		t.Fatalf("block task: changed=%v err=%v", changed, err)
+	}
+
+	body, _ := json.Marshal(map[string]any{
+		"action":     "resume",
+		"channel":    "general",
+		"id":         task.ID,
+		"created_by": "cos",
+		"details":    "Capability repaired: Slack integration is available; retry the original update.",
+	})
+	req, _ := http.NewRequest(http.MethodPost, "http://"+b.Addr()+"/tasks", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+b.Token())
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("post resume task: %v", err)
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 resuming task, got %d: %s", resp.StatusCode, raw)
+	}
+
+	var resumed teamTask
+	for _, candidate := range b.AllTasks() {
+		if candidate.ID == task.ID {
+			resumed = candidate
+			break
+		}
+	}
+	if resumed.Blocked() || resumed.Status() != "in_progress" {
+		t.Fatalf("expected original task resumed after repair, got %+v", resumed)
+	}
+	if !strings.Contains(resumed.Details, "missing Slack integration") ||
+		!strings.Contains(resumed.Details, "Capability repaired") {
+		t.Fatalf("expected resume detail appended, got %q", resumed.Details)
+	}
+}
+
+func TestBrokerBlockTaskRejectsFalseReadOnlyBlockForWritableWorktree(t *testing.T) {
+	worktreeDir := t.TempDir()
+	setPrepareTaskWorktreeForTest(t, func(taskID string) (string, string, error) {
+		return worktreeDir, "hivex-" + taskID, nil
+	})
+	setCleanupTaskWorktreeForTest(t, func(path, branch string) error { return nil })
+	setVerifyTaskWorktreeWritableForTest(t, func(path string) error {
+		if path != worktreeDir {
+			t.Fatalf("expected probe path %q, got %q", worktreeDir, path)
+		}
+		return nil
+	})
+	b := newTestBroker(t)
+	task, reused, err := b.EnsurePlannedTask(plannedTaskInput{
+		Channel:       "general",
+		Title:         "Implement the first runnable generator slice",
+		Owner:         "eng",
+		CreatedBy:     "cos",
+		TaskType:      "feature",
+		ExecutionMode: "local_worktree",
+	})
+	if err != nil || reused {
+		t.Fatalf("ensure planned task: %v reused=%v", err, reused)
+	}
+
+	got, changed, err := b.BlockTask(task.ID, "eng", "Need writable workspace because the filesystem sandbox is read-only.", "")
+	if err == nil {
+		t.Fatal("expected false read-only block to be rejected")
+	}
+	if changed {
+		t.Fatalf("expected no task state change on rejected block, got %+v", got)
+	}
+	if !strings.Contains(err.Error(), "assigned local worktree is writable") {
+		t.Fatalf("expected writable-worktree guidance, got %v", err)
+	}
+
+	var updated teamTask
+	for _, candidate := range b.AllTasks() {
+		if candidate.ID == task.ID {
+			updated = candidate
+			break
+		}
+	}
+	if updated.ID == "" {
+		t.Fatalf("expected to find task %s", task.ID)
+	}
+	if updated.Status() != "in_progress" || updated.Blocked() {
+		t.Fatalf("expected task to remain active after rejected block, got %+v", updated)
+	}
+	if strings.Contains(strings.ToLower(updated.Details), "read-only") {
+		t.Fatalf("expected false read-only detail to stay out of task state, got %+v", updated)
+	}
+}
+
+// TestBrokerEnsurePlannedTaskRunsWorktreeOwnerLanesConcurrently: two
+// local_worktree tasks for the same owner now BOTH activate at once (parallel
+// instances). Each gets its own worktree, so the headless scheduler runs them
+// in distinct lanes; admission control no longer queues the second behind the
+// first. (Contrast TestBrokerEnsurePlannedTaskQueuesConcurrentLiveExternalOwnerWork,
+// where external side-effects still serialize.)
+func TestBrokerEnsurePlannedTaskRunsWorktreeOwnerLanesConcurrently(t *testing.T) {
+	setPrepareTaskWorktreeForTest(t, func(taskID string) (string, string, error) {
+		return "/tmp/hivex-task-" + taskID, "hivex-" + taskID, nil
+	})
+	setCleanupTaskWorktreeForTest(t, func(path, branch string) error { return nil })
+	b := newTestBroker(t)
+	ensureTestMemberAccess(b, "general", "executor", "Executor")
+
+	first, reused, err := b.EnsurePlannedTask(plannedTaskInput{
+		Channel:       "general",
+		Title:         "Build the homepage MVP",
+		Details:       "Ship the first runnable site slice.",
+		Owner:         "executor",
+		CreatedBy:     "cos",
+		TaskType:      "feature",
+		ExecutionMode: "local_worktree",
+	})
+	if err != nil || reused {
+		t.Fatalf("ensure first task: %v reused=%v", err, reused)
+	}
+	second, reused, err := b.EnsurePlannedTask(plannedTaskInput{
+		Channel:       "general",
+		Title:         "Define the upload path",
+		Details:       "Wire the next implementation slice after the homepage.",
+		Owner:         "executor",
+		CreatedBy:     "cos",
+		TaskType:      "feature",
+		ExecutionMode: "local_worktree",
+	})
+	if err != nil || reused {
+		t.Fatalf("ensure second task: %v reused=%v", err, reused)
+	}
+
+	if first.Status() != "in_progress" || first.Blocked() {
+		t.Fatalf("expected first task to stay active, got %+v", first)
+	}
+	// Second worktree task now runs concurrently — NOT queued behind the first.
+	if second.Status() != "in_progress" || second.Blocked() {
+		t.Fatalf("expected second worktree task to run concurrently (in_progress, not blocked), got %+v", second)
+	}
+	if second.LifecycleState == LifecycleStateQueuedBehindOwner {
+		t.Fatalf("expected second task NOT to be queued behind owner, got %q", second.LifecycleState)
+	}
+	if containsString(second.DependsOn, first.ID) {
+		t.Fatalf("expected second task NOT to depend on first %s, got %+v", first.ID, second.DependsOn)
+	}
+	if strings.Contains(second.Details, "Queued behind "+first.ID) {
+		t.Fatalf("expected no queue note in details, got %+v", second)
+	}
+}
+
+// TestBrokerEnsurePlannedTaskRunsNonDependentLiveExternalConcurrently: two
+// NON-dependent live_external tasks for the same owner both activate at once.
+// External side-effects no longer serialize by default — only a declared
+// dependency holds a task back. The headless scheduler gives each its own lane.
+func TestBrokerEnsurePlannedTaskRunsNonDependentLiveExternalConcurrently(t *testing.T) {
+	b := newTestBroker(t)
+	ensureTestMemberAccess(b, "general", "executor", "Executor")
+
+	first, reused, err := b.EnsurePlannedTask(plannedTaskInput{
+		Channel:       "general",
+		Title:         "Send the launch announcement",
+		Owner:         "executor",
+		CreatedBy:     "cos",
+		TaskType:      "follow_up",
+		ExecutionMode: "live_external",
+	})
+	if err != nil || reused {
+		t.Fatalf("ensure first task: %v reused=%v", err, reused)
+	}
+	second, reused, err := b.EnsurePlannedTask(plannedTaskInput{
+		Channel:       "general",
+		Title:         "Send the follow-up announcement",
+		Owner:         "executor",
+		CreatedBy:     "cos",
+		TaskType:      "follow_up",
+		ExecutionMode: "live_external",
+	})
+	if err != nil || reused {
+		t.Fatalf("ensure second task: %v reused=%v", err, reused)
+	}
+
+	if first.Status() != "in_progress" || first.Blocked() {
+		t.Fatalf("expected first task to stay active, got %+v", first)
+	}
+	if second.Status() != "in_progress" || second.Blocked() {
+		t.Fatalf("expected second external task to run concurrently (in_progress, not blocked), got %+v", second)
+	}
+	if second.LifecycleState == LifecycleStateQueuedBehindOwner {
+		t.Fatalf("expected second task NOT to be queued behind owner, got %q", second.LifecycleState)
+	}
+	if containsString(second.DependsOn, first.ID) {
+		t.Fatalf("expected second task NOT to depend on first %s, got %+v", first.ID, second.DependsOn)
+	}
+}
+
+// TestBrokerTaskPlanKeepsTaskInTheSubmittedChannel verifies that a task plan
+// leaves its tasks in the channel it was submitted against.
+//
+// It used to assert the reverse — that such a task was pushed out into a
+// dedicated task-<id> room. Per-task rooms are gone because they split the
+// roster: a human @-mentioning a teammate inside a task room was addressing
+// someone who was not in it. The half of the old contract that survives
+// unchanged is the negative one, and it is the reason this test pre-seeds
+// "client-loop": a task plan must never be absorbed into some unrelated
+// pre-existing execution channel just because it was recently active.
+func TestBrokerTaskPlanKeepsTaskInTheSubmittedChannel(t *testing.T) {
+	setPrepareTaskWorktreeForTest(t, func(taskID string) (string, string, error) {
+		return t.TempDir(), "hivex-" + taskID, nil
+	})
+	setCleanupTaskWorktreeForTest(t, func(path, branch string) error { return nil })
+	b := newTestBroker(t)
+	// The channel the plan is submitted against. Named rather than repeated as a
+	// literal: #general is scheduled for removal, and the contract is "stays in
+	// the submitted channel", not the name of that channel.
+	submittedTo := "general"
+	ensureTestMemberAccess(b, submittedTo, "builder", "Builder")
+	// Pre-existing shared channel — must NOT absorb the new task.
+	b.channels = append(b.channels, teamChannel{
+		Slug:      "client-loop",
+		Name:      "client-loop",
+		Members:   []string{"cos", "builder"},
+		CreatedBy: "cos",
+		CreatedAt: time.Now().UTC().Format(time.RFC3339),
+	})
+	if err := b.StartOnPort(0); err != nil {
+		t.Fatalf("failed to start broker: %v", err)
+	}
+	defer b.Stop()
+
+	base := fmt.Sprintf("http://%s", b.Addr())
+	body, _ := json.Marshal(map[string]any{
+		"channel":    submittedTo,
+		"created_by": "cos",
+		"tasks": []map[string]any{
+			{
+				"title":          "Create the client-facing operating brief",
+				"assignee":       "builder",
+				"details":        "Move the live client delivery forward in the workspace and leave the customer-ready brief in the execution lane.",
+				"task_type":      "launch",
+				"execution_mode": "office",
+			},
+		},
+	})
+	req, _ := http.NewRequest(http.MethodPost, base+"/task-plan", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+b.Token())
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("post task plan: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Fatalf("unexpected status %d: %s", resp.StatusCode, raw)
+	}
+
+	var result struct {
+		Tasks []teamTask `json:"tasks"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		t.Fatalf("decode task plan response: %v", err)
+	}
+	if len(result.Tasks) != 1 {
+		t.Fatalf("expected one task, got %+v", result.Tasks)
+	}
+	task := result.Tasks[0]
+	// Stays where the plan was submitted, and is NOT absorbed by the
+	// pre-existing client-loop channel.
+	if task.Channel != submittedTo {
+		t.Fatalf("expected the task to stay in the submitted channel %q, got %q: %+v", submittedTo, task.Channel, task)
+	}
+	if task.Channel == "client-loop" {
+		t.Fatalf("a pre-existing execution channel must not absorb a new task: %+v", task)
+	}
+	assertNoPerTaskChannels(t, b)
+	// The owner is a member of the room the task landed in, so an @mention
+	// there reaches them — the guarantee per-task channels used to provide by
+	// seeding owner + CEO into a private room.
+	b.mu.Lock()
+	var office *teamChannel
+	for i := range b.channels {
+		if b.channels[i].Slug == submittedTo {
+			office = &b.channels[i]
+			break
+		}
+	}
+	b.mu.Unlock()
+	if office == nil {
+		t.Fatalf("expected the %q channel to exist", submittedTo)
+	}
+	if !stringSliceContainsFold(office.Members, "builder") {
+		t.Fatalf("expected builder (task owner) to be a member of %q, got %v", submittedTo, office.Members)
+	}
+	// The task is discoverable from that room.
+	if got := len(b.ChannelTasks(submittedTo)); got != 1 {
+		t.Fatalf("expected the task listed in %q, got %d", submittedTo, got)
+	}
+	if got := len(b.ChannelTasks("client-loop")); got != 0 {
+		t.Fatalf("expected client-loop to hold no tasks, got %d", got)
+	}
+}
+
+func TestBrokerTaskPlanReusesExistingActiveLane(t *testing.T) {
+	b := newTestBroker(t)
+	ensureTestMemberAccess(b, "client-loop", "builder", "Builder")
+	ensureTestMemberAccess(b, "client-loop", "operator", "Operator")
+	for i := range b.channels {
+		if normalizeChannelSlug(b.channels[i].Slug) == "client-loop" {
+			b.channels[i].CreatedBy = "operator"
+			b.channels[i].CreatedAt = time.Now().UTC().Format(time.RFC3339)
+		}
+	}
+	if err := b.StartOnPort(0); err != nil {
+		t.Fatalf("failed to start broker: %v", err)
+	}
+	defer b.Stop()
+
+	existing, reused, err := b.EnsurePlannedTask(plannedTaskInput{
+		Channel:       "client-loop",
+		Title:         "Create live client workspace in Google Drive",
+		Details:       "First pass.",
+		Owner:         "builder",
+		CreatedBy:     "cos",
+		TaskType:      "follow_up",
+		ExecutionMode: "office",
+	})
+	if err != nil || reused {
+		t.Fatalf("ensure initial task: %v reused=%v", err, reused)
+	}
+
+	base := fmt.Sprintf("http://%s", b.Addr())
+	body, _ := json.Marshal(map[string]any{
+		"channel": "general",
+		// created_by=cos always passes the access check; reuse is now
+		// channel-agnostic so the existing task in client-loop is found
+		// regardless of the requested channel.
+		"created_by": "cos",
+		"tasks": []map[string]any{
+			{
+				"title":          "Create live client workspace in Google Drive",
+				"assignee":       "builder",
+				"details":        "Updated live-work details.",
+				"task_type":      "follow_up",
+				"execution_mode": "office",
+			},
+		},
+	})
+	req, _ := http.NewRequest(http.MethodPost, base+"/task-plan", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+b.Token())
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("post task plan: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Fatalf("unexpected status %d: %s", resp.StatusCode, raw)
+	}
+
+	var result struct {
+		Tasks []teamTask `json:"tasks"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		t.Fatalf("decode task plan response: %v", err)
+	}
+	if len(result.Tasks) != 1 {
+		t.Fatalf("expected one task in response, got %+v", result.Tasks)
+	}
+	if result.Tasks[0].ID != existing.ID {
+		t.Fatalf("expected task plan to reuse %s, got %+v", existing.ID, result.Tasks[0])
+	}
+	if got := len(b.AllTasks()); got != 1 {
+		t.Fatalf("expected one durable task after reuse, got %d", got)
+	}
+	// Reuse preserves the original channel the task was created in.
+	if result.Tasks[0].Channel != "client-loop" {
+		t.Fatalf("expected reused task to stay in client-loop, got %+v", result.Tasks[0])
+	}
+	if result.Tasks[0].Details != "Updated live-work details." {
+		t.Fatalf("expected details to update, got %+v", result.Tasks[0])
+	}
+}
+
+// TestTaskStaysInTheChannelItWasCreatedFrom verifies, end-to-end through
+// EnsurePlannedTask, that a task's channel is simply the channel it was created
+// from:
+//   - a task created from the office channel stays there — whether or not its
+//     title reads like a business objective;
+//   - an explicit project-channel request is kept as-is (unchanged);
+//   - no task-<id> channel is minted for any of them.
+//
+// This test used to assert the first bullet's opposite: every task, keyword-less
+// ones included, was pushed out into its own "task-<id>" room seeded with the
+// owner and the CEO. That model is gone. A private room per task meant the human
+// was talking to a two-member audience: @-mentioning any other teammate in it
+// addressed someone who was not there (the @designer hand-off failure of
+// 2026-08-22). Tasks keep their title, owner, and status in the Tasks surface;
+// the conversation happens where the roster already is.
+//
+// The office channel is named in a variable rather than inlined because
+// #general is scheduled for removal; the contract is "stays where it was
+// created", not the name of that room.
+//
+// The unit-level guard for every task shape is TestNoPerTaskChannels below.
+func TestTaskStaysInTheChannelItWasCreatedFrom(t *testing.T) {
+	setPrepareTaskWorktreeForTest(t, func(taskID string) (string, string, error) {
+		return t.TempDir(), "hivex-" + taskID, nil
+	})
+	setCleanupTaskWorktreeForTest(t, func(path, branch string) error { return nil })
+
+	b := newTestBroker(t)
+	createdFrom := "general"
+	ensureTestMemberAccess(b, createdFrom, "builder", "Builder")
+	if err := b.StartOnPort(0); err != nil {
+		t.Fatalf("start broker: %v", err)
+	}
+	defer b.Stop()
+
+	// --- Case 1: business-objective task → stays where it was created ---
+	task1, _, err := b.EnsurePlannedTask(plannedTaskInput{
+		Channel:       createdFrom,
+		Title:         "Launch the client-facing sales campaign",
+		Details:       "Deliver the customer-ready marketing materials.",
+		Owner:         "builder",
+		CreatedBy:     "cos",
+		TaskType:      "issue",
+		ExecutionMode: "office",
+	})
+	if err != nil {
+		t.Fatalf("EnsurePlannedTask business objective: %v", err)
+	}
+	if task1.Channel != createdFrom {
+		t.Fatalf("expected business-objective task to stay in %q, got %+v", createdFrom, task1)
+	}
+
+	// The owner is in the room the task landed in, so an @mention there reaches
+	// them — what the private per-task room used to guarantee for two people.
+	b.mu.Lock()
+	var office *teamChannel
+	for i := range b.channels {
+		if b.channels[i].Slug == createdFrom {
+			office = &b.channels[i]
+			break
+		}
+	}
+	b.mu.Unlock()
+	if office == nil {
+		t.Fatalf("expected the %q channel to exist", createdFrom)
+	}
+	if !stringSliceContainsFold(office.Members, "builder") {
+		t.Fatalf("builder (owner) not a member of %q: %v", createdFrom, office.Members)
+	}
+
+	// --- Case 2: a plain task with NO business-objective keywords stays too.
+	// The keyword gate was dropped in 2026-06-03 so that every task got a
+	// channel; now no task does, keywords or not. ---
+	task2, _, err := b.EnsurePlannedTask(plannedTaskInput{
+		Channel:       createdFrom,
+		Title:         "Internal tooling housekeeping",
+		Owner:         "builder",
+		CreatedBy:     "cos",
+		TaskType:      "issue",
+		ExecutionMode: "office",
+	})
+	if err != nil {
+		t.Fatalf("EnsurePlannedTask plain task: %v", err)
+	}
+	if task2.Channel != createdFrom {
+		t.Fatalf("expected plain (keyword-less) task to stay in %q, got %+v", createdFrom, task2)
+	}
+
+	// --- Case 3: an explicit project channel is kept as-is ---
+	// The creating actor has to be a member too: membership is authoritative for
+	// every bot, the CEO included, so a create into a project channel it is not
+	// in is denied.
+	ensureTestMemberAccess(b, "youtube-factory", "builder", "Builder")
+	ensureTestMemberAccess(b, "youtube-factory", "cos", "CEO")
+	task3, _, err := b.EnsurePlannedTask(plannedTaskInput{
+		Channel:       "youtube-factory",
+		Title:         "Publish the YouTube channel launch video",
+		Owner:         "builder",
+		CreatedBy:     "cos",
+		TaskType:      "issue",
+		ExecutionMode: "office",
+	})
+	if err != nil {
+		t.Fatalf("EnsurePlannedTask explicit channel: %v", err)
+	}
+	if task3.Channel != "youtube-factory" {
+		t.Fatalf("expected explicit channel youtube-factory, got %q", task3.Channel)
+	}
+
+	// Not one room was minted across any of the three.
+	assertNoPerTaskChannels(t, b)
+}
+
+// TestNoPerTaskChannels pins the one-room contract: no task, of any shape,
+// gets its own chat channel. The office is one room (#general) so every
+// teammate is present for every conversation; a task carries its title,
+// description, owner, and status in the Tasks surface instead of a private
+// room. Regression guard for the fragmentation this replaced, where
+// @-mentioning a teammate inside a per-task channel addressed someone who was
+// not in it.
+func TestNoPerTaskChannels(t *testing.T) {
+	cases := []struct {
+		name             string
+		channel          string
+		ownedByOtherTask bool
+		task             teamTask
+	}{
+		{"plain task from general", "general", false, teamTask{Title: "Tidy up the backlog"}},
+		{"business objective from general", "general", false, teamTask{Title: "Launch the sales campaign"}},
+		{"system task", "general", false, teamTask{Title: "Backup & Migration", System: true}},
+		{"incident self-heal", "general", false, teamTask{Title: "Recover", PipelineID: "incident"}},
+		{"sub-task", "general", false, teamTask{Title: "child", ParentIssueID: "task-1"}},
+		{"sub-task handed the parent channel", "task-1", true, teamTask{Title: "child", ParentIssueID: "task-1"}},
+		{"task created inside another task's legacy channel", "task-22", true, teamTask{Title: "Outbound email reply bot"}},
+		{"explicit shared channel", "youtube-factory", false, teamTask{Title: "Publish the launch video"}},
+		{"empty task", "general", false, teamTask{}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if shouldMintPerTaskChannel(tc.channel, tc.ownedByOtherTask, &tc.task) {
+				t.Fatalf("shouldMintPerTaskChannel(%q, %v, %+v) = true; tasks must stay in the channel they were created from", tc.channel, tc.ownedByOtherTask, tc.task)
+			}
+		})
+	}
+	if shouldMintPerTaskChannel("general", false, nil) {
+		t.Fatal("nil task must not mint a channel")
+	}
+}
+
+// TestReuseIsChannelAgnostic verifies that findReusableTaskLocked finds
+// an existing task even when the incoming create request names a different
+// channel.  Submitting the same title twice must never create a second task
+// row.
+//
+// The first task used to be seeded by creating it from "general" and letting it
+// be pushed out into its own task-<id> channel, which is what made the second
+// (general) submit cross a channel boundary. The one-room model mints no such
+// channel, so the divergence is now set up the way it still occurs in
+// production: the task lives in an explicit project channel and the same title
+// is re-submitted from the office channel.
+func TestReuseIsChannelAgnostic(t *testing.T) {
+	setPrepareTaskWorktreeForTest(t, func(taskID string) (string, string, error) {
+		return t.TempDir(), "hivex-" + taskID, nil
+	})
+	setCleanupTaskWorktreeForTest(t, func(path, branch string) error { return nil })
+
+	b := newTestBroker(t)
+	ensureTestMemberAccess(b, "general", "builder", "Builder")
+	ensureTestMemberAccess(b, "client-loop", "builder", "Builder")
+	// The creating actor has to be a member too: membership is authoritative for
+	// every bot, the CEO included, so a create into a project channel it is not
+	// in is denied.
+	ensureTestMemberAccess(b, "client-loop", "cos", "CEO")
+	if err := b.StartOnPort(0); err != nil {
+		t.Fatalf("start broker: %v", err)
+	}
+	defer b.Stop()
+
+	// Create the initial task in an explicit project channel.
+	first, _, err := b.EnsurePlannedTask(plannedTaskInput{
+		Channel:       "client-loop",
+		Title:         "Launch the client revenue pipeline",
+		Owner:         "builder",
+		CreatedBy:     "cos",
+		TaskType:      "issue",
+		ExecutionMode: "office",
+	})
+	if err != nil {
+		t.Fatalf("first EnsurePlannedTask: %v", err)
+	}
+	if first.Channel != "client-loop" {
+		t.Fatalf("first task should stay in the channel it was created from: %+v", first)
+	}
+
+	// Submit the same title a second time against "general" — must reuse.
+	second, reused, err := b.EnsurePlannedTask(plannedTaskInput{
+		Channel:       "general",
+		Title:         "Launch the client revenue pipeline",
+		Owner:         "builder",
+		CreatedBy:     "cos",
+		TaskType:      "issue",
+		ExecutionMode: "office",
+	})
+	if err != nil {
+		t.Fatalf("second EnsurePlannedTask: %v", err)
+	}
+	if !reused {
+		t.Fatalf("expected second create to reuse the existing task; second=%+v", second)
+	}
+	if second.ID != first.ID {
+		t.Fatalf("expected same task ID on reuse: first=%s second=%s", first.ID, second.ID)
+	}
+	// Reuse does not relocate the task into the requesting channel.
+	if second.Channel != "client-loop" {
+		t.Fatalf("reuse must leave the task where it lives, got %q", second.Channel)
+	}
+	// Exactly one task row must exist.
+	if got := len(b.AllTasks()); got != 1 {
+		t.Fatalf("expected 1 task after reuse, got %d", got)
+	}
+}
+
+// TestFindReusableTaskSkipsTerminal pins the boundary that keeps the
+// channel-agnostic title+owner dedup safe (see findReusableTaskLocked's doc):
+// a TERMINAL same-title task is never reused, while a concurrently-ACTIVE
+// same-title task is — regardless of channel. Together with
+// TestReuseIsChannelAgnostic this fixes the documented dedup scope.
+func TestFindReusableTaskSkipsTerminal(t *testing.T) {
+	b := newTestBroker(t)
+	b.mu.Lock()
+	b.tasks = append(b.tasks,
+		teamTask{ID: "OFFICE-T1", Title: "Same title", Owner: "builder", status: "done", Channel: "general"},
+		teamTask{ID: "OFFICE-T2", Title: "Active dup", Owner: "builder", status: "in_progress", Channel: "task-office-t2"},
+	)
+	b.mu.Unlock()
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	// A terminal same-title task must NOT be reused — a fresh one is minted.
+	if got := b.findReusableTaskLocked(taskReuseMatch{Title: "Same title", Owner: "builder", Channel: "general"}); got != nil {
+		t.Fatalf("terminal same-title task must not be reused; got %s", got.ID)
+	}
+
+	// A concurrently-active same-title task IS reused, even when the create
+	// request names a different channel (channel-agnostic dedup).
+	if got := b.findReusableTaskLocked(taskReuseMatch{Title: "Active dup", Owner: "builder", Channel: "general"}); got == nil || got.ID != "OFFICE-T2" {
+		t.Fatalf("active same-title task must be reused channel-agnostically; got %+v", got)
+	}
+}
+
+func TestBrokerBlockTaskAllowsReadOnlyBlockWhenWriteProbeFails(t *testing.T) {
+	worktreeDir := t.TempDir()
+	setPrepareTaskWorktreeForTest(t, func(taskID string) (string, string, error) {
+		return worktreeDir, "hivex-" + taskID, nil
+	})
+	setCleanupTaskWorktreeForTest(t, func(path, branch string) error { return nil })
+	setVerifyTaskWorktreeWritableForTest(t, func(path string) error {
+		if path != worktreeDir {
+			t.Fatalf("expected probe path %q, got %q", worktreeDir, path)
+		}
+		return fmt.Errorf("permission denied")
+	})
+	b := newTestBroker(t)
+	task, reused, err := b.EnsurePlannedTask(plannedTaskInput{
+		Channel:       "general",
+		Title:         "Implement the first runnable generator slice",
+		Owner:         "eng",
+		CreatedBy:     "cos",
+		TaskType:      "feature",
+		ExecutionMode: "local_worktree",
+	})
+	if err != nil || reused {
+		t.Fatalf("ensure planned task: %v reused=%v", err, reused)
+	}
+
+	got, changed, err := b.BlockTask(task.ID, "eng", "Need writable workspace because the filesystem sandbox is read-only.", "")
+	if err != nil {
+		t.Fatalf("expected real write failure blocker to pass through, got %v", err)
+	}
+	if !changed {
+		t.Fatalf("expected task state change on real blocker, got %+v", got)
+	}
+	if got.Status() != "blocked" || !got.Blocked() {
+		t.Fatalf("expected blocked task result, got %+v", got)
+	}
+	if !strings.Contains(got.Details, "read-only") {
+		t.Fatalf("expected block reason to persist, got %+v", got)
+	}
+}
+
+func TestBrokerCompleteClosesReviewTaskAndUnblocksDependents(t *testing.T) {
+	setPrepareTaskWorktreeForTest(t, func(taskID string) (string, string, error) {
+		return "/tmp/hivex-task-" + taskID, "hivex-" + taskID, nil
+	})
+	setCleanupTaskWorktreeForTest(t, func(path, branch string) error { return nil })
+	b := newTestBroker(t)
+	ensureTestMemberAccess(b, "general", "eng", "Engineer")
+	if err := b.StartOnPort(0); err != nil {
+		t.Fatalf("failed to start broker: %v", err)
+	}
+	defer b.Stop()
+
+	architecture, reused, err := b.EnsurePlannedTask(plannedTaskInput{
+		Channel:       "general",
+		Title:         "Audit the repo and design the automation architecture",
+		Owner:         "eng",
+		CreatedBy:     "cos",
+		TaskType:      "research",
+		ExecutionMode: "local_worktree",
+	})
+	if err != nil || reused {
+		t.Fatalf("ensure architecture task: %v reused=%v", err, reused)
+	}
+	build, reused, err := b.EnsurePlannedTask(plannedTaskInput{
+		Channel:       "general",
+		Title:         "Implement the v0 automated content factory",
+		Owner:         "eng",
+		CreatedBy:     "cos",
+		TaskType:      "feature",
+		ExecutionMode: "local_worktree",
+		DependsOn:     []string{architecture.ID},
+	})
+	if err != nil || reused {
+		t.Fatalf("ensure build task: %v reused=%v", err, reused)
+	}
+	if !build.Blocked() {
+		t.Fatalf("expected dependent task to start blocked, got %+v", build)
+	}
+
+	base := fmt.Sprintf("http://%s", b.Addr())
+	post := func(payload map[string]any) teamTask {
+		// No default room any more: a mutation that names no channel is
+		// refused on purpose. These cases are not testing that rule, so the
+		// helper supplies the fixture's room.
+		if _, ok := payload["channel"]; !ok {
+			payload["channel"] = GeneralChannelSlug
+		}
+		body, _ := json.Marshal(payload)
+		req, _ := http.NewRequest(http.MethodPost, base+"/tasks", bytes.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+b.Token())
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("task post failed: %v", err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			raw, _ := io.ReadAll(resp.Body)
+			t.Fatalf("unexpected status %d: %s", resp.StatusCode, raw)
+		}
+		var result struct {
+			Task teamTask `json:"task"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+			t.Fatalf("decode task response: %v", err)
+		}
+		return result.Task
+	}
+
+	reviewReady := post(map[string]any{
+		"action":     "complete",
+		"channel":    "general",
+		"id":         architecture.ID,
+		"created_by": "cos",
+	})
+	if reviewReady.Status() != "review" || reviewReady.ReviewState() != "ready_for_review" {
+		t.Fatalf("expected first complete to move task into review, got %+v", reviewReady)
+	}
+
+	closed := post(map[string]any{
+		"action":     "complete",
+		"channel":    "general",
+		"id":         architecture.ID,
+		"created_by": "cos",
+	})
+	if closed.Status() != "done" || closed.ReviewState() != "approved" {
+		t.Fatalf("expected second complete to close review task, got %+v", closed)
+	}
+
+	var unblocked teamTask
+	for _, task := range b.AllTasks() {
+		if task.ID == build.ID {
+			unblocked = task
+			break
+		}
+	}
+	if unblocked.ID == "" {
+		t.Fatalf("expected to find dependent task %s", build.ID)
+	}
+	if unblocked.Blocked() || unblocked.Status() != "in_progress" {
+		t.Fatalf("expected dependent task to unblock after review close, got %+v", unblocked)
+	}
+}
+
+func TestBrokerCreateTaskReusesCompletedDependencyWorktree(t *testing.T) {
+	var prepareCalls []string
+	worktreeRoot := t.TempDir()
+	setPrepareTaskWorktreeForTest(t, func(taskID string) (string, string, error) {
+		prepareCalls = append(prepareCalls, taskID)
+		if len(prepareCalls) > 1 {
+			return "", "", fmt.Errorf("unexpected prepareTaskWorktree call for %s", taskID)
+		}
+		path := filepath.Join(worktreeRoot, "hivex-task-"+taskID)
+		initUsableGitWorktree(t, path)
+		return path, "hivex-" + taskID, nil
+	})
+	setCleanupTaskWorktreeForTest(t, func(path, branch string) error { return nil })
+	b := newTestBroker(t)
+	ensureTestMemberAccess(b, "general", "builder", "Builder")
+	ensureTestMemberAccess(b, "general", "operator", "Operator")
+	if err := b.StartOnPort(0); err != nil {
+		t.Fatalf("failed to start broker: %v", err)
+	}
+	defer b.Stop()
+
+	base := fmt.Sprintf("http://%s", b.Addr())
+	post := func(payload map[string]any) teamTask {
+		// No default room any more: a mutation that names no channel is
+		// refused on purpose. These cases are not testing that rule, so the
+		// helper supplies the fixture's room.
+		if _, ok := payload["channel"]; !ok {
+			payload["channel"] = GeneralChannelSlug
+		}
+		body, _ := json.Marshal(payload)
+		req, _ := http.NewRequest(http.MethodPost, base+"/tasks", bytes.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+b.Token())
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("task post failed: %v", err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			raw, _ := io.ReadAll(resp.Body)
+			t.Fatalf("unexpected status %d: %s", resp.StatusCode, raw)
+		}
+		var result struct {
+			Task teamTask `json:"task"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+			t.Fatalf("decode task response: %v", err)
+		}
+		return result.Task
+	}
+
+	first := post(map[string]any{
+		"action":         "create",
+		"title":          "Ship the dry-run approval packet generator",
+		"details":        "Initial consulting delivery slice",
+		"created_by":     "cos",
+		"owner":          "builder",
+		"thread_id":      "msg-1",
+		"execution_mode": "local_worktree",
+		"task_type":      "feature",
+	})
+	if first.WorktreePath == "" || first.WorktreeBranch == "" {
+		t.Fatalf("expected first task worktree metadata, got %+v", first)
+	}
+
+	reviewReady := post(map[string]any{
+		"action":     "complete",
+		"channel":    "general",
+		"id":         first.ID,
+		"created_by": "cos",
+	})
+	if reviewReady.Status() != "review" || reviewReady.ReviewState() != "ready_for_review" {
+		t.Fatalf("expected first complete to move task into review, got %+v", reviewReady)
+	}
+
+	approved := post(map[string]any{
+		"action":     "approve",
+		"channel":    "general",
+		"id":         first.ID,
+		"created_by": "cos",
+	})
+	if approved.Status() != "done" || approved.ReviewState() != "approved" {
+		t.Fatalf("expected approve to close task, got %+v", approved)
+	}
+
+	second := post(map[string]any{
+		"action":         "create",
+		"title":          "Render the approval packet into a reviewable dry-run bundle",
+		"details":        "Reuse the existing generator worktree",
+		"created_by":     "cos",
+		"owner":          "builder",
+		"thread_id":      "msg-2",
+		"execution_mode": "local_worktree",
+		"task_type":      "feature",
+		"depends_on":     []string{first.ID},
+	})
+	if second.WorktreePath != first.WorktreePath || second.WorktreeBranch != first.WorktreeBranch {
+		t.Fatalf("expected dependent task to reuse worktree %s/%s, got %+v", first.WorktreePath, first.WorktreeBranch, second)
+	}
+	if got := len(prepareCalls); got != 1 {
+		t.Fatalf("expected one worktree prepare call, got %d (%v)", got, prepareCalls)
+	}
+}
+
+func TestBrokerSyncTaskWorktreeReplacesStaleAssignedPath(t *testing.T) {
+	stalePath := t.TempDir()
+	freshPath := filepath.Join(t.TempDir(), "fresh-worktree")
+	var cleaned []string
+	setPrepareTaskWorktreeForTest(t, func(taskID string) (string, string, error) {
+		return freshPath, "hivex-" + taskID, nil
+	})
+	setCleanupTaskWorktreeForTest(t, func(path, branch string) error {
+		cleaned = append(cleaned, path+"|"+branch)
+		return nil
+	})
+	b := newTestBroker(t)
+	task := &teamTask{
+		ID:             "task-80",
+		Title:          "Fix onboarding",
+		Owner:          "executor",
+		status:         "in_progress",
+		ExecutionMode:  "local_worktree",
+		WorktreePath:   stalePath,
+		WorktreeBranch: "hivex-stale-task-80",
+	}
+	if err := b.syncTaskWorktreeLocked(task); err != nil {
+		t.Fatalf("syncTaskWorktreeLocked: %v", err)
+	}
+	if task.WorktreePath != freshPath || task.WorktreeBranch != "hivex-task-80" {
+		t.Fatalf("expected stale worktree to be replaced, got %+v", task)
+	}
+	if len(cleaned) != 1 || !strings.Contains(cleaned[0], stalePath) {
+		t.Fatalf("expected stale worktree cleanup before reprovision, got %v", cleaned)
+	}
+}
+
+func TestBrokerNormalizeLoadedStateRepairsStaleAssignedWorktree(t *testing.T) {
+	stalePath := t.TempDir()
+	freshPath := filepath.Join(t.TempDir(), "fresh-worktree")
+	setPrepareTaskWorktreeForTest(t, func(taskID string) (string, string, error) {
+		return freshPath, "hivex-" + taskID, nil
+	})
+	setCleanupTaskWorktreeForTest(t, func(path, branch string) error { return nil })
+	now := time.Now().UTC().Format(time.RFC3339)
+	b := newTestBroker(t)
+	b.tasks = []teamTask{{
+		ID:             "task-80",
+		Channel:        "youtube-factory",
+		Title:          "Fix onboarding",
+		Owner:          "executor",
+		status:         "in_progress",
+		ExecutionMode:  "local_worktree",
+		WorktreePath:   stalePath,
+		WorktreeBranch: "hivex-stale-task-80",
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	}}
+
+	b.mu.Lock()
+	b.normalizeLoadedStateLocked()
+	got := b.tasks[0]
+	b.mu.Unlock()
+
+	if got.WorktreePath != freshPath || got.WorktreeBranch != "hivex-task-80" {
+		t.Fatalf("expected normalize to refresh stale worktree, got %+v", got)
+	}
+}
+
+func TestBrokerUpdatesTaskByIDAcrossChannels(t *testing.T) {
+	b := newTestBroker(t)
+	b.channels = []teamChannel{
+		{
+			Slug: "general",
+			Name: "general",
+		},
+		{
+			Slug: "planning",
+			Name: "planning",
+		},
+	}
+	handler := b.requireAuth(b.handleTasks)
+	post := func(payload map[string]any) teamTask {
+		t.Helper()
+		body, _ := json.Marshal(payload)
+		req := httptest.NewRequest(http.MethodPost, "/tasks", bytes.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+b.Token())
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		handler(rec, req)
+		resp := rec.Result()
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			raw, _ := io.ReadAll(resp.Body)
+			t.Fatalf("unexpected status %d: %s", resp.StatusCode, raw)
+		}
+		var result struct {
+			Task teamTask `json:"task"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+			t.Fatalf("decode task response: %v", err)
+		}
+		return result.Task
+	}
+
+	created := post(map[string]any{
+		"action":     "create",
+		"channel":    "planning",
+		"title":      "Inventory capabilities and approvals",
+		"owner":      "planner",
+		"created_by": "human",
+	})
+	if created.Channel != "planning" {
+		t.Fatalf("expected planning task, got %+v", created)
+	}
+
+	// Owner-set issues now land in Planning (structured planning); the human
+	// approves the plan to start execution before it can be completed.
+	if created.LifecycleState != LifecycleStatePlanning {
+		t.Fatalf("expected created owner-set issue to land planning, got %+v", created)
+	}
+	post(map[string]any{
+		"action":     "approve",
+		"channel":    "planning",
+		"id":         created.ID,
+		"created_by": "human",
+	})
+
+	completed := post(map[string]any{
+		"action":     "complete",
+		"channel":    "general",
+		"id":         created.ID,
+		"created_by": "human",
+	})
+	if completed.ID != created.ID {
+		t.Fatalf("expected to update %s, got %+v", created.ID, completed)
+	}
+	if completed.Channel != "planning" {
+		t.Fatalf("expected task channel to remain planning, got %+v", completed)
+	}
+	if completed.Status() != "done" && completed.Status() != "review" {
+		t.Fatalf("expected task to move forward, got %+v", completed)
+	}
+}
+
+func TestBrokerCompleteAlreadyDoneTaskStaysApproved(t *testing.T) {
+	setPrepareTaskWorktreeForTest(t, func(taskID string) (string, string, error) {
+		return "/tmp/hivex-task-" + taskID, "hivex-" + taskID, nil
+	})
+	setCleanupTaskWorktreeForTest(t, func(path, branch string) error { return nil })
+	b := newTestBroker(t)
+	ensureTestMemberAccess(b, "general", "eng", "Engineer")
+	if err := b.StartOnPort(0); err != nil {
+		t.Fatalf("failed to start broker: %v", err)
+	}
+	defer b.Stop()
+
+	task, reused, err := b.EnsurePlannedTask(plannedTaskInput{
+		Channel:       "general",
+		Title:         "Ship publish-pack output",
+		Owner:         "eng",
+		CreatedBy:     "cos",
+		TaskType:      "feature",
+		ExecutionMode: "local_worktree",
+	})
+	if err != nil || reused {
+		t.Fatalf("ensure planned task: %v reused=%v", err, reused)
+	}
+
+	base := fmt.Sprintf("http://%s", b.Addr())
+	post := func(payload map[string]any) teamTask {
+		// No default room any more: a mutation that names no channel is
+		// refused on purpose. These cases are not testing that rule, so the
+		// helper supplies the fixture's room.
+		if _, ok := payload["channel"]; !ok {
+			payload["channel"] = GeneralChannelSlug
+		}
+		body, _ := json.Marshal(payload)
+		req, _ := http.NewRequest(http.MethodPost, base+"/tasks", bytes.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+b.Token())
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("task post failed: %v", err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			raw, _ := io.ReadAll(resp.Body)
+			t.Fatalf("unexpected status %d: %s", resp.StatusCode, raw)
+		}
+		var result struct {
+			Task teamTask `json:"task"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+			t.Fatalf("decode task response: %v", err)
+		}
+		return result.Task
+	}
+
+	reviewReady := post(map[string]any{
+		"action":     "complete",
+		"channel":    "general",
+		"id":         task.ID,
+		"created_by": "cos",
+	})
+	if reviewReady.Status() != "review" || reviewReady.ReviewState() != "ready_for_review" {
+		t.Fatalf("expected first complete to move task into review, got %+v", reviewReady)
+	}
+
+	approved := post(map[string]any{
+		"action":     "approve",
+		"channel":    "general",
+		"id":         task.ID,
+		"created_by": "cos",
+	})
+	if approved.Status() != "done" || approved.ReviewState() != "approved" {
+		t.Fatalf("expected approve to close task, got %+v", approved)
+	}
+
+	repeatedComplete := post(map[string]any{
+		"action":     "complete",
+		"channel":    "general",
+		"id":         task.ID,
+		"created_by": "cos",
+	})
+	if repeatedComplete.Status() != "done" || repeatedComplete.ReviewState() != "approved" {
+		t.Fatalf("expected repeated complete to stay done/approved, got %+v", repeatedComplete)
+	}
+}
+
+func TestResolveTaskIntervalsRespectMinimumFloor(t *testing.T) {
+	t.Setenv("HIVEX_TASK_FOLLOWUP_MINUTES", "1")
+	t.Setenv("HIVEX_TASK_REMINDER_MINUTES", "1")
+	t.Setenv("HIVEX_TASK_RECHECK_MINUTES", "1")
+
+	if got := config.ResolveTaskFollowUpInterval(); got != 2 {
+		t.Fatalf("expected follow-up interval floor of 2, got %d", got)
+	}
+	if got := config.ResolveTaskReminderInterval(); got != 2 {
+		t.Fatalf("expected reminder interval floor of 2, got %d", got)
+	}
+	if got := config.ResolveTaskRecheckInterval(); got != 2 {
+		t.Fatalf("expected recheck interval floor of 2, got %d", got)
+	}
+}
+
+func TestInFlightTasksReturnsOnlyNonTerminalOwned(t *testing.T) {
+	b := newTestBroker(t)
+	b.mu.Lock()
+	b.tasks = []teamTask{
+		{ID: "t1", Title: "Active task", Owner: "fe", status: "in_progress"},
+		{ID: "t2", Title: "Done task", Owner: "fe", status: "done"},
+		{ID: "t3", Title: "No owner", Owner: "", status: "in_progress"},
+		{ID: "t4", Title: "Canceled task", Owner: "be", status: "canceled"},
+		{ID: "t5", Title: "Cancelled task", Owner: "be", status: "cancelled"},
+		{ID: "t6", Title: "Pending with owner", Owner: "pm", status: "pending"},
+		{ID: "t7", Title: "Open with owner", Owner: "cos", status: "open"},
+	}
+	b.mu.Unlock()
+
+	got := b.InFlightTasks()
+
+	// Only tasks with owner AND non-terminal status should be returned.
+	// "done", "canceled", "cancelled" are terminal. No-owner tasks excluded.
+	if len(got) != 3 {
+		t.Fatalf("expected 3 in-flight tasks, got %d: %+v", len(got), got)
+	}
+	ids := make(map[string]bool)
+	for _, task := range got {
+		ids[task.ID] = true
+	}
+	if !ids["t1"] {
+		t.Error("expected t1 (in_progress+owner) to be included")
+	}
+	if !ids["t6"] {
+		t.Error("expected t6 (pending+owner) to be included")
+	}
+	if !ids["t7"] {
+		t.Error("expected t7 (open+owner) to be included")
+	}
+	if ids["t2"] {
+		t.Error("expected t2 (done) to be excluded")
+	}
+	if ids["t3"] {
+		t.Error("expected t3 (no owner) to be excluded")
+	}
+	if ids["t4"] {
+		t.Error("expected t4 (canceled) to be excluded")
+	}
+	if ids["t5"] {
+		t.Error("expected t5 (cancelled) to be excluded")
+	}
+}
+
+func TestInFlightTasksExcludesCompletedStatus(t *testing.T) {
+	b := newTestBroker(t)
+	b.mu.Lock()
+	b.tasks = []teamTask{
+		{ID: "t1", Title: "Active task", Owner: "fe", status: "in_progress"},
+		{ID: "t2", Title: "Completed task", Owner: "fe", status: "completed"},
+	}
+	b.mu.Unlock()
+
+	got := b.InFlightTasks()
+
+	// "completed" is a terminal status — should be excluded just like "done".
+	if len(got) != 1 {
+		t.Fatalf("expected 1 in-flight task, got %d: %+v", len(got), got)
+	}
+	if got[0].ID != "t1" {
+		t.Errorf("expected t1 (in_progress), got %q", got[0].ID)
+	}
+	for _, task := range got {
+		if task.status == "completed" {
+			t.Errorf("completed task %q should not appear in InFlightTasks()", task.ID)
+		}
+	}
+}
+
+func TestBrokerMemoryWorkflowCompletionGateAndOverride(t *testing.T) {
+	b := newTestBroker(t)
+	if err := b.StartOnPort(0); err != nil {
+		t.Fatalf("failed to start broker: %v", err)
+	}
+	defer b.Stop()
+
+	postTask := func(payload map[string]any) (*http.Response, []byte) {
+		t.Helper()
+		body, _ := json.Marshal(payload)
+		req, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("http://%s/tasks", b.Addr()), bytes.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+b.Token())
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("post task: %v", err)
+		}
+		raw, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		return resp, raw
+	}
+
+	createResp, raw := postTask(map[string]any{
+		"action":     "create",
+		"title":      "Research prior context for onboarding",
+		"created_by": "cos",
+		"owner":      "cos",
+		"task_type":  "research",
+	})
+	if createResp.StatusCode != http.StatusOK {
+		t.Fatalf("create status=%d body=%s", createResp.StatusCode, raw)
+	}
+	var created struct {
+		Task teamTask `json:"task"`
+	}
+	if err := json.Unmarshal(raw, &created); err != nil {
+		t.Fatalf("decode create: %v", err)
+	}
+	if created.Task.MemoryWorkflow == nil || !created.Task.MemoryWorkflow.Required {
+		t.Fatalf("expected required workflow on create, got %+v", created.Task.MemoryWorkflow)
+	}
+
+	completeResp, raw := postTask(map[string]any{
+		"action":     "complete",
+		"id":         created.Task.ID,
+		"created_by": "cos",
+	})
+	if completeResp.StatusCode != http.StatusConflict {
+		t.Fatalf("expected completion conflict, got status=%d body=%s", completeResp.StatusCode, raw)
+	}
+	if !strings.Contains(string(raw), "memory workflow incomplete") {
+		t.Fatalf("expected actionable memory workflow error, got %s", raw)
+	}
+
+	overrideResp, raw := postTask(map[string]any{
+		"action":                          "complete",
+		"id":                              created.Task.ID,
+		"created_by":                      "cos",
+		"memory_workflow_override":        true,
+		"memory_workflow_override_reason": "Human reviewed and accepted missing memory evidence.",
+	})
+	if overrideResp.StatusCode != http.StatusOK {
+		t.Fatalf("override status=%d body=%s", overrideResp.StatusCode, raw)
+	}
+	var overridden struct {
+		Task teamTask `json:"task"`
+	}
+	if err := json.Unmarshal(raw, &overridden); err != nil {
+		t.Fatalf("decode override: %v", err)
+	}
+	if overridden.Task.Status() != "done" {
+		t.Fatalf("expected done after override, got %+v", overridden.Task)
+	}
+	wf := overridden.Task.MemoryWorkflow
+	if wf == nil || wf.Status != MemoryWorkflowStatusOverridden || wf.Override == nil {
+		t.Fatalf("expected recorded override, got %+v", wf)
+	}
+	if wf.Override.Actor != "cos" || wf.Override.Reason == "" || wf.Override.Timestamp == "" {
+		t.Fatalf("override metadata missing: %+v", wf.Override)
+	}
+}
+
+func TestBrokerMemoryWorkflowCompletionGateRerunsForExistingDoneTask(t *testing.T) {
+	b := newTestBroker(t)
+	if err := b.StartOnPort(0); err != nil {
+		t.Fatalf("failed to start broker: %v", err)
+	}
+	defer b.Stop()
+
+	postTask := func(payload map[string]any) (*http.Response, []byte) {
+		t.Helper()
+		body, _ := json.Marshal(payload)
+		req, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("http://%s/tasks", b.Addr()), bytes.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+b.Token())
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("post task: %v", err)
+		}
+		raw, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		return resp, raw
+	}
+
+	createResp, raw := postTask(map[string]any{
+		"action":     "create",
+		"title":      "Compare pricing pages",
+		"created_by": "cos",
+		"owner":      "cos",
+		"task_type":  "feature",
+	})
+	if createResp.StatusCode != http.StatusOK {
+		t.Fatalf("create status=%d body=%s", createResp.StatusCode, raw)
+	}
+	var created struct {
+		Task teamTask `json:"task"`
+	}
+	if err := json.Unmarshal(raw, &created); err != nil {
+		t.Fatalf("decode create: %v", err)
+	}
+	completeResp, raw := postTask(map[string]any{
+		"action":     "complete",
+		"id":         created.Task.ID,
+		"created_by": "cos",
+	})
+	if completeResp.StatusCode != http.StatusOK {
+		t.Fatalf("complete status=%d body=%s", completeResp.StatusCode, raw)
+	}
+
+	updateResp, raw := postTask(map[string]any{
+		"action":     "reassign",
+		"id":         created.Task.ID,
+		"created_by": "cos",
+		"owner":      "pm",
+		"task_type":  "process_research",
+	})
+	if updateResp.StatusCode != http.StatusConflict {
+		t.Fatalf("expected done-state update to rerun memory gate, got status=%d body=%s", updateResp.StatusCode, raw)
+	}
+	if !strings.Contains(string(raw), "memory workflow incomplete") {
+		t.Fatalf("expected memory workflow gate error, got %s", raw)
+	}
+}
+
+func TestBrokerTaskPlanInitializesMemoryWorkflow(t *testing.T) {
+	b := newTestBroker(t)
+	if err := b.StartOnPort(0); err != nil {
+		t.Fatalf("failed to start broker: %v", err)
+	}
+	defer b.Stop()
+
+	body, _ := json.Marshal(map[string]any{
+		"channel":    "general",
+		"created_by": "cos",
+		"tasks": []map[string]any{
+			{
+				"title":     "Map support process memory",
+				"assignee":  "cos",
+				"task_type": "process-research",
+			},
+		},
+	})
+	req, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("http://%s/task-plan", b.Addr()), bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+b.Token())
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("task plan request: %v", err)
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("task plan status=%d body=%s", resp.StatusCode, raw)
+	}
+	var result struct {
+		Tasks []teamTask `json:"tasks"`
+	}
+	if err := json.Unmarshal(raw, &result); err != nil {
+		t.Fatalf("decode task plan: %v", err)
+	}
+	if len(result.Tasks) != 1 || result.Tasks[0].MemoryWorkflow == nil || !result.Tasks[0].MemoryWorkflow.Required {
+		t.Fatalf("expected required workflow from task_plan, got %+v", result.Tasks)
+	}
+}
+
+func TestBrokerReusedTaskPreservesAndRecomputesMemoryWorkflow(t *testing.T) {
+	b := newTestBroker(t)
+	if err := b.StartOnPort(0); err != nil {
+		t.Fatalf("failed to start broker: %v", err)
+	}
+	defer b.Stop()
+
+	postTask := func(payload map[string]any) teamTask {
+		t.Helper()
+		body, _ := json.Marshal(payload)
+		req, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("http://%s/tasks", b.Addr()), bytes.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+b.Token())
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("post task: %v", err)
+		}
+		defer resp.Body.Close()
+		raw, _ := io.ReadAll(resp.Body)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("post task status=%d body=%s", resp.StatusCode, raw)
+		}
+		var result struct {
+			Task teamTask `json:"task"`
+		}
+		if err := json.Unmarshal(raw, &result); err != nil {
+			t.Fatalf("decode task: %v", err)
+		}
+		return result.Task
+	}
+
+	created := postTask(map[string]any{
+		"action":     "create",
+		"title":      "Research prior context for onboarding",
+		"created_by": "cos",
+		"owner":      "cos",
+		"task_type":  "research",
+		"thread_id":  "thread-1",
+	})
+	if _, found, changed, err := b.RecordTaskMemoryCapture(created.ID, "cos", MemoryWorkflowArtifact{Backend: "markdown", Source: "notebook", Path: "agents/cos/notebook/onboarding.md"}); err != nil || !found || !changed {
+		t.Fatalf("record capture found=%v changed=%v err=%v", found, changed, err)
+	}
+
+	reused := postTask(map[string]any{
+		"action":     "create",
+		"title":      "Research prior context for onboarding",
+		"created_by": "cos",
+		"owner":      "cos",
+		"task_type":  "feature",
+		"thread_id":  "thread-1",
+	})
+	if reused.ID != created.ID {
+		t.Fatalf("expected task reuse, got new task %s vs %s", reused.ID, created.ID)
+	}
+	if reused.TaskType != "feature" {
+		t.Fatalf("expected reused task type recomputed to feature, got %+v", reused)
+	}
+	if reused.MemoryWorkflow == nil {
+		t.Fatalf("expected existing workflow preserved")
+	}
+	if reused.MemoryWorkflow.Required {
+		t.Fatalf("expected reused feature task not to require workflow, got %+v", reused.MemoryWorkflow)
+	}
+	if len(reused.MemoryWorkflow.Captures) != 1 {
+		t.Fatalf("expected prior captures preserved, got %+v", reused.MemoryWorkflow)
+	}
+}
+
+func TestBrokerTaskMemoryWorkflowReportsIdempotentNoOp(t *testing.T) {
+	b := newTestBroker(t)
+	if err := b.StartOnPort(0); err != nil {
+		t.Fatalf("failed to start broker: %v", err)
+	}
+	defer b.Stop()
+
+	createBody, _ := json.Marshal(map[string]any{
+		"action":     "create",
+		"title":      "Research prior context for onboarding",
+		"created_by": "cos",
+		"owner":      "cos",
+		"task_type":  "research",
+	})
+	req, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("http://%s/tasks", b.Addr()), bytes.NewReader(createBody))
+	req.Header.Set("Authorization", "Bearer "+b.Token())
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("create task: %v", err)
+	}
+	raw, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("create status=%d body=%s", resp.StatusCode, raw)
+	}
+	var created struct {
+		Task teamTask `json:"task"`
+	}
+	if err := json.Unmarshal(raw, &created); err != nil {
+		t.Fatalf("decode create: %v", err)
+	}
+
+	workflowBody, _ := json.Marshal(map[string]any{
+		"event":   "lookup",
+		"task_id": created.Task.ID,
+		"actor":   "pm",
+		"query":   "onboarding context",
+		"citations": []map[string]any{
+			{
+				"backend": "markdown",
+				"source":  "notebook",
+				"path":    "agents/pm/notebook/onboarding.md",
+				"title":   "Onboarding",
+			},
+		},
+	})
+	postWorkflow := func() bool {
+		t.Helper()
+		req, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("http://%s/tasks/memory-workflow", b.Addr()), bytes.NewReader(workflowBody))
+		req.Header.Set("Authorization", "Bearer "+b.Token())
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("record workflow: %v", err)
+		}
+		raw, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("workflow status=%d body=%s", resp.StatusCode, raw)
+		}
+		var result struct {
+			Updated bool `json:"updated"`
+		}
+		if err := json.Unmarshal(raw, &result); err != nil {
+			t.Fatalf("decode workflow: %v", err)
+		}
+		return result.Updated
+	}
+	if !postWorkflow() {
+		t.Fatal("first workflow event should update state")
+	}
+	if postWorkflow() {
+		t.Fatal("duplicate workflow event should report updated=false")
+	}
+}
+
+func TestBrokerTaskMemoryWorkflowBadRequestErrorsReturn400(t *testing.T) {
+	b := newTestBroker(t)
+	if err := b.StartOnPort(0); err != nil {
+		t.Fatalf("failed to start broker: %v", err)
+	}
+	defer b.Stop()
+
+	body, _ := json.Marshal(map[string]any{
+		"event": "lookup",
+		"query": "missing task id",
+	})
+	req, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("http://%s/tasks/memory-workflow", b.Addr()), bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+b.Token())
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("record workflow: %v", err)
+	}
+	raw, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected bad request for malformed workflow event, got status=%d body=%s", resp.StatusCode, raw)
+	}
+}
+
+func TestBrokerTaskMemoryWorkflowRecordsBatchedArtifacts(t *testing.T) {
+	b := newTestBroker(t)
+	if err := b.StartOnPort(0); err != nil {
+		t.Fatalf("failed to start broker: %v", err)
+	}
+	defer b.Stop()
+
+	createBody, _ := json.Marshal(map[string]any{
+		"action":     "create",
+		"title":      "Research prior context for onboarding",
+		"created_by": "cos",
+		"owner":      "cos",
+		"task_type":  "research",
+	})
+	req, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("http://%s/tasks", b.Addr()), bytes.NewReader(createBody))
+	req.Header.Set("Authorization", "Bearer "+b.Token())
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("create task: %v", err)
+	}
+	raw, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("create status=%d body=%s", resp.StatusCode, raw)
+	}
+	var created struct {
+		Task teamTask `json:"task"`
+	}
+	if err := json.Unmarshal(raw, &created); err != nil {
+		t.Fatalf("decode create: %v", err)
+	}
+
+	workflowBody, _ := json.Marshal(map[string]any{
+		"event":   "capture",
+		"task_id": created.Task.ID,
+		"actor":   "pm",
+		"artifacts": []map[string]any{
+			{
+				"backend": "markdown",
+				"source":  "notebook",
+				"path":    "agents/pm/notebook/onboarding.md",
+				"title":   "Onboarding",
+			},
+			{
+				"backend": "markdown",
+				"source":  "notebook",
+				"path":    "agents/pm/notebook/checklist.md",
+				"title":   "Checklist",
+			},
+		},
+	})
+	req, _ = http.NewRequest(http.MethodPost, fmt.Sprintf("http://%s/tasks/memory-workflow", b.Addr()), bytes.NewReader(workflowBody))
+	req.Header.Set("Authorization", "Bearer "+b.Token())
+	req.Header.Set("Content-Type", "application/json")
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("record workflow: %v", err)
+	}
+	raw, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("workflow status=%d body=%s", resp.StatusCode, raw)
+	}
+	var updated struct {
+		Task    teamTask `json:"task"`
+		Updated bool     `json:"updated"`
+	}
+	if err := json.Unmarshal(raw, &updated); err != nil {
+		t.Fatalf("decode workflow: %v", err)
+	}
+	if !updated.Updated {
+		t.Fatal("expected batched workflow artifacts to update task")
+	}
+	if got := len(updated.Task.MemoryWorkflow.Captures); got != 2 {
+		t.Fatalf("expected both capture artifacts to persist, got %d: %+v", got, updated.Task.MemoryWorkflow.Captures)
+	}
+}
+
+func TestBrokerTaskMemoryWorkflowPrevalidatesBatchedArtifacts(t *testing.T) {
+	b := newTestBroker(t)
+	if err := b.StartOnPort(0); err != nil {
+		t.Fatalf("failed to start broker: %v", err)
+	}
+	defer b.Stop()
+
+	createBody, _ := json.Marshal(map[string]any{
+		"action":     "create",
+		"title":      "Research prior context for onboarding",
+		"created_by": "cos",
+		"owner":      "cos",
+		"task_type":  "research",
+	})
+	req, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("http://%s/tasks", b.Addr()), bytes.NewReader(createBody))
+	req.Header.Set("Authorization", "Bearer "+b.Token())
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("create task: %v", err)
+	}
+	raw, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("create status=%d body=%s", resp.StatusCode, raw)
+	}
+	var created struct {
+		Task teamTask `json:"task"`
+	}
+	if err := json.Unmarshal(raw, &created); err != nil {
+		t.Fatalf("decode create: %v", err)
+	}
+
+	workflowBody, _ := json.Marshal(map[string]any{
+		"event":   "capture",
+		"task_id": created.Task.ID,
+		"actor":   "pm",
+		"artifacts": []map[string]any{
+			{
+				"backend": "markdown",
+				"source":  "notebook",
+				"path":    "agents/pm/notebook/onboarding.md",
+			},
+			{},
+		},
+	})
+	req, _ = http.NewRequest(http.MethodPost, fmt.Sprintf("http://%s/tasks/memory-workflow", b.Addr()), bytes.NewReader(workflowBody))
+	req.Header.Set("Authorization", "Bearer "+b.Token())
+	req.Header.Set("Content-Type", "application/json")
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("record workflow: %v", err)
+	}
+	raw, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected invalid batch to be rejected, got status=%d body=%s", resp.StatusCode, raw)
+	}
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for _, task := range b.tasks {
+		if task.ID != created.Task.ID || task.MemoryWorkflow == nil {
+			continue
+		}
+		if got := len(task.MemoryWorkflow.Captures); got != 0 {
+			t.Fatalf("invalid batch should not partially persist captures, got %+v", task.MemoryWorkflow.Captures)
+		}
+	}
+}
+
+func TestBrokerTaskMemoryWorkflowAcceptsContextToolEventShape(t *testing.T) {
+	b := newTestBroker(t)
+	if err := b.StartOnPort(0); err != nil {
+		t.Fatalf("failed to start broker: %v", err)
+	}
+	defer b.Stop()
+
+	createBody, _ := json.Marshal(map[string]any{
+		"action":     "create",
+		"title":      "Research prior context for renewal process",
+		"created_by": "cos",
+		"owner":      "cos",
+		"task_type":  "research",
+	})
+	req, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("http://%s/tasks", b.Addr()), bytes.NewReader(createBody))
+	req.Header.Set("Authorization", "Bearer "+b.Token())
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("create task: %v", err)
+	}
+	raw, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("create status=%d body=%s", resp.StatusCode, raw)
+	}
+	var created struct {
+		Task teamTask `json:"task"`
+	}
+	if err := json.Unmarshal(raw, &created); err != nil {
+		t.Fatalf("decode create: %v", err)
+	}
+
+	workflowBody, _ := json.Marshal(map[string]any{
+		"event":   "lookup",
+		"task_id": created.Task.ID,
+		"actor":   "pm",
+		"query":   "renewal process",
+		"citations": []map[string]any{
+			{
+				"corpus":   "shared",
+				"backend":  "gbrain",
+				"source":   "compiled_truth",
+				"slug":     "process/passport-renewal",
+				"page_id":  42,
+				"chunk_id": 7,
+				"title":    "Passport renewal process",
+				"snippet":  "Use the updated renewal checklist.",
+			},
+		},
+	})
+	req, _ = http.NewRequest(http.MethodPost, fmt.Sprintf("http://%s/tasks/memory-workflow", b.Addr()), bytes.NewReader(workflowBody))
+	req.Header.Set("Authorization", "Bearer "+b.Token())
+	req.Header.Set("Content-Type", "application/json")
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("record workflow: %v", err)
+	}
+	raw, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("workflow status=%d body=%s", resp.StatusCode, raw)
+	}
+	var updated struct {
+		Task teamTask `json:"task"`
+	}
+	if err := json.Unmarshal(raw, &updated); err != nil {
+		t.Fatalf("decode workflow: %v", err)
+	}
+	wf := updated.Task.MemoryWorkflow
+	if wf == nil || wf.Lookup.Status != MemoryWorkflowStepStatusSatisfied || len(wf.Citations) != 1 {
+		t.Fatalf("expected lookup workflow update, got %+v", wf)
+	}
+	citation := wf.Citations[0]
+	if citation.PageID != "42" || citation.ChunkID != "7" || citation.SourceID != "process/passport-renewal" {
+		t.Fatalf("expected normalized gbrain citation ids, got %+v", citation)
+	}
+}

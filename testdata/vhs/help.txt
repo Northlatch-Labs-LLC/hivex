@@ -1,0 +1,48 @@
+> /tmp/hivex-vhs --help
+hivebot vdev — the terminal office you always wanted.
+
+Usage:
+  hivex              Launch multi-bot team (web UI on :7891)
+  hivex --legacy-tui  Launch with legacy tmux TUI instead
+  hivex init         Install the latest CLI and save setup defaults
+  hivex upgrade      Check npm for a newer version and show the changelog
+  hivex shred        Burn the workspace down and reopen onboarding
+  hivex import --from legacy  Import from a running external orchestrator (auto-detect)
+  hivex log          Show what your bots actually did (task receipts)
+  hivex share        Invite one team member over a private network
+  hivex memory migrate --from {hive,gbrain}  Port legacy memory into the team wiki
+  hivex workspace ...  Manage multiple isolated hivebot workspaces
+  hivex skills publish <slug-or-path> --to <hub>    Publish a team skill to a public hub
+  hivex skills install <name> --from <hub>  Pull a public skill into the team wiki
+  hivex --cmd <cmd>  Run a command non-interactively
+
+Flags:
+  --1o1
+        Launch a direct 1:1 session with a single bot (default cos)
+  --api-key
+        API key for authentication
+  --blueprint
+        Operation blueprint ID for this run
+  --broker-port
+        Port for the local broker (default 7890)
+  --cmd
+        Run a command non-interactively
+  --collab
+        Start in collaborative mode (all bots see all messages)
+  --format
+        Output format (text, json) (default "text")
+  --from-scratch
+        Start without a saved blueprint and synthesize the first operation from the directive
+  --legacy-tui
+        Launch with legacy tmux TUI instead of the web UI (deprecated; slated for removal)
+  --memory-backend
+        Memory backend for organizational context (hive, gbrain, none)
+  --no-hive
+        Disable Hive completely for this run
+  --no-open
+        Don't open browser automatically on launch
+  --opus-ceo
+        Upgrade CEO bot from Sonnet to Opus
+  --pack
+        Operation blueprint ID (legacy pack alias supported)
+  --provider

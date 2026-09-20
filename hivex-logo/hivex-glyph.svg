@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+<title>Hivex glyph</title>
+<defs>
+<linearGradient id="gHex" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#FFD44F"/><stop offset="1" stop-color="#FF8A1E"/></linearGradient><linearGradient id="gX" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#FFDF7E"/><stop offset="1" stop-color="#FF9330"/></linearGradient>  <linearGradient id="gBg" x1="0" y1="0" x2="0" y2="1">
+    <stop offset="0" stop-color="#1A2434"/>
+    <stop offset="1" stop-color="#0A0F18"/>
+  </linearGradient>
+  <radialGradient id="gSheen" cx="0.5" cy="0.18" r="0.75">
+    <stop offset="0" stop-color="#FFB556" stop-opacity="0.07"/>
+    <stop offset="1" stop-color="#FFB556" stop-opacity="0"/>
+  </radialGradient>
+</defs>
+    <rect width="512" height="512" rx="116" fill="url(#gBg)"/>
+  <rect x="1" y="1" width="510" height="510" rx="115" fill="none"
+        stroke="#FFFFFF" stroke-opacity="0.06" stroke-width="2"/>
+  <ellipse cx="256" cy="80" rx="280" ry="150" fill="url(#gSheen)"/>
+  <path d="M256 104 L387.64 180 L387.64 332 L256 408 L124.36 332 L124.36 180 Z" fill="none" stroke="url(#gHex)" stroke-width="20" stroke-linejoin="round"/>
+  <path d="M160.74 201 L351.26 311 M351.26 201 L160.74 311"
+        stroke="url(#gX)" stroke-width="26" stroke-linecap="round" fill="none"/>
+  <circle cx="256" cy="256" r="22" fill="#FFEDC2"/>
+</svg>

@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+<title>Hivex — Agentic Orchestration Harness</title>
+<defs>
+</defs>
+  <path d="M461 256 L358.5 433.54 L153.5 433.54 L51 256 L153.5 78.46 L358.5 78.46 Z" fill="none" stroke="#161513" stroke-opacity="0.08" stroke-width="3"/>
+  <path d="M256 108 L384.17 182 L384.17 330 L256 404 L127.83 330 L127.83 182 Z" fill="none" stroke="#161513" stroke-width="14" stroke-linejoin="round"/>
+  <path d="M256 138 L256 374" stroke="#161513" stroke-opacity="0.4" stroke-width="9" stroke-linecap="round"/>
+  <path d="M153.81 197 L358.19 315 M358.19 197 L153.81 315" stroke="#161513" stroke-width="18" stroke-linecap="round" fill="none"/>
+  <circle cx="358.19" cy="315" r="15" fill="#161513"/>
+  <circle cx="153.81" cy="315" r="15" fill="#161513"/>
+  <circle cx="153.81" cy="197" r="15" fill="#161513"/>
+  <circle cx="358.19" cy="197" r="15" fill="#161513"/>
+  <circle cx="256" cy="138" r="11" fill="none" stroke="#161513" stroke-width="5"/>
+  <circle cx="256" cy="374" r="11" fill="none" stroke="#161513" stroke-width="5"/>
+  <circle cx="312.21" cy="288.45" r="5" fill="#161513" stroke="none" opacity="0.8"/>
+  <circle cx="199.79" cy="288.45" r="5" fill="#161513" stroke="none" opacity="0.8"/>
+  <circle cx="199.79" cy="223.55" r="5" fill="#161513" stroke="none" opacity="0.8"/>
+  <circle cx="312.21" cy="223.55" r="5" fill="#161513" stroke="none" opacity="0.8"/>
+  <circle cx="256" cy="256" r="32" fill="none" stroke="#161513" stroke-width="5"/>
+  <circle cx="256" cy="256" r="18" fill="#161513"/>
+  <circle cx="256" cy="256" r="8.5" fill="#FFFFFF"/>
+</svg>

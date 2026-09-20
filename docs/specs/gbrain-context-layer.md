@@ -1,0 +1,345 @@
+# gbrain as the wiki context layer
+
+Status: landed on `feat/gbrain-context-layer`, behind `HIVEX_WIKI_BACKEND`.
+
+Replaces the SQLite + bleve pairing under the wiki context layer with gbrain
+(PGLite or Postgres). Everything above the `FactStore` and `TextIndex`
+interfaces is unchanged: retrieval routing, `QueryHandler`, the 19 `/wiki/*`
+routes, the MCP `hivex_wiki_lookup` tool, and the 86 web components.
+
+## Why the interfaces were the seam
+
+`internal/team/wiki_index.go` already isolated storage behind two interfaces:
+`FactStore` (25 methods) and `TextIndex` (4). Replacing the layer therefore
+meant implementing 29 methods, not rewriting the wiki. The git markdown repo
+remains the substrate and the source of truth; the brain is a derived index.
+
+## Data mapping
+
+gbrain models a brain as pages, typed links, and tags. It has no
+subject/predicate/object table, so the triplet is reconstructed from links.
+
+| hivebot | gbrain |
+|---|---|
+| `TypedFact` | page `atoms/<factID>`, type `atom` |
+| `IndexEntity` | page `entities/<slug>`, type `person`/`company`/`project`/`concept` |
+| `IndexEdge` | link `entities/<subject>` →`<predicate>`→ `entities/<object>` |
+| `Redirect` | link `hivex_redirect`, payload in link context |
+| category membership | link `hivex_category` from `articles/<b64(path)>` |
+| category tree | link `hivex_parent_category` |
+| `TextIndex.Search` | `query` (gbrain's own hybrid RRF pipeline) |
+| `ListFactsByPredicateObject` | `traverse_graph` direction=in, filtered to `atoms/` |
+
+### Frontmatter carries a base64 JSON blob
+
+The authoritative record travels as base64-encoded JSON in a single frontmatter
+key (`hivex_fact`, `hivex_entity`), not as YAML fields. Fact text is arbitrary
+user content containing apostrophes, colons, newlines, and unicode, each of
+which needs different YAML quoting. Base64 is lossless for any input and cannot
+be broken by a YAML edge case. Human-readable `subject`/`predicate`/`object`
+keys are emitted alongside it, advisory only, never read back.
+
+This matters because gbrain **rewrites** two fields on write: it title-cases
+`title` and coerces an unknown `type` to `concept`. Neither is durable storage.
+
+## gbrain behaviours discovered by probing 0.42.58.0
+
+Recorded here because none are documented and all are load-bearing.
+
+**Status on 0.48.1.0, re-probed 2026-09-02.** Three of these were fixed
+upstream. The workarounds are now gated on `gbrain.NeedsPutPageRestore` and
+friends, so they cost nothing on a current gbrain and still protect an old one:
+
+| Behaviour | 0.42 | 0.48 |
+|---|---|---|
+| `put_page` leaves `deleted_at` set | broken | **fixed** |
+| `list_pages` ignores `offset` | broken | **fixed** |
+| `add_link` rejects a missing endpoint | broken | **fixed** |
+| `query` ignores the `type` filter | not a defect | not a defect |
+
+`MinRecommendedVersion` is 0.48.0.0. Below it the office logs one warning naming
+the risk (a write to a previously deleted page can be silently lost) and the
+one-command fix, rather than compensating silently forever. An UNKNOWN version
+keeps the workarounds: they are correct on every version, so when in doubt be
+slow rather than lossy.
+
+The fourth was never a gbrain defect. It was our bug: `list_pages` takes a
+SINGULAR `type` string and `query` takes a PLURAL `types` list, and MCP drops
+unknown arguments without complaint. Sending `type` to `query` therefore looked
+exactly like a server-side filter being ignored — the call succeeded and
+returned byte-identical unfiltered rows — and it was misdiagnosed as such. The
+filter is now sent as `types` and needs no workaround on any version.
+
+This mattered more than an efficiency fix. gbrain applies `types` at the SQL
+level on every retrieval leg, so fusion ranks are computed over the FILTERED
+candidate set; dropping rows client-side afterwards leaves the survivors
+carrying scores fused against the noise. Measured on 0.48.1.0, the same two
+entity hits score 0.5082 / 0.4999 unfiltered and 0.7767 / 0.7767 filtered.
+
+Making the filter useful required giving the category layer a page type of its
+own (`category`). Categories were typed `concept`, which is also the fallback
+type for concept-KIND entities, so no `types` filter could separate them — the
+same collision the `categories/` directory split fixed, still present in the
+type dimension. Verified live: with a category page typed `concept`, it takes
+the #1 result slot ahead of both matching entities. Page types are open strings
+since gbrain v0.38 and a custom type round-trips unchanged (verified by writing
+`category` and reading it back); an earlier note here claiming gbrain coerces
+unknown types to `concept` was wrong. Category pages written before this change
+keep `concept` until rewritten, so entity retrieval keeps a cheap slug-prefix
+check as a backstop rather than trusting the type filter alone.
+
+`ListAllPages` uses plain `offset` paging where it is supported and keeps the
+`updated_after` cursor only below 0.48, gated the same way as the write
+workarounds. The cursor's one failure case — a tie cluster larger than the page
+size, which it reports as an error rather than silently skipping — is
+theoretical rather than live, because gbrain stamps `updated_at` with
+millisecond precision. So this is not a bug fix; it is the same rule applied to
+paging that is applied to writes: run the compensating path only where it is
+needed.
+
+1. **`put_page` does not clear `deleted_at`.** Writing to a soft-deleted slug
+   updates the row but leaves it invisible to `get_page` and to search. A fact
+   that was retired and later re-extracted would vanish permanently with no
+   error. Every write therefore goes through `gbrainFactStore.putPage`, which
+   calls `restore_page` after the write. `restore_page` is idempotent on a live
+   page (`already_active`) and not-found on a new one, which is ignored.
+   Regression test: `TestGBrainFactStore_ResurrectsDeletedFact`.
+2. **`traverse_graph` returns edges only when both `link_type` and `direction`
+   are supplied.** Without them it returns nodes. `get_links` is undirected and
+   untyped and cannot answer "who champions X".
+3. **`add_link` takes `from`/`to`**, not `from_slug`/`to_slug`, and round-trips
+   an arbitrary `context` string verbatim. That is what lets an `IndexEdge`
+   carry its timestamp and source SHA without a column of its own.
+4. **`list_pages` returns metadata without frontmatter**, so every full scan
+   costs one list plus one `get_page` per row.
+5. **`atom`** is gbrain's "smallest extractable claim unit" type and survives a
+   round-trip uncoerced. It is the fact carrier.
+6. **The upgrade banner goes to stderr**, so stdout parses cleanly.
+
+## Costs versus the store it replaces
+
+These are real regressions, accepted deliberately.
+
+- **Write amplification: up to 4 writes per fact** (the atom page plus three
+  links). PGLite is single-writer, so writes serialise behind `writeMu`. Bulk
+  reconcile is materially slower than SQLite.
+- **Read amplification on full scans.** `ListAllFacts`, `IterateEntities`, and
+  both canonical hashes are O(corpus) round-trips, where SQLite was one query.
+- **`ListAllFactsPaged` is no longer a keyset query.** gbrain paginates by
+  offset, so the method scans and slices. Caller memory stays bounded; read cost
+  does not.
+- **`ListEdgesForEntity` narrowed.** gbrain has no "all link types" edge query,
+  so the type set is derived from the entity's own facts. An edge written by
+  `UpsertEdge` for a predicate no fact uses is invisible. The extractor always
+  writes fact and edge together, so this is not reachable on the normal path.
+- **Search costs one `get_page` per hit.** `SearchHit.Entity` renders as the
+  citation title and gbrain's query result carries no frontmatter. Bounded by
+  topK.
+
+## Failure policy
+
+`HIVEX_WIKI_BACKEND` selects the backend:
+
+- **unset** (default): try gbrain; on failure log a WARNING and fall back to the
+  in-memory index. Without this, any deployment without gbrain loses the wiki
+  entirely and every broker test would need a live brain.
+- **`gbrain`**: gbrain or nothing. An operator who pinned it must not silently
+  get a different store.
+- **`memory`**: previous in-memory behaviour.
+
+The fallback is loud because a context layer that quietly degrades to an empty
+store answers "no facts found" for every question, which reads as a product bug
+rather than the missing dependency it is.
+
+## Testing
+
+- `wiki_gbrain_mapping_test.go` — pure unit coverage, runs everywhere. Covers
+  slug round-trips, the hostile-input blob round-trip, frontmatter determinism
+  (which guards `content_hash` churn), and YAML injection through the advisory
+  keys.
+- `wiki_index_gbrain_contract_test.go` — live contract coverage against a real
+  brain. Opt-in, and destructive within the hivex namespaces:
+
+  ```bash
+  GBRAIN_HOME=~/.hivex-gbrain-ctx-home HIVEX_GBRAIN_TEST=1 \
+    OPENAI_API_KEY=sk-... go test ./internal/team/ -run TestGBrain -count=1
+  ```
+
+  `OPENAI_API_KEY` must be exported explicitly. The Go test harness points
+  `HIVEX_RUNTIME_HOME` at a temp dir, so `config.ResolveOpenAIAPIKey()` reads an
+  empty config and `gbrainEnv()` forwards no key to the subprocess. Without it
+  the tests pass but cover the keyword arm only, because gbrain writes chunks
+  with NULL embeddings. Check with `gbrain stats`: Embedded should equal Chunks.
+
+## Enabling embeddings
+
+gbrain REFUSES `gbrain config set embedding_model` on PGLite: the model and
+dimensions size the schema, so they are file-plane only and must be stable
+across connects. There is no in-place upgrade and no `--force`. The procedure
+is wipe and re-init:
+
+```bash
+export OPENAI_API_KEY=sk-...
+export GBRAIN_HOME="$HOME/.hivex-gbrain-ctx-home"
+rm -rf "$GBRAIN_HOME/.gbrain/brain.pglite"
+gbrain init --pglite --embedding-model openai:text-embedding-3-large
+```
+
+Two traps:
+
+1. **A pre-existing `embedding_disabled: true` silently wins over
+   `--embedding-model`.** init honours it as a deferred-setup sentinel and
+   writes no model, with no warning. Remove the key from `config.json` first.
+2. **Use OpenAI.** `content_chunks.embedding` is declared `vector(1536)` with
+   `model` defaulting to `text-embedding-3-large`, so OpenAI at 1536d is a
+   native fit. Voyage (1024d) and ZeroEntropy (2560d) fight the column.
+
+`put_page` embeds synchronously when a key is present, so no background pass is
+needed on the write path.
+
+For the hivebot context layer this wipe is cheap: the brain is a derived index and
+the git markdown repo is the substrate, so the extractor repopulates it.
+
+## Benchmark result
+
+### The baseline correction that changes the verdict
+
+The first rounds of this comparison benchmarked gbrain against SQLite + bleve
+(`NewPersistentWikiIndex`). **That code path was never running.**
+`broker_wiki_lifecycle.go` called `NewWikiIndex` directly, and
+`NewPersistentWikiIndex` was reachable only from this bench. Production ran the
+IN-MEMORY store, rebuilt from markdown on every boot.
+
+Benchmarking against sqlite therefore measured a path no user ever exercised.
+`--backend=memory` measures the real one.
+
+| Metric | **memory (what production ran)** | sqlite+bleve (dead code) | **gbrain entity (new)** |
+|---|---|---|---|
+| Ship gate (recall@20) | **60% RED** | 100% | **94% GREEN** |
+| status class pass rate | **0%** | 100% | 85% |
+| Micro-recall | **53.3%** | 99.7% | **97.6%** |
+| nDCG@10 | **0.466** | 0.809 | **0.720** |
+| MRR | **0.441** | 0.802 | **0.858** |
+| recall@1 | 0.069 | 0.106 | **0.121** |
+| recall@10 | 0.508 | 0.845 | **0.739** |
+| Retrieval p50 | 0.18 ms | 0.09 ms | 226 ms |
+
+Against the real baseline gbrain is not a marginal trade, it is a large win:
+micro-recall roughly doubles (53% -> 98%), MRR nearly doubles (0.44 -> 0.86),
+and the ship gate goes RED to GREEN. Most starkly, **status queries scored 0%
+in production** — "What does Marcus Lee do?" returned nothing relevant, for 20
+of the 50 bench queries — and now pass at 85%.
+
+The in-memory store also lost every fact on restart. gbrain persists.
+
+The cost is latency: 0.18 ms to 226 ms, an MCP round-trip per query. That is
+structural. It only matters where retrieval sits in a tight loop; behind an LLM
+call it is noise.
+
+### Why the atom shape failed
+
+One page per fact (the atom shape) scored 84% RED — worse than the recommended
+one-page-per-entity shape at 94% GREEN. Writing a page per fact turned gbrain
+into flat RAG over 475 fragments, which is exactly what its schema doc argues
+against. The implementation, not gbrain, was that gap.
+
+gbrain still trails the (never-running) sqlite path on deep-list ranking —
+recall@10 0.739 vs 0.845 — because "this entity's facts, newest first" orders
+worse deep in a list than per-fact BM25. That is the one place the dead code was
+genuinely better, and it is worth revisiting if deep recall starts mattering.
+
+## Pagination: offset where supported, updated_after cursor below 0.48
+
+**As of 0.48 `offset` works**, so `ListAllPages` uses plain offset paging there
+(`sort=slug` for a stable order) and keeps the cursor below it, gated on
+`gbrain.SupportsListPageOffset`. The rest of this section describes the cursor
+and the 0.42 behaviour that made it necessary.
+
+gbrain's `list_pages` caps at ~100 rows and, BEFORE 0.48, ACCEPTED BUT SILENTLY DROPPED `offset`
+(`core/operations.ts` calls `engine.listPages({type, updated_after, limit,
+...scope})` — no offset parameter exists; offset=0 and offset=2 return
+byte-identical rows). Both naive loops are wrong: stopping on a short batch
+truncates at the cap, looping until empty never terminates.
+
+`Client.ListAllPages` walks a real cursor instead. Two gbrain arguments ARE
+honoured and together they paginate:
+
+- `sort=updated_asc` — the default is descending, against which no forward
+  cursor can walk.
+- `updated_after` — strictly greater-than.
+
+Because the comparison is strict, advancing to the batch MAXIMUM would drop rows
+sharing that timestamp that did not fit. The cursor advances to the
+SECOND-LARGEST DISTINCT timestamp, so boundary rows are deliberately re-fetched
+and deduplicated by slug. The cursor strictly increases each round, so it
+terminates. The one unrepresentable case — a full batch whose rows all share one
+timestamp, a tie cluster larger than the page size — returns an error rather
+than silently skipping rows.
+
+Verified live: `TestGBrainFactStore_FullScanPastListCap` writes 120 entity pages
+(past the cap) and asserts CountFacts, ListAllFacts, and IterateEntities all see
+the full set. Before the cursor, CountFacts returned 100 for a 120-fact corpus.
+
+There is deliberately NO exported non-paginating list helper: one would silently
+truncate, which is the defect this package exists to hide from callers.
+
+### Prerequisite bug fixed alongside it
+
+`PageMeta` declared `json:"updated"` but gbrain emits `updated_at`, so the field
+silently decoded EMPTY. That blanked `LastEditedTs` on every wiki page in
+`wiki_gbrain_adapter.go` and left the cursor with nothing to advance on.
+`PageMeta.UnmarshalJSON` now accepts either spelling.
+
+## Where the 226 ms actually goes (measured 2026-08-31)
+
+**It is the hosted query-embedding API call, not this adapter.**
+
+Hybrid search must embed the query before it can search vectors. With
+`openai:text-embedding-3-large` that is a round-trip to api.openai.com. Measured
+directly, five samples:
+
+```
+0.486s  0.214s  0.171s  0.275s  0.261s     median ~215 ms
+```
+
+The bench measured 226 ms p50 for the entire retrieval. So the query embedding
+accounts for effectively all of it; the MCP round-trip, the page loads, and the
+anchor parsing are noise by comparison.
+
+Two consequences worth being explicit about:
+
+1. **There is nothing to optimise in hivebot's code.** An earlier draft of this
+   document claimed the cost was one `get_page` per hit in
+   `gbrainTextIndex.Search`. That was true of the ATOM backend, which is not
+   what shipped. `gbrainEntityTextIndex.Search` makes ZERO `GetFact` calls —
+   the anchors carry the fact IDs, and entity pages are cached in the store.
+   Re-encoding the entity slug into the page slug would save approximately
+   nothing.
+
+2. **A local embedder is the latency fix, not just a cost saver.** An Ollama
+   embedder runs on localhost, so it trades a ~215 ms internet round-trip for a
+   single-digit-millisecond one. The local-embedding fallback in
+   `gbrain-local-embeddings.md` is therefore a PERFORMANCE feature as much as a
+   credential one — worth benching both ways before assuming the hosted model's
+   better recall is worth its latency.
+
+gbrain also ships a semantic query cache (`core/search/query-cache.ts`), so
+repeated queries skip the round-trip. The bench runs each query three times and
+reports the median, which means the 226 ms figure may already be cache-assisted
+and a cold query could be slower.
+
+## Not done
+
+- **The CI eval gate is still unrun against this backend.**
+  `wiki_query_eval_test.go` (recall@3 >= 0.90, nDCG@10 >= 0.95) lives on a
+  different branch and was never merged, so it does not gate this. The
+  `bench/slice-1` harness HAS been run against all four backends — see the
+  benchmark table above.
+- **The founder's own brain (`~/.gbrain`) still has `embedding_disabled: true`**
+  and is therefore keyword-only. Enabling it means the same wipe-and-re-init
+  against real data plus `gbrain sync`; not done, because it is destructive.
+- **No migration path.** Nothing backfills an existing SQLite wiki index into a
+  brain. A fresh brain starts empty and repopulates as the extractor runs.
+- **`internal/gbrain/pages.go` duplicates nothing but extends `Client`**;
+  `ListOptions` was left untouched and `ListPageOptions` added beside it, so the
+  diff against upstream `mcp.go` stays reviewable.

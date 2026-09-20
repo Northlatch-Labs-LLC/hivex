@@ -1,0 +1,28 @@
+{
+  "compilerOptions": {
+    "target": "ES2024",
+    "useDefineForClassFields": true,
+    "lib": ["ES2024", "DOM", "DOM.Iterable"],
+    "module": "ESNext",
+    "skipLibCheck": true,
+    "moduleResolution": "bundler",
+    "preserveSymlinks": true,
+    "allowImportingTsExtensions": true,
+    "isolatedModules": true,
+    "moduleDetection": "force",
+    "noEmit": true,
+    "jsx": "react-jsx",
+    "strict": true,
+    "noUnusedLocals": false,
+    "noUnusedParameters": false,
+    "noFallthroughCasesInSwitch": true,
+    "forceConsistentCasingInFileNames": true,
+    "resolveJsonModule": true,
+    "paths": {
+      "@/*": ["./src/*"],
+      "@hivex/protocol": ["../packages/protocol/src/index.ts"],
+      "@hivex/protocol/browser": ["../packages/protocol/src/browser.ts"]
+    }
+  },
+  "include": ["src", "tests"]
+}

@@ -1,0 +1,348 @@
+import { useMatches } from "@tanstack/react-router";
+
+import { useOfficeTasks } from "../hooks/useOfficeTasks";
+import { directChannelSlug } from "../lib/channels";
+import {
+  appRoute,
+  appTaskDetailRoute,
+  articleRoute,
+  botDetailRoute,
+  botDetailTabRoute,
+  botsRoute,
+  channelRoute,
+  inboxRoute,
+  indexRoute,
+  routineDetailRoute,
+  routineNewRoute,
+  skillDetailRoute,
+  taskDecisionRoute,
+  taskDetailRoute,
+  taskNewRoute,
+  tasksRoute,
+  wikiArticleRoute,
+  wikiIndexRoute,
+  wikiLookupRoute,
+} from "../lib/router";
+import { useAppStore } from "../stores/app";
+
+/**
+ * Discriminated union describing the matched leaf route. Replaces the
+ * legacy `currentApp` / `currentChannel` / `wikiPath` / `wikiLookupQuery` /
+ * `notebookBotSlug` / `notebookEntrySlug` scattered across the Zustand
+ * store with one URL-driven shape that components can pattern-match on.
+ *
+ * Step 4 of the route migration deletes those store fields; everything
+ * downstream reads its identifiers via this hook (or the convenience
+ * helpers below) instead.
+ */
+export type CurrentRoute =
+  | { kind: "channel"; channelSlug: string }
+  | { kind: "app"; appId: string }
+  // New-task home composer (index route).
+  | { kind: "home" }
+  | { kind: "task-board" }
+  | { kind: "task-detail"; taskId: string }
+  | { kind: "task-new" }
+  | { kind: "wiki" }
+  | { kind: "wiki-article"; articlePath: string }
+  | { kind: "wiki-lookup"; query: string | null }
+  | { kind: "article"; articleId: string }
+  | { kind: "inbox" }
+  | { kind: "task-decision"; taskId: string }
+  // Bots tool — roster grid + per-bot config/detail page.
+  | { kind: "agents" }
+  | { kind: "bot-detail"; agentSlug: string; tab?: string }
+  // Full-screen skill detail editor + viewer.
+  | { kind: "skill-detail"; skillName: string }
+  | { kind: "routine-detail"; routineSlug: string }
+  | { kind: "routine-new" }
+  | { kind: "unknown" };
+
+interface ParamsShape {
+  channelSlug?: string;
+  agentSlug?: string;
+  appId?: string;
+  entrySlug?: string;
+  taskId?: string;
+  _splat?: string;
+  articleId?: string;
+  tab?: string;
+  skillName?: string;
+  routineSlug?: string;
+}
+
+interface SearchShape {
+  q?: unknown;
+}
+
+type RouteDeriver = (params: ParamsShape, search: SearchShape) => CurrentRoute;
+type CurrentRouteId =
+  | typeof indexRoute.id
+  | typeof channelRoute.id
+  | typeof appRoute.id
+  | typeof tasksRoute.id
+  | typeof taskDetailRoute.id
+  | typeof taskNewRoute.id
+  | typeof appTaskDetailRoute.id
+  | typeof wikiIndexRoute.id
+  | typeof wikiLookupRoute.id
+  | typeof wikiArticleRoute.id
+  | typeof articleRoute.id
+  | typeof inboxRoute.id
+  | typeof taskDecisionRoute.id
+  | typeof botsRoute.id
+  | typeof botDetailRoute.id
+  | typeof botDetailTabRoute.id
+  | typeof skillDetailRoute.id
+  | typeof routineDetailRoute.id
+  | typeof routineNewRoute.id;
+
+const CURRENT_ROUTE_IDS = [
+  indexRoute.id,
+  channelRoute.id,
+  appRoute.id,
+  tasksRoute.id,
+  taskDetailRoute.id,
+  taskNewRoute.id,
+  appTaskDetailRoute.id,
+  wikiIndexRoute.id,
+  wikiLookupRoute.id,
+  wikiArticleRoute.id,
+  articleRoute.id,
+  inboxRoute.id,
+  taskDecisionRoute.id,
+  botsRoute.id,
+  botDetailRoute.id,
+  botDetailTabRoute.id,
+  skillDetailRoute.id,
+  routineDetailRoute.id,
+  routineNewRoute.id,
+] as const satisfies readonly CurrentRouteId[];
+
+const CURRENT_ROUTE_ID_SET = new Set<string>(CURRENT_ROUTE_IDS);
+
+function isCurrentRouteId(routeId: string): routeId is CurrentRouteId {
+  return CURRENT_ROUTE_ID_SET.has(routeId);
+}
+
+const ROUTE_DERIVERS = {
+  [indexRoute.id]: () => ({ kind: "home" }),
+  [channelRoute.id]: (params) => ({
+    kind: "channel",
+    channelSlug: params.channelSlug ?? "general",
+  }),
+  [appRoute.id]: (params) => ({ kind: "app", appId: params.appId ?? "" }),
+  [tasksRoute.id]: () => ({ kind: "task-board" }),
+  [taskDetailRoute.id]: (params) => ({
+    kind: "task-detail",
+    taskId: params.taskId ?? "",
+  }),
+  [taskNewRoute.id]: () => ({ kind: "task-new" }),
+  // `/apps/tasks/$taskId` redirects before matching; the deriver mirrors
+  // taskDetail for completeness so the registry type stays exhaustive.
+  [appTaskDetailRoute.id]: (params) => ({
+    kind: "task-detail",
+    taskId: params.taskId ?? "",
+  }),
+  [wikiIndexRoute.id]: () => ({ kind: "wiki" }),
+  [wikiLookupRoute.id]: (_params, search) => ({
+    kind: "wiki-lookup",
+    query: typeof search.q === "string" ? search.q : null,
+  }),
+  [wikiArticleRoute.id]: (params) => {
+    // Empty splat (e.g. legacy `#/wiki/` URLs that landed on the
+    // article route) renders the catalog rather than a `wiki-article`
+    // surface with an empty path that would fetch the empty article.
+    const splat = typeof params._splat === "string" ? params._splat : "";
+    if (splat.length === 0) return { kind: "wiki" };
+    return { kind: "wiki-article", articlePath: splat };
+  },
+  [articleRoute.id]: (params) => ({
+    kind: "article",
+    articleId: params.articleId ?? "",
+  }),
+  [inboxRoute.id]: () => ({ kind: "inbox" }),
+  [taskDecisionRoute.id]: (params) => ({
+    kind: "task-decision",
+    taskId: params.taskId ?? "",
+  }),
+  // Bots tool — roster grid (/bots) + per-bot config (/bots/$slug)
+  // + tabbed subspace (/bots/$slug/$tab).
+  [botsRoute.id]: () => ({ kind: "agents" }),
+  [botDetailRoute.id]: (params) => ({
+    kind: "bot-detail",
+    agentSlug: params.agentSlug ?? "",
+    tab: undefined,
+  }),
+  [botDetailTabRoute.id]: (params) => ({
+    kind: "bot-detail",
+    agentSlug: params.agentSlug ?? "",
+    tab: params.tab,
+  }),
+  [skillDetailRoute.id]: (params) => ({
+    kind: "skill-detail",
+    skillName: params.skillName ?? "",
+  }),
+  [routineDetailRoute.id]: (params) => ({
+    kind: "routine-detail",
+    routineSlug: params.routineSlug ?? "",
+  }),
+  [routineNewRoute.id]: () => ({ kind: "routine-new" }),
+} satisfies Record<CurrentRouteId, RouteDeriver>;
+
+/**
+ * Pure URL→state dispatch. Exported for unit tests so we can pin the
+ * shape per-route without spinning up a full RouterProvider.
+ */
+export function deriveCurrentRoute(
+  routeId: string,
+  params: ParamsShape,
+  search: SearchShape,
+): CurrentRoute {
+  if (!isCurrentRouteId(routeId)) return { kind: "unknown" };
+  return ROUTE_DERIVERS[routeId](params, search);
+}
+
+export function useCurrentRoute(): CurrentRoute {
+  const matches = useMatches();
+  const leaf = matches.at(-1);
+  return deriveCurrentRoute(
+    leaf?.routeId ?? "",
+    (leaf?.params as ParamsShape) ?? {},
+    (leaf?.search as SearchShape) ?? {},
+  );
+}
+
+/**
+ * Resolve the broker channel slug for the matched conversation route.
+ * Returns null for non-conversation routes (apps, wiki, notebooks, etc.),
+ * so callers that need a slug can fall back to "general" or skip work.
+ */
+export function useChannelSlug(): string | null {
+  const route = useCurrentRoute();
+  if (route.kind === "channel") return route.channelSlug;
+  return null;
+}
+
+/**
+ * Resolve the task id for the currently-viewed task-detail route, or null
+ * when the matched route is anything else. Chat cards use this to detect
+ * when a Task pointer (created / lifecycle card) refers to the very task
+ * whose channel is already on screen, so a self-referential "Open →" can
+ * be suppressed (created card) or rendered inert (lifecycle card).
+ */
+export function useCurrentTaskId(): string | null {
+  const route = useCurrentRoute();
+  if (route.kind === "task-detail" && route.taskId) return route.taskId;
+  return null;
+}
+
+/**
+ * Resolve the channel slug of the chat the human is *currently looking at*:
+ * the channel for a channel route, the owning task's channel for a
+ * task-detail route, and "general" for the home composer (which posts to
+ * #general). Returns null on non-chat surfaces (wiki, bots, apps,
+ * settings, inbox, …) where there is no single conversation to anchor to.
+ *
+ * The interview bar uses this to surface a bot's question only in the
+ * chat it was asked in, instead of mirroring the office-wide request queue
+ * onto every surface. Cross-channel triage still lives in the Inbox, so a
+ * request is never stranded by this narrowing.
+ *
+ * task-detail resolution leans on the already-cached office task list
+ * (useOfficeTasks shares its query key), so this adds no extra polling.
+ * While that list is still loading the slug is null and the bar simply
+ * stays quiet for a beat rather than flashing another channel's request.
+ */
+export function useActiveChannelSlug(): string | null {
+  const route = useCurrentRoute();
+  const { data: tasks } = useOfficeTasks();
+  if (route.kind === "channel") return route.channelSlug;
+  // The bot subspace IS a chat now — its Chat tab is the DM with that
+  // bot, and since the shared-room retirement it is the PRIMARY surface.
+  // Without this mapping the globally-mounted InterviewBar treated
+  // /bots/:slug as a non-chat route and rendered nothing, which made
+  // blocking approvals (add a teammate, plan sign-off) unanswerable anywhere:
+  // the board card is read-only and a chat reply just makes the bot cancel
+  // and re-ask. Found live: three consecutive "Add Editor?" requests, each
+  // canceled by the next, with no Approve control on any surface.
+  if (route.kind === "bot-detail" && route.agentSlug.trim()) {
+    return directChannelSlug(route.agentSlug);
+  }
+  // Home used to scope to "general", a room that no longer exists — every
+  // request silently failed to render there. The lead's DM is the one
+  // conversation every office is guaranteed to have, and it is where the
+  // home composer routes work by default.
+  if (route.kind === "home") return directChannelSlug("cos");
+  if (route.kind === "task-detail") {
+    const owner = (tasks ?? []).find((task) => task.id === route.taskId);
+    const channel = owner?.channel?.trim();
+    return channel ? channel : null;
+  }
+  return null;
+}
+
+/**
+ * Channel slug consumers that work outside conversation routes (thread
+ * panels, request badges, cross-surface actions) should use this hook so
+ * they keep pointing at the user's last-visited channel rather than silently
+ * collapsing to `"general"` whenever the URL is on `/apps/...` or
+ * `/wiki/...`. Falls through to `"general"` only on a cold start where
+ * the user has not yet visited any conversation route.
+ */
+export function useFallbackChannelSlug(): string {
+  const route = useCurrentRoute();
+  const lastChannel = useAppStore((s) => s.lastConversationalChannel);
+  if (route.kind === "channel") return route.channelSlug;
+  return lastChannel ?? "general";
+}
+
+/**
+ * Compatibility shape for code that previously read `currentApp` from
+ * the store. Returns:
+ *   - an app panel id for /apps/$appId,
+ *   - "tasks" for /tasks route variants,
+ *   - "wiki" for any wiki article or catalog route,
+ *   - "wiki-lookup" for /wiki/lookup,
+ *   - null when the matched route is a conversation (channel) or
+ *     unknown.
+ */
+export function useCurrentApp(): string | null {
+  const route = useCurrentRoute();
+  switch (route.kind) {
+    case "app":
+      return route.appId;
+    case "task-board":
+    case "task-detail":
+    case "task-new":
+      return "tasks";
+    case "wiki":
+    case "wiki-article":
+      return "wiki";
+    case "wiki-lookup":
+      return "wiki-lookup";
+    case "article":
+      return "article";
+    case "inbox":
+      return "inbox";
+    case "task-decision":
+      return "inbox";
+    case "routine-detail":
+    case "routine-new":
+      return "routines";
+    case "agents":
+    case "bot-detail":
+      return "agents";
+    case "home":
+    case "channel":
+    case "skill-detail":
+    case "unknown":
+      return null;
+    default: {
+      // Exhaustiveness check — see MainContent's matching switch.
+      const _exhaustive: never = route;
+      void _exhaustive;
+      return null;
+    }
+  }
+}

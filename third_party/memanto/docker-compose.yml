@@ -1,0 +1,29 @@
+services:
+  memanto:
+    build: .
+    image: memanto:latest
+    container_name: memanto
+    ports:
+      # Northlatch remap: host 8000 is the hosting panel, so Memanto serves
+      # on 8090 externally (see DEPLOY.md).
+      - "8090:8000"
+    # Load MOORCHEH_API_KEY and any overrides from your local .env file.
+    # Copy .env.example → .env and fill in your key before running.
+    env_file:
+      - .env
+    restart: unless-stopped
+    volumes:
+      - memanto-state:/data
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://localhost:8000/ready')"
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
+volumes:
+  memanto-state:

@@ -1,0 +1,261 @@
+package main
+
+import (
+	"fmt"
+	"strings"
+
+	"github.com/charmbracelet/lipgloss"
+
+	"github.com/Northlatch-Labs-LLC/hivex/cmd/hivebot/channelui"
+)
+
+func (m channelModel) currentMainViewportLines(contentWidth, msgH int) []channelui.RenderedLine {
+	workspace := m.currentWorkspaceUIState()
+	needsYou := workspace.NeedsYouLines(contentWidth)
+	bodyHeight := msgH
+	if len(needsYou) > 0 && bodyHeight-len(needsYou) >= 8 {
+		bodyHeight -= len(needsYou)
+	} else {
+		needsYou = nil
+	}
+
+	if m.isOneOnOne() {
+		if m.activeApp == channelui.OfficeAppRecovery {
+			return m.currentMainLines(contentWidth)
+		}
+		if m.activeApp == channelui.OfficeAppInbox || m.activeApp == channelui.OfficeAppOutbox {
+			return append(needsYou, m.currentMainLines(contentWidth)...)
+		}
+		if len(m.messages) == 0 {
+			return append(needsYou, m.buildDirectFeedLines(contentWidth)...)
+		}
+		lines := buildOneOnOneViewportSuffix(m.messages, m.actions, m.tasks, m.members, m.expandedThreads, contentWidth, bodyHeight, m.scroll, m.oneOnOneBotName(), m.oneOnOneBotSlug(), m.unreadAnchorID, m.unreadCount)
+		return append(needsYou, lines...)
+	}
+	if m.activeApp == channelui.OfficeAppMessages {
+		if len(m.messages) == 0 {
+			return append(needsYou, m.buildOfficeFeedLines(contentWidth)...)
+		}
+		lines := buildOfficeViewportSuffix(m.messages, m.expandedThreads, contentWidth, bodyHeight, m.scroll, m.threadsDefaultExpand, m.unreadAnchorID, m.unreadCount, m.members, m.tasks, m.actions)
+		return append(needsYou, lines...)
+	}
+	return m.currentMainLines(contentWidth)
+}
+
+func buildOfficeViewportSuffix(messages []channelui.BrokerMessage, expanded map[string]bool, contentWidth, msgH, scroll int, threadsDefaultExpand bool, unreadAnchorID string, unreadCount int, members []channelui.Member, tasks []channelui.Task, actions []channelui.Action) []channelui.RenderedLine {
+	tail := channelui.BuildLiveWorkLines(members, tasks, actions, contentWidth, "")
+	return buildVirtualizedOfficeViewport(messages, expanded, contentWidth, msgH, scroll, threadsDefaultExpand, unreadAnchorID, unreadCount, tail)
+}
+
+func buildOneOnOneViewportSuffix(messages []channelui.BrokerMessage, actions []channelui.Action, tasks []channelui.Task, members []channelui.Member, expanded map[string]bool, contentWidth, msgH, scroll int, botName, botSlug, unreadAnchorID string, unreadCount int) []channelui.RenderedLine {
+	var tail []channelui.RenderedLine
+	tail = append(tail, channelui.BuildDirectExecutionLines(actions, botSlug, contentWidth)...)
+	tail = append(tail, channelui.BuildLiveWorkLines(members, tasks, nil, contentWidth, botSlug)...)
+	if len(messages) == 0 {
+		limit := msgH + scroll
+		if limit < 1 {
+			limit = 1
+		}
+		lines := append(buildOneOnOneMessageLines(messages, expanded, contentWidth, botName, unreadAnchorID, unreadCount), tail...)
+		if len(lines) > limit {
+			return channelui.CloneRenderedLines(lines[len(lines)-limit:])
+		}
+		return lines
+	}
+	return buildVirtualizedOfficeViewport(messages, expanded, contentWidth, msgH, scroll, true, unreadAnchorID, unreadCount, tail)
+}
+
+func officeThreadedMessages(messages []channelui.BrokerMessage, expanded map[string]bool, threadsDefaultExpand bool) []channelui.ThreadedMessage {
+	return cachedThreadedMessages(messages, expanded, threadsDefaultExpand)
+}
+
+var threadParticipantDisplaySlug = map[string]string{
+	"cos":               "cos",
+	"product manager":   "pm",
+	"frontend engineer": "fe",
+	"backend engineer":  "be",
+	"ai engineer":       "ai",
+	"designer":          "designer",
+	"cmo":               "cmo",
+	"cro":               "cro",
+}
+
+func threadParticipantColor(participant string) string {
+	normalized := strings.TrimPrefix(strings.ToLower(strings.TrimSpace(participant)), "@")
+	if slug, ok := threadParticipantDisplaySlug[normalized]; ok {
+		return channelui.BotColor(slug)
+	}
+	if color := channelui.BotColor(normalized); color != "" {
+		return color
+	}
+	return "#ABABAD"
+}
+
+func renderOfficeMessageBlock(tm channelui.ThreadedMessage, contentWidth int, unreadAnchorID string, unreadCount int) []channelui.RenderedLine {
+	msg := tm.Message
+	mutedStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(channelui.SlackMuted))
+	statusStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#CBD5E1")).Italic(true)
+
+	var lines []channelui.RenderedLine
+	if unreadAnchorID != "" && msg.ID == unreadAnchorID {
+		lines = append(lines, channelui.RenderedLine{Text: channelui.RenderUnreadDivider(contentWidth, unreadCount)})
+	}
+	ts := msg.Timestamp
+	if len(ts) > 19 {
+		ts = ts[11:19]
+	}
+
+	color := channelui.BotColor(msg.From)
+	if color == "" {
+		color = "#9CA3AF"
+	}
+	nameStyle := lipgloss.NewStyle().
+		Foreground(lipgloss.Color(color)).
+		Bold(true)
+	ruleStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(color))
+
+	appendWrappedLine := func(text string) {
+		wrapped := channelui.AppendWrapped(nil, contentWidth, text)
+		for _, line := range wrapped {
+			lines = append(lines, channelui.RenderedLine{Text: line})
+		}
+	}
+
+	if strings.HasPrefix(msg.Kind, "human_") {
+		lines = append(lines, channelui.RenderedLine{Text: ""})
+		headerPrefix := "  " + strings.Repeat("  ", tm.Depth)
+		if tm.Depth > 0 {
+			headerPrefix += "↳ "
+		}
+		meta := fmt.Sprintf("for you · %s · %s", channelui.HumanMessageLabel(msg.Kind), msg.ID)
+		if tm.Depth > 0 {
+			meta += fmt.Sprintf(" · thread reply to %s", tm.ParentLabel)
+		}
+		appendWrappedLine(fmt.Sprintf("%s%s %s  %s  %s",
+			headerPrefix,
+			channelui.BotAvatar(msg.From),
+			nameStyle.Render(channelui.DisplayName(msg.From)),
+			mutedStyle.Render(ts),
+			lipgloss.NewStyle().Foreground(lipgloss.Color("#F59E0B")).Render(meta),
+		))
+
+		prefix := "  " + strings.Repeat("  ", tm.Depth)
+		if tm.Depth > 0 {
+			prefix += lipgloss.NewStyle().Foreground(lipgloss.Color("#F59E0B")).Render("┆") + " "
+		} else {
+			prefix += lipgloss.NewStyle().Foreground(lipgloss.Color("#F59E0B")).Render("│") + " "
+		}
+		titleLine := msg.Title
+		if titleLine == "" {
+			titleLine = channelui.DefaultHumanMessageTitle(msg.Kind, msg.From)
+		}
+		appendWrappedLine(prefix + channelui.SubtlePill("for you", "#FEF3C7", "#92400E") + " " + lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#F8FAFC")).Render(titleLine))
+		for _, paragraph := range strings.Split(msg.Content, "\n") {
+			paragraph = channelui.HighlightMentions(paragraph, channelui.BotColorMap)
+			appendWrappedLine(prefix + paragraph)
+		}
+		return lines
+	}
+
+	if msg.Kind == "automation" || msg.From == "hive" {
+		lines = append(lines, channelui.RenderedLine{Text: ""})
+		source := msg.Source
+		if source == "" {
+			source = "context graph"
+		} else {
+			source = strings.ReplaceAll(source, "_", " ")
+		}
+		meta := fmt.Sprintf("%s · automated · %s", source, msg.ID)
+		if tm.Depth > 0 {
+			meta += fmt.Sprintf(" · thread reply to %s", tm.ParentLabel)
+		}
+		titleLine := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(color)).Render(channelui.FallbackString(msg.Title, "Automation update"))
+		for _, lineText := range channelui.RenderRuntimeEventCard(contentWidth, channelui.SubtlePill("automation", "#F8FAFC", "#334155")+" "+titleLine, meta, "#7C3AED", strings.Split(msg.Content, "\n")) {
+			lines = append(lines, channelui.RenderedLine{Text: "  " + lineText})
+		}
+		return lines
+	}
+
+	if strings.HasPrefix(msg.Content, "[STATUS]") {
+		status := strings.TrimPrefix(msg.Content, "[STATUS] ")
+		titleLine := channelui.SubtlePill("status", "#E2E8F0", "#334155") + " " + nameStyle.Render("@"+msg.From) + " " + statusStyle.Render("is "+status)
+		for _, lineText := range channelui.RenderRuntimeEventCard(contentWidth, titleLine, mutedStyle.Render(ts), "#475569", nil) {
+			lines = append(lines, channelui.RenderedLine{Text: "  " + lineText})
+		}
+		return lines
+	}
+
+	if msg.From == "system" && (msg.Kind == "routing" || msg.Kind == "stage") {
+		label := "routing"
+		if msg.Kind == "stage" {
+			label = "stage"
+		}
+		for _, lineText := range channelui.RenderRuntimeEventCard(contentWidth, channelui.SubtlePill(label, "#E5E7EB", "#334155")+" "+mutedStyle.Render(ts), msg.Content, "#475569", nil) {
+			lines = append(lines, channelui.RenderedLine{Text: "  " + lineText})
+		}
+		return lines
+	}
+
+	mood := channelui.InferMood(msg.Content)
+	meta := channelui.RoleLabel(msg.From) + " · " + msg.ID
+	if mood != "" {
+		meta += " · " + mood
+	}
+	if usageMeta := channelui.RenderMessageUsageMeta(msg.Usage, color); usageMeta != "" {
+		meta += " · " + usageMeta
+	}
+	if tm.Depth > 0 {
+		meta += fmt.Sprintf(" · thread reply to %s", tm.ParentLabel)
+	}
+	metaStyle := mutedStyle
+	if mood != "" {
+		metaStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(color))
+	}
+	lines = append(lines, channelui.RenderedLine{Text: ""})
+	headerPrefix := "  " + strings.Repeat("  ", tm.Depth)
+	if tm.Depth > 0 {
+		headerPrefix += "↳ "
+	}
+	appendWrappedLine(fmt.Sprintf("%s%s %s  %s  %s", headerPrefix, channelui.BotAvatar(msg.From), nameStyle.Render(channelui.DisplayName(msg.From)), mutedStyle.Render(ts), metaStyle.Render(meta)))
+
+	prefix := "  " + strings.Repeat("  ", tm.Depth)
+	if tm.Depth > 0 {
+		prefix += ruleStyle.Render("┆") + " "
+	} else {
+		prefix += ruleStyle.Render("│") + " "
+	}
+
+	rendered := renderMarkdown(msg.Content, contentWidth-len(prefix)-2)
+	for _, paragraph := range strings.Split(rendered, "\n") {
+		paragraph = channelui.HighlightMentions(paragraph, channelui.BotColorMap)
+		appendWrappedLine(prefix + paragraph)
+	}
+	if reactionLine := channelui.RenderReactions(msg.Reactions); reactionLine != "" {
+		appendWrappedLine(prefix + reactionLine)
+	}
+	if tm.Collapsed && tm.HiddenReplies > 0 {
+		var coloredNames []string
+		for _, p := range tm.ThreadParticipants {
+			pColor := threadParticipantColor(p)
+			coloredNames = append(coloredNames, lipgloss.NewStyle().Foreground(lipgloss.Color(pColor)).Bold(true).Render(p))
+		}
+		participantStr := ""
+		if len(coloredNames) > 0 {
+			participantStr = "  " + strings.Join(coloredNames, ", ")
+		}
+		label := fmt.Sprintf("  ↩ %d %s%s", tm.HiddenReplies, channelui.PluralizeWord(tm.HiddenReplies, "reply", "replies"), participantStr)
+		lines = append(lines, channelui.RenderedLine{Text: label, ThreadID: msg.ID})
+	}
+
+	return lines
+}
+
+func prependRenderedLines(dst, prefix []channelui.RenderedLine) []channelui.RenderedLine {
+	if len(prefix) == 0 {
+		return dst
+	}
+	out := make([]channelui.RenderedLine, 0, len(prefix)+len(dst))
+	out = append(out, prefix...)
+	out = append(out, dst...)
+	return out
+}

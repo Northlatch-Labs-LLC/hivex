@@ -1,0 +1,1324 @@
+package onboarding
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"github.com/Northlatch-Labs-LLC/hivex/internal/config"
+	"github.com/Northlatch-Labs-LLC/hivex/internal/gbrain"
+	"github.com/Northlatch-Labs-LLC/hivex/internal/operations"
+)
+
+// gbrainEnsureTimeout bounds the best-effort gbrain brain initialization fired
+// when onboarding completes. It mirrors the /init TUI flow's budget: brain init
+// (`gbrain init --pglite`) can take time on first run, so the call runs in a
+// detached goroutine and never blocks the HTTP response.
+const gbrainEnsureTimeout = 90 * time.Second
+
+// Test seams for the onboarding-complete gbrain wiring. They default to the real
+// gbrain implementations and are overridden in unit tests so the completion path
+// can be exercised without a live gbrain binary. ensureBrainHook is the function
+// HandleComplete launches in a goroutine after a successful completion.
+var (
+	gbrainIsInstalled = gbrain.IsInstalled
+	gbrainEnsureBrain = gbrain.EnsureBrain
+	ensureBrainHook   = ensureGBrainBrain
+)
+
+// ensureGBrainBrain initializes a gbrain brain with the best available embedder
+// when onboarding completes. It is best-effort and MUST NOT fail or block
+// onboarding: it is a no-op when gbrain is not installed, gbrain.EnsureBrain is
+// strictly idempotent (a brain that already exists is left untouched), and any
+// error is logged rather than surfaced. By the time onboarding completes the
+// user's pasted OpenAI key is already persisted to config (via /config), so
+// SelectEmbeddingModel/EnsureBrain pick the strongest embedder automatically.
+func ensureGBrainBrain() {
+	if !gbrainIsInstalled() {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), gbrainEnsureTimeout)
+	defer cancel()
+	if _, err := gbrainEnsureBrain(ctx); err != nil {
+		log.Printf("onboarding: gbrain ensure-brain failed: %v", err)
+	}
+}
+
+// CompleteFunc is the side-effect hook invoked by HandleComplete when the
+// user finishes onboarding. The broker supplies a real implementation that
+// seeds the team from the picked blueprint (or synthesizes one when blueprintID
+// is empty), honors the selectedBots filter from the wizard, and posts the
+// kickoff task. blueprintID is empty for the "from scratch" path.
+// selectedBots is nil when no filtering is requested (internal synthesis
+// callers) and may be an empty slice when the wizard user unchecked every
+// bot. companyName is the company or project name captured in the identity
+// step; it is empty when the user skipped or left the field blank.
+type CompleteFunc func(task string, skipTask bool, blueprintID string, selectedBots []string, companyName string) error
+
+// RegisterRoutes attaches all onboarding HTTP handlers to mux.
+//
+// completeFn is called by HandleComplete when the user finishes onboarding.
+// Pass nil to defer wiring — the broker should supply a real implementation
+// that seeds the team, posts the first message, and triggers the CEO turn.
+//
+// packSlug is a legacy selection identifier. HandleTemplates uses it to
+// return operation-appropriate first-task suggestions and falls back to the
+// generic compatibility templates when no blueprint-specific set exists.
+//
+// wikiRoot is the absolute path to the wiki directory used by the scan
+// handler to write extracted company context articles.
+//
+// authMiddleware wraps each handler. Pass the broker's requireAuth so local
+// processes and cross-origin callers cannot POST /onboarding/complete (which
+// seeds the team and fires the first CEO turn) without the broker token.
+// Pass a nil middleware only in tests — RegisterRoutes substitutes a passthrough.
+//
+// TransitionFunc is the broker callback invoked when the phase advances.
+// The broker uses this to emit the next CEO suggestion card into b.messages
+// on the CEO DM and perform any phase-transition side effects.
+// phase is the new phase the state machine just entered.
+type TransitionFunc func(phase string, s *State) error
+
+// RegisterRoutes wires the onboarding HTTP endpoints onto mux.
+//
+// Routes registered:
+//
+//	GET  /onboarding/state
+//	POST /onboarding/progress
+//	POST /onboarding/complete
+//	GET  /onboarding/prereqs
+//	POST /onboarding/verify
+//	GET  /onboarding/install-steps
+//	POST /onboarding/validate-key
+//	GET  /onboarding/templates
+//	POST /onboarding/checklist/{id}/done
+//	POST /onboarding/checklist/dismiss
+//	POST /onboarding/scan
+//	POST /onboarding/upload-context
+//	POST /onboarding/transition   (Phase 2)
+//	POST /onboarding/answer       (Phase 2)
+//	POST /onboarding/suggestion/ack (Phase 2)
+func RegisterRoutes(mux *http.ServeMux, completeFn CompleteFunc, packSlug string, authMiddleware func(http.HandlerFunc) http.HandlerFunc, wikiRoot string) {
+	RegisterRoutesWithTransition(mux, completeFn, nil, packSlug, authMiddleware, wikiRoot)
+}
+
+// RegisterRoutesWithTransition is like RegisterRoutes but also accepts a
+// TransitionFunc that the broker supplies to receive phase-transition events.
+// Pass nil transitionFn to skip the broker callback (legacy path / tests).
+func RegisterRoutesWithTransition(mux *http.ServeMux, completeFn CompleteFunc, transitionFn TransitionFunc, packSlug string, authMiddleware func(http.HandlerFunc) http.HandlerFunc, wikiRoot string) {
+	if authMiddleware == nil {
+		authMiddleware = func(h http.HandlerFunc) http.HandlerFunc { return h }
+	}
+	mux.HandleFunc("/onboarding/state", authMiddleware(HandleState))
+	mux.HandleFunc("/onboarding/progress", authMiddleware(HandleProgress))
+	mux.HandleFunc("/onboarding/complete", authMiddleware(makeHandleComplete(completeFn)))
+	mux.HandleFunc("/onboarding/prereqs", authMiddleware(HandlePrereqs))
+	mux.HandleFunc("/onboarding/verify", authMiddleware(HandleVerify))
+	mux.HandleFunc("/onboarding/install-steps", authMiddleware(HandleInstallSteps))
+	mux.HandleFunc("/onboarding/validate-key", authMiddleware(HandleValidateKey))
+	mux.HandleFunc("/onboarding/templates", authMiddleware(makeHandleTemplates(packSlug)))
+	mux.HandleFunc("/onboarding/blueprints", authMiddleware(HandleBlueprints))
+	mux.HandleFunc("/onboarding/checklist/dismiss", authMiddleware(HandleChecklistDismiss))
+	// Pattern must be registered after the more-specific /dismiss route so
+	// that /dismiss is not swallowed by the /{id}/done prefix match.
+	mux.HandleFunc("/onboarding/checklist/", authMiddleware(HandleChecklistDone))
+	mux.HandleFunc("/onboarding/scan", authMiddleware(makeHandleScan(wikiRoot)))
+	mux.HandleFunc("/onboarding/upload-context", authMiddleware(handleUploadContext))
+	// Phase 2 — deterministic CEO conversation handlers.
+	mux.HandleFunc("/onboarding/transition", authMiddleware(makeHandleTransition(transitionFn)))
+	mux.HandleFunc("/onboarding/answer", authMiddleware(HandleAnswer))
+	mux.HandleFunc("/onboarding/suggestion/ack", authMiddleware(HandleSuggestionAck))
+}
+
+// HandleState handles GET /onboarding/state.
+// Returns the full onboarding State plus an "onboarded" convenience boolean.
+// The frontend wizard reads state.onboarded to decide whether to show itself
+// on page load. Without this boolean, a completed user who refreshes the
+// page sees the wizard again because the frontend has no simple flag to
+// check.
+func HandleState(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	s, err := Load()
+	if err != nil {
+		http.Error(w, "failed to load state", http.StatusInternalServerError)
+		return
+	}
+	payload := map[string]any{
+		"version":             s.Version,
+		"completed_at":        s.CompletedAt,
+		"company_name":        s.CompanyName,
+		"step":                onboardingStateStep(s),
+		"completed_steps":     s.CompletedSteps,
+		"checklist_dismissed": s.ChecklistDismissed,
+		"partial":             s.Partial,
+		"checklist":           s.Checklist,
+		"onboarded":           s.Onboarded(),
+		// v2 fields.
+		"phase":                   s.Phase,
+		"ceo_dm_channel_id":       s.CEODMChannelID,
+		"pending_suggestion":      s.PendingSuggestion,
+		"form_answers":            s.FormAnswers,
+		"first_issue_id":          s.FirstIssueID,
+		"first_issue_approved_at": s.FirstIssueApprovedAt,
+		"activated":               s.Activated(),
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(payload)
+}
+
+// HandleProgress handles POST /onboarding/progress.
+// Body: {"step": string, "answers": map}.
+// Merges the answers for the given step into the partial-progress record.
+func HandleProgress(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var body map[string]interface{}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "invalid json", http.StatusBadRequest)
+		return
+	}
+	step := strings.TrimSpace(anyString(body["step"]))
+	if step == "" {
+		http.Error(w, "step required", http.StatusBadRequest)
+		return
+	}
+	answers := anyMap(body["answers"])
+	if len(answers) == 0 {
+		answers = legacyProgressAnswers(body)
+	}
+	if err := SaveProgress(step, answers); err != nil {
+		http.Error(w, "failed to save progress", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+}
+
+// makeHandleComplete returns a handler for POST /onboarding/complete that
+// closes over completeFn. The broker should supply a non-nil completeFn to
+// seed the team and post the first message.
+func makeHandleComplete(completeFn CompleteFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		HandleComplete(w, r, completeFn)
+	}
+}
+
+// HandleComplete handles POST /onboarding/complete.
+// Body: {"task": string, "skip_task": bool, "blueprint": string, "bots": []string}.
+// The blueprint and bots fields are forwarded to completeFn so the broker
+// can seed the team that the wizard actually picked. A legacy client that
+// omits them is treated as "from scratch" (blueprint empty, bots nil).
+//
+// Logic:
+//  1. Load state; if already completed return 200 {"already_completed": true, "redirect": "/"}.
+//  2. If skip_task is false and task is empty, return 400.
+//  3. Call completeFn (when non-nil) — the broker wires side-effects here.
+//     If completeFn returns an error (e.g. LoadBlueprint failed), return 500
+//     with the error message so the wizard can surface it.
+//  4. Mark state as complete and persist it.
+//  5. Return 200 {"ok": true, "redirect": "/"}.
+func HandleComplete(w http.ResponseWriter, r *http.Request, completeFn CompleteFunc) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var body struct {
+		Task          string   `json:"task"`
+		SkipTask      bool     `json:"skip_task"`
+		Blueprint     string   `json:"blueprint"`
+		Bots          []string `json:"agents"`
+		Website       string   `json:"website"`
+		ScanCompleted bool     `json:"scan_completed"`
+		OwnerName     string   `json:"owner_name"`
+		OwnerRole     string   `json:"owner_role"`
+		// Product analytics consent captured by the wizard's two toggles.
+		// Pointers so a legacy client that omits them leaves config alone
+		// (default ON resolves at read time). See docs/specs/product-analytics.md.
+		AnalyticsTelemetryEnabled        *bool `json:"analytics_telemetry_enabled,omitempty"`
+		AnalyticsSessionRecordingEnabled *bool `json:"analytics_session_recording_enabled,omitempty"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "invalid json", http.StatusBadRequest)
+		return
+	}
+
+	website := strings.TrimSpace(body.Website)
+	ownerName := strings.TrimSpace(body.OwnerName)
+	ownerRole := strings.TrimSpace(body.OwnerRole)
+
+	s, err := Load()
+	if err != nil {
+		http.Error(w, "failed to load state", http.StatusInternalServerError)
+		return
+	}
+
+	// Idempotent: already done.
+	if s.Onboarded() {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"already_completed": true,
+			"redirect":          "/",
+		})
+		return
+	}
+
+	// Validate: task is required unless skip_task=true.
+	if !body.SkipTask && strings.TrimSpace(body.Task) == "" {
+		http.Error(w, "task required", http.StatusBadRequest)
+		return
+	}
+
+	// Extract company name before calling completeFn so the broker can sync it
+	// to the workspace registry as part of its side effects.
+	companyName := onboardingPartialCompanyName(s.Partial)
+
+	if completeFn != nil {
+		if err := completeFn(body.Task, body.SkipTask, strings.TrimSpace(body.Blueprint), body.Bots, companyName); err != nil {
+			// Log the full error server-side but return an opaque response to
+			// the client. completeFn may wrap filesystem paths, yaml parse
+			// messages, or other internals that should not leak to HTTP
+			// callers on a locally-bound broker.
+			log.Printf("onboarding: complete failed: %v", err)
+			http.Error(w, "complete failed", http.StatusInternalServerError)
+			return
+		}
+	}
+
+	// Persist company/owner fields and analytics consent only after validation
+	// and completeFn succeed so duplicate or invalid requests don't overwrite
+	// config state.
+	if website != "" || ownerName != "" || ownerRole != "" || !body.ScanCompleted ||
+		body.AnalyticsTelemetryEnabled != nil || body.AnalyticsSessionRecordingEnabled != nil {
+		if cfg, err := config.Load(); err == nil {
+			if website != "" {
+				cfg.CompanyWebsite = website
+			}
+			if ownerName != "" {
+				cfg.OwnerName = ownerName
+			}
+			if ownerRole != "" {
+				cfg.OwnerRole = ownerRole
+			}
+			if website != "" || ownerName != "" || ownerRole != "" {
+				cfg.PendingCompanySeed = !body.ScanCompleted
+			}
+			// Copy into fresh locals so the stored pointer doesn't alias the
+			// decoded request body.
+			if body.AnalyticsTelemetryEnabled != nil {
+				v := *body.AnalyticsTelemetryEnabled
+				cfg.AnalyticsTelemetryEnabled = &v
+			}
+			if body.AnalyticsSessionRecordingEnabled != nil {
+				v := *body.AnalyticsSessionRecordingEnabled
+				cfg.AnalyticsSessionRecordingEnabled = &v
+			}
+			if err := config.Save(cfg); err != nil {
+				log.Printf("onboarding: complete: failed to persist company fields: %v", err)
+			}
+		}
+	}
+
+	// Build the completed payload — prepare the response before writing disk.
+	completeState(s, companyName)
+
+	if err := Save(s); err != nil {
+		http.Error(w, "failed to save state", http.StatusInternalServerError)
+		return
+	}
+
+	// Best-effort: initialize the gbrain knowledge brain with the strongest
+	// available embedder now that the OpenAI key (if any) is persisted. Runs in
+	// a detached goroutine so a slow first-run `gbrain init` never blocks the
+	// HTTP response, and never fails onboarding (no-op when gbrain is absent,
+	// idempotent when a brain already exists). See ensureGBrainBrain.
+	go ensureBrainHook()
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"ok":       true,
+		"redirect": "/",
+	})
+}
+
+func onboardingStateStep(s *State) string {
+	if s == nil || s.Partial == nil {
+		return ""
+	}
+	return strings.TrimSpace(s.Partial.Step)
+}
+
+func anyString(value interface{}) string {
+	if s, ok := value.(string); ok {
+		return s
+	}
+	return ""
+}
+
+func anyMap(value interface{}) map[string]interface{} {
+	m, ok := value.(map[string]interface{})
+	if !ok {
+		return nil
+	}
+	return m
+}
+
+func legacyProgressAnswers(body map[string]interface{}) map[string]interface{} {
+	answers := make(map[string]interface{})
+	for key, value := range body {
+		switch key {
+		case "step", "answers":
+			continue
+		default:
+			answers[key] = value
+		}
+	}
+	return answers
+}
+
+func onboardingPartialCompanyName(partial *PartialProgress) string {
+	if partial == nil || partial.Answers == nil {
+		return ""
+	}
+	// "identity" is the current wizard step name; "welcome" and "setup"
+	// remain for back-compat with sessions saved before the wizard restructure.
+	for _, step := range []string{"identity", "welcome", "setup"} {
+		answers := partial.Answers[step]
+		for _, key := range []string{"company_name", "company"} {
+			if value, ok := answers[key].(string); ok && strings.TrimSpace(value) != "" {
+				return strings.TrimSpace(value)
+			}
+		}
+	}
+	return ""
+}
+
+// validateProviderKey pings the provider API with a minimal request to verify
+// the key. Returns "valid", "invalid", "unreachable", or "format_error".
+func validateProviderKey(ctx context.Context, provider, key string) string {
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return "format_error"
+	}
+	switch provider {
+	case "anthropic":
+		if !strings.HasPrefix(key, "sk-ant-") || len(key) < 20 {
+			return "format_error"
+		}
+		return pingAnthropic(ctx, key)
+	case "openai":
+		if !strings.HasPrefix(key, "sk-") || len(key) < 20 {
+			return "format_error"
+		}
+		return pingOpenAI(ctx, key)
+	case "gemini":
+		if len(key) < 10 {
+			return "format_error"
+		}
+		// Gemini format varies; accept if non-empty and reasonable length.
+		return "valid"
+	default:
+		return "format_error"
+	}
+}
+
+func pingAnthropic(ctx context.Context, key string) string {
+	client := &http.Client{Timeout: 3 * time.Second}
+	body := strings.NewReader(`{"model":"claude-haiku-4-5-20251001","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}`)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://api.anthropic.com/v1/messages", body)
+	if err != nil {
+		return "unreachable"
+	}
+	req.Header.Set("x-api-key", key)
+	req.Header.Set("anthropic-version", "2023-06-01")
+	req.Header.Set("content-type", "application/json")
+	resp, err := client.Do(req)
+	if err != nil {
+		return "unreachable"
+	}
+	defer resp.Body.Close()
+	switch resp.StatusCode {
+	case http.StatusOK, http.StatusBadRequest: // 400 means auth passed, model may complain
+		return "valid"
+	case http.StatusUnauthorized, http.StatusForbidden:
+		return "invalid"
+	default:
+		return fmt.Sprintf("unreachable:%d", resp.StatusCode)
+	}
+}
+
+func pingOpenAI(ctx context.Context, key string) string {
+	client := &http.Client{Timeout: 3 * time.Second}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://api.openai.com/v1/models", nil)
+	if err != nil {
+		return "unreachable"
+	}
+	req.Header.Set("Authorization", "Bearer "+key)
+	resp, err := client.Do(req)
+	if err != nil {
+		return "unreachable"
+	}
+	defer resp.Body.Close()
+	switch resp.StatusCode {
+	case http.StatusOK:
+		return "valid"
+	case http.StatusUnauthorized, http.StatusForbidden:
+		return "invalid"
+	default:
+		return "unreachable"
+	}
+}
+
+// HandleChecklistDone handles POST /onboarding/checklist/{id}/done.
+// Parses the item ID from the URL path and marks it done.
+func HandleChecklistDone(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	// Path: /onboarding/checklist/{id}/done
+	// Strip prefix and suffix to extract id.
+	path := strings.TrimPrefix(r.URL.Path, "/onboarding/checklist/")
+	path = strings.TrimSuffix(path, "/done")
+	id := strings.TrimSpace(path)
+	if id == "" || id == "dismiss" {
+		http.Error(w, "item id required", http.StatusBadRequest)
+		return
+	}
+	if err := MarkChecklistItem(id, true); err != nil {
+		http.Error(w, "failed to update checklist", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+}
+
+// HandlePrereqs handles GET /onboarding/prereqs.
+// Returns JSON array of PrereqResult for node, git, and claude CLI.
+func HandlePrereqs(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	results := CheckAll(r.Context())
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(results)
+}
+
+// HandleVerify handles POST /onboarding/verify.
+// Body: {"runtime": string}. The runtime may also be supplied as the
+// ?runtime= query parameter (the body takes precedence when both are set).
+// Returns a VerifyResult JSON classifying the runtime as
+// pass | not_installed | auth_required by reusing CheckOne plus the
+// per-runtime session probe.
+//
+// A 10s request deadline bounds the underlying subprocess probes (CheckOne's
+// own per-call timeout is 10s for --version and 3s for the session probe, so
+// a single runtime stays well inside this budget). Matches the client-side
+// 5s budget on /onboarding/prereqs spirit while leaving slack for a probe
+// under load.
+func HandleVerify(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Accept the runtime from the JSON body first, falling back to the query
+	// parameter. An empty or absent body is tolerated so the ?runtime= form
+	// works on its own.
+	runtime := strings.TrimSpace(r.URL.Query().Get("runtime"))
+	var body struct {
+		Runtime string `json:"runtime"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err == nil {
+		if b := strings.TrimSpace(body.Runtime); b != "" {
+			runtime = b
+		}
+	}
+	if runtime == "" {
+		http.Error(w, "runtime required", http.StatusBadRequest)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+	result := VerifyRuntime(ctx, runtime)
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(result)
+}
+
+// HandleInstallSteps handles GET /onboarding/install-steps?runtime=<name>.
+// Returns {"runtime": string, "steps": []InstallStep} with the per-runtime
+// guided setup. This is cheap, static metadata (no subprocess), kept separate
+// from the live /onboarding/verify probe so the guided picker can render the
+// steps without paying for a check.
+func HandleInstallSteps(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	runtime := strings.TrimSpace(r.URL.Query().Get("runtime"))
+	if runtime == "" {
+		http.Error(w, "runtime required", http.StatusBadRequest)
+		return
+	}
+	steps := InstallSteps(runtime)
+	if steps == nil {
+		steps = []InstallStep{}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"runtime": runtime,
+		"steps":   steps,
+	})
+}
+
+// HandleValidateKey handles POST /onboarding/validate-key.
+// Body: {"provider": string, "key": string}.
+// Returns {"status": "valid"|"invalid"|"unreachable"|"format_error"}.
+func HandleValidateKey(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var body struct {
+		Provider string `json:"provider"`
+		Key      string `json:"key"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "invalid json", http.StatusBadRequest)
+		return
+	}
+	status := validateProviderKey(r.Context(), body.Provider, body.Key)
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]string{"status": status})
+}
+
+// makeHandleTemplates returns a handler for GET /onboarding/templates that
+// closes over the active selection so the first-task suggestions match the
+// operation the user is actually launching.
+func makeHandleTemplates(packSlug string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		HandleTemplates(w, r, packSlug)
+	}
+}
+
+// HandleTemplates handles GET /onboarding/templates.
+// Returns JSON array of TaskTemplate for the given selection. An empty
+// selection falls back to the generic compatibility templates.
+func HandleTemplates(w http.ResponseWriter, r *http.Request, packSlug string) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(TemplatesForSelection("", packSlug))
+}
+
+// blueprintSummary is the wizard-facing shape returned by HandleBlueprints.
+// Keep the field names in sync with BlueprintTemplate in
+// web/src/components/onboarding/wizard/types.ts. The pack-library
+// fields (outcome, category, channels, skills, wiki_scaffold,
+// first_tasks, requirements, estimated_setup_minutes,
+// example_artifacts) are additive — older clients that only consume
+// id/name/description/bots/tasks keep working.
+type blueprintSummary struct {
+	ID                    string                       `json:"id"`
+	Name                  string                       `json:"name"`
+	Description           string                       `json:"description,omitempty"`
+	Emoji                 string                       `json:"emoji,omitempty"`
+	Outcome               string                       `json:"outcome,omitempty"`
+	Category              string                       `json:"category,omitempty"`
+	EstimatedSetupMinutes int                          `json:"estimated_setup_minutes,omitempty"`
+	Bots                  []blueprintBotSummary        `json:"agents,omitempty"`
+	Channels              []blueprintChannelSummary    `json:"channels,omitempty"`
+	Tasks                 []blueprintTaskSummary       `json:"tasks,omitempty"`
+	Skills                []blueprintSkillSummary      `json:"skills,omitempty"`
+	WikiScaffold          []blueprintWikiScaffoldEntry `json:"wiki_scaffold,omitempty"`
+	FirstTasks            []blueprintFirstTaskSummary  `json:"first_tasks,omitempty"`
+	Requirements          []blueprintRequirementEntry  `json:"requirements,omitempty"`
+	ExampleArtifacts      []blueprintExampleSummary    `json:"example_artifacts,omitempty"`
+}
+
+type blueprintChannelSummary struct {
+	Slug    string `json:"slug"`
+	Name    string `json:"name,omitempty"`
+	Purpose string `json:"purpose,omitempty"`
+}
+
+type blueprintSkillSummary struct {
+	Name    string `json:"name"`
+	Purpose string `json:"purpose,omitempty"`
+}
+
+type blueprintWikiScaffoldEntry struct {
+	Path  string `json:"path"`
+	Title string `json:"title,omitempty"`
+}
+
+type blueprintFirstTaskSummary struct {
+	ID             string `json:"id"`
+	Title          string `json:"title"`
+	Prompt         string `json:"prompt,omitempty"`
+	ExpectedOutput string `json:"expected_output,omitempty"`
+}
+
+type blueprintRequirementEntry struct {
+	Kind     string `json:"kind"`
+	Name     string `json:"name"`
+	Required bool   `json:"required,omitempty"`
+	Detail   string `json:"detail,omitempty"`
+}
+
+type blueprintExampleSummary struct {
+	Kind  string `json:"kind,omitempty"`
+	Title string `json:"title"`
+}
+
+type blueprintBotSummary struct {
+	Slug    string `json:"slug"`
+	Name    string `json:"name"`
+	Role    string `json:"role,omitempty"`
+	Emoji   string `json:"emoji,omitempty"`
+	Checked bool   `json:"checked"`
+	// BuiltIn marks the blueprint's lead bot (type: lead or built_in:
+	// true in the yaml). The wizard uses this to prevent the user from
+	// unchecking the lead in the Team step — downstream broker guards
+	// also refuse to disable or remove a BuiltIn member.
+	BuiltIn bool `json:"built_in,omitempty"`
+}
+
+type blueprintTaskSummary struct {
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	Description string `json:"description,omitempty"`
+	Prompt      string `json:"prompt,omitempty"`
+}
+
+// HandleBlueprints handles GET /onboarding/blueprints.
+// Returns {"templates": [...]} in the shape the Wizard expects for its
+// blueprint picker. Passes "" to ListBlueprints when the filesystem walk
+// finds no repo — the loader falls back to the binary's embedded
+// templates (wired in the root hivex package's init), so installs without
+// a checkout still see the shipped blueprints.
+func HandleBlueprints(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	summaries := []blueprintSummary{}
+	blueprints, err := operations.ListBlueprints(resolveTemplatesRepoRoot(""))
+	if err == nil {
+		for _, bp := range blueprints {
+			summaries = append(summaries, summarizeBlueprint(bp))
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{"templates": summaries})
+}
+
+func summarizeBlueprint(bp operations.Blueprint) blueprintSummary {
+	s := blueprintSummary{
+		ID:                    bp.ID,
+		Name:                  bp.Name,
+		Description:           bp.Description,
+		Outcome:               bp.Outcome,
+		Category:              bp.Category,
+		EstimatedSetupMinutes: bp.EstimatedSetupMinutes,
+	}
+	leadSlug := strings.TrimSpace(bp.Starter.LeadSlug)
+	for _, a := range bp.Starter.Bots {
+		// Mark the lead as BuiltIn so the wizard's Team step can disable
+		// its checkbox. We trust three signals from the blueprint yaml:
+		// explicit built_in, type=lead, or slug matching starter.lead_slug.
+		builtIn := a.BuiltIn || strings.EqualFold(strings.TrimSpace(a.Type), "lead") || (leadSlug != "" && a.Slug == leadSlug)
+		s.Bots = append(s.Bots, blueprintBotSummary{
+			Slug:    a.Slug,
+			Name:    a.Name,
+			Role:    a.Role,
+			Emoji:   a.Emoji,
+			Checked: a.Checked,
+			BuiltIn: builtIn,
+		})
+	}
+	for _, c := range bp.Starter.Channels {
+		slug := strings.TrimSpace(c.Slug)
+		if slug == "" || strings.Contains(slug, "{{") {
+			continue
+		}
+		s.Channels = append(s.Channels, blueprintChannelSummary{
+			Slug:    slug,
+			Name:    strings.TrimSpace(c.Name),
+			Purpose: strings.TrimSpace(c.Description),
+		})
+	}
+	for _, t := range bp.Starter.Tasks {
+		title := strings.TrimSpace(t.Title)
+		if title == "" {
+			continue
+		}
+		s.Tasks = append(s.Tasks, blueprintTaskSummary{
+			ID:          onboardingTemplateID(title),
+			Name:        title,
+			Description: strings.TrimSpace(t.Details),
+		})
+	}
+	for _, ft := range bp.FirstTasks {
+		id := strings.TrimSpace(ft.ID)
+		title := strings.TrimSpace(ft.Title)
+		if id == "" || title == "" {
+			continue
+		}
+		s.FirstTasks = append(s.FirstTasks, blueprintFirstTaskSummary{
+			ID:             id,
+			Title:          title,
+			Prompt:         strings.TrimSpace(ft.Prompt),
+			ExpectedOutput: strings.TrimSpace(ft.ExpectedOutput),
+		})
+	}
+	for _, sk := range bp.Skills {
+		name := strings.TrimSpace(sk.Name)
+		if name == "" {
+			continue
+		}
+		s.Skills = append(s.Skills, blueprintSkillSummary{
+			Name:    name,
+			Purpose: strings.TrimSpace(sk.Purpose),
+		})
+	}
+	for _, req := range bp.Requirements {
+		name := strings.TrimSpace(req.Name)
+		if name == "" {
+			continue
+		}
+		s.Requirements = append(s.Requirements, blueprintRequirementEntry{
+			Kind:     strings.TrimSpace(req.Kind),
+			Name:     name,
+			Required: req.Required,
+			Detail:   strings.TrimSpace(req.Detail),
+		})
+	}
+	if bp.WikiSchema != nil {
+		for _, item := range bp.WikiSchema.Bootstrap {
+			path := strings.TrimSpace(item.Path)
+			if path == "" {
+				continue
+			}
+			s.WikiScaffold = append(s.WikiScaffold, blueprintWikiScaffoldEntry{
+				Path:  path,
+				Title: strings.TrimSpace(item.Title),
+			})
+		}
+	}
+	for _, ex := range bp.ExampleArtifacts {
+		title := strings.TrimSpace(ex.Title)
+		if title == "" {
+			continue
+		}
+		s.ExampleArtifacts = append(s.ExampleArtifacts, blueprintExampleSummary{
+			Kind:  strings.TrimSpace(ex.Kind),
+			Title: title,
+		})
+	}
+	return s
+}
+
+// OSScanRequest is the request body for POST /onboarding/scan.
+type OSScanRequest struct {
+	WebsiteURL string   `json:"website_url"`
+	FilePaths  []string `json:"file_paths"`
+	OwnerName  string   `json:"owner_name"`
+	OwnerRole  string   `json:"owner_role"`
+}
+
+// OSScanResponse is the response body for POST /onboarding/scan.
+type OSScanResponse struct {
+	Facts           []string `json:"facts"`
+	ArticlesWritten []string `json:"articles_written"`
+	Warnings        []string `json:"warnings,omitempty"`
+}
+
+// makeHandleScan returns a handler for POST /onboarding/scan that runs the
+// company context seeding pipeline and writes wiki articles.
+func makeHandleScan(wikiRoot string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req OSScanRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "invalid json", http.StatusBadRequest)
+			return
+		}
+		// Security: file path prefix guard — only files staged under the
+		// hivex-upload temp prefix are permitted. EvalSymlinks resolves any
+		// symlinks so a link inside the upload dir cannot escape to an
+		// arbitrary path. Resolve os.TempDir() itself so the prefix matches
+		// on platforms (e.g. macOS) where /tmp is a symlink to /private/tmp.
+		resolvedTmpDir, tmpErr := filepath.EvalSymlinks(os.TempDir())
+		if tmpErr != nil {
+			resolvedTmpDir = os.TempDir()
+		}
+		uploadPrefix := filepath.Join(resolvedTmpDir, "hivex-upload-")
+		for _, p := range req.FilePaths {
+			resolved, symlinkErr := filepath.EvalSymlinks(p)
+			if symlinkErr != nil {
+				http.Error(w, "invalid file path", http.StatusBadRequest)
+				return
+			}
+			if !strings.HasPrefix(resolved, uploadPrefix) {
+				http.Error(w, "invalid file path", http.StatusBadRequest)
+				return
+			}
+		}
+		// Clean up uploaded temp dirs after the scan regardless of outcome.
+		defer func() {
+			seen := make(map[string]struct{})
+			for _, p := range req.FilePaths {
+				dir := filepath.Dir(p)
+				if _, ok := seen[dir]; !ok {
+					seen[dir] = struct{}{}
+					_ = os.RemoveAll(dir)
+				}
+			}
+		}()
+		ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+		defer cancel()
+		input := operations.CompanySeedInput{
+			WebsiteURL: req.WebsiteURL,
+			FilePaths:  req.FilePaths,
+			OwnerName:  req.OwnerName,
+			OwnerRole:  req.OwnerRole,
+			Completer:  cliCompleter{},
+			WikiRoot:   wikiRoot,
+		}
+		result, err := operations.SeedCompanyContext(ctx, input)
+		if err != nil {
+			if ctx.Err() != nil {
+				log.Printf("onboarding: scan timeout for %q", req.WebsiteURL)
+				http.Error(w, "scan timeout", http.StatusRequestTimeout)
+				return
+			}
+			log.Printf("onboarding: scan failed: %v", err)
+			http.Error(w, "scan failed", http.StatusInternalServerError)
+			return
+		}
+		resp := OSScanResponse{
+			Facts:           result.Facts,
+			ArticlesWritten: result.ArticlesWritten,
+			Warnings:        result.Warnings,
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	}
+}
+
+// handleUploadContext handles POST /onboarding/upload-context.
+// Accepts a multipart form with a "files" field and saves each uploaded file
+// to a temp directory so /onboarding/scan can reference it by path.
+func handleUploadContext(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 32<<20)
+	if err := r.ParseMultipartForm(32 << 20); err != nil {
+		http.Error(w, "parse form failed", http.StatusBadRequest)
+		return
+	}
+	defer func() {
+		if r.MultipartForm != nil {
+			_ = r.MultipartForm.RemoveAll()
+		}
+	}()
+	files := r.MultipartForm.File["files"]
+	if len(files) == 0 {
+		http.Error(w, "no files uploaded", http.StatusBadRequest)
+		return
+	}
+	const maxFileCount = 20
+	if len(files) > maxFileCount {
+		http.Error(w, "too many files", http.StatusBadRequest)
+		return
+	}
+	var paths []string
+	for _, fh := range files {
+		f, err := fh.Open()
+		if err != nil {
+			continue
+		}
+		// Create temp dir with hivex-upload- prefix so the scan handler's
+		// path prefix guard accepts it.
+		dir, err := os.MkdirTemp("", "hivex-upload-")
+		if err != nil {
+			f.Close()
+			continue
+		}
+		dst := filepath.Join(dir, filepath.Base(fh.Filename))
+		out, err := os.Create(dst)
+		if err != nil {
+			f.Close()
+			_ = os.RemoveAll(dir)
+			continue
+		}
+		if _, err := io.Copy(out, f); err != nil {
+			_ = out.Close()
+			f.Close()
+			_ = os.RemoveAll(dir)
+			continue
+		}
+		_ = out.Close()
+		f.Close()
+		paths = append(paths, dst)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string][]string{"paths": paths})
+}
+
+// legalPhaseTransitions defines the valid next-phase set for each current phase
+// in the deterministic CEO conversation state machine (Phase 2 scope).
+// LLM phases (draft/approve/kickoff) are included for forward-compat but are
+// not wired in Phase 2.
+var legalPhaseTransitions = map[string]map[string]bool{
+	"": {
+		PhaseGreet: true,
+	},
+	PhaseGreet: {
+		PhaseIdentity: true,
+	},
+	PhaseIdentity: {
+		PhaseWebsite: true,
+	},
+	PhaseWebsite: {
+		PhaseScan:      true,
+		PhaseBlueprint: true, // skip scan if no website
+	},
+	PhaseScan: {
+		PhaseBlueprint: true,
+		// Recovery path after a scan failure: re-enter PhaseWebsite so the
+		// user can supply a different URL. (#934)
+		PhaseWebsite: true,
+	},
+	PhaseBlueprint: {
+		PhaseTeam: true,
+		PhaseSeed: true, // scratch path skips team
+	},
+	PhaseTeam: {
+		PhaseSeed: true,
+	},
+	PhaseSeed: {
+		PhaseBridge: true,
+	},
+	PhaseBridge: {
+		PhaseComplete: true, // "look around first"
+	},
+	PhaseDraft: {
+		PhaseApprove: true,
+	},
+	PhaseApprove: {
+		PhaseKickoff: true,
+	},
+	PhaseKickoff: {
+		PhaseComplete: true,
+	},
+}
+
+// IsLegalTransition reports whether the transition from currentPhase to
+// nextPhase is allowed by the state machine. Exported so broker_onboarding_phase2.go
+// can validate transitions before accepting them, and for use in tests.
+func IsLegalTransition(currentPhase, nextPhase string) bool {
+	allowed, ok := legalPhaseTransitions[currentPhase]
+	if !ok {
+		return false
+	}
+	return allowed[nextPhase]
+}
+
+// makeHandleTransition returns the POST /onboarding/transition handler.
+func makeHandleTransition(transitionFn TransitionFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		handleTransition(w, r, transitionFn)
+	}
+}
+
+// handleTransition handles POST /onboarding/transition.
+// Body: {"phase": string}
+// Validates the requested phase transition, persists the new phase cursor,
+// and invokes the TransitionFunc (when non-nil) so the broker can emit the
+// next CEO suggestion card.
+//
+// Returns 400 for invalid transitions, 500 on persistence errors.
+func handleTransition(w http.ResponseWriter, r *http.Request, transitionFn TransitionFunc) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var body struct {
+		Phase string `json:"phase"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "invalid json", http.StatusBadRequest)
+		return
+	}
+	next := strings.TrimSpace(body.Phase)
+	if next == "" {
+		http.Error(w, "phase required", http.StatusBadRequest)
+		return
+	}
+
+	s, err := Load()
+	if err != nil {
+		http.Error(w, "failed to load state", http.StatusInternalServerError)
+		return
+	}
+
+	// Validate the requested transition.
+	allowed, ok := legalPhaseTransitions[s.Phase]
+	if !ok || !allowed[next] {
+		http.Error(w, fmt.Sprintf("invalid transition from %q to %q", s.Phase, next), http.StatusBadRequest)
+		return
+	}
+
+	s.Phase = next
+
+	// Setting CompletedAt at the bridge→complete transition path satisfies the
+	// spec rule: "CompletedAt is set at end of bridge phase regardless of
+	// first issue."
+	if next == PhaseComplete && s.CompletedAt == "" {
+		s.CompletedAt = time.Now().UTC().Format(time.RFC3339)
+		s.Version = currentStateVersion
+	}
+
+	if err := Save(s); err != nil {
+		http.Error(w, "failed to save state", http.StatusInternalServerError)
+		return
+	}
+
+	// Notify broker so it can emit the next CEO message on the DM.
+	if transitionFn != nil {
+		if err := transitionFn(next, s); err != nil {
+			// Log server-side; the state is already persisted so this is
+			// best-effort. A transient broker error should not fail the
+			// transition from the client's perspective.
+			log.Printf("onboarding: transition broker callback failed (phase=%s): %v", next, err)
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"ok":    true,
+		"phase": next,
+	})
+}
+
+// HandleAnswer handles POST /onboarding/answer.
+// Body: {"field": string, "value": any}
+// Commits a single FormAnswers field. String values are sanitized via
+// onboardingSanitizeString. Persists state on each call (~10-12 writes
+// per full onboarding per spec).
+func HandleAnswer(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var body struct {
+		Field string      `json:"field"`
+		Value interface{} `json:"value"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "invalid json", http.StatusBadRequest)
+		return
+	}
+	field := strings.TrimSpace(body.Field)
+	if field == "" {
+		http.Error(w, "field required", http.StatusBadRequest)
+		return
+	}
+
+	s, err := Load()
+	if err != nil {
+		http.Error(w, "failed to load state", http.StatusInternalServerError)
+		return
+	}
+
+	if err := applyFormAnswer(s, field, body.Value); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	if err := Save(s); err != nil {
+		http.Error(w, "failed to save state", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+}
+
+// applyFormAnswer writes a single field value into s.FormAnswers.
+// String values are sanitized. Unknown fields return an error.
+func applyFormAnswer(s *State, field string, value interface{}) error {
+	sanitizeStr := func(v interface{}) string {
+		str, _ := v.(string)
+		return onboardingSanitizeString(strings.TrimSpace(str))
+	}
+	switch field {
+	case "company_name":
+		s.FormAnswers.CompanyName = sanitizeStr(value)
+		// Mirror to top-level CompanyName for back-compat with v1 callers.
+		s.CompanyName = s.FormAnswers.CompanyName
+	case "description":
+		s.FormAnswers.Description = sanitizeStr(value)
+	case "priority":
+		s.FormAnswers.Priority = sanitizeStr(value)
+	case "website_url":
+		s.FormAnswers.WebsiteURL = sanitizeStr(value)
+	case "owner_name":
+		s.FormAnswers.OwnerName = sanitizeStr(value)
+	case "owner_role":
+		s.FormAnswers.OwnerRole = sanitizeStr(value)
+	case "owner_email":
+		// Founder email captured on the welcome step. PII, stored locally; the
+		// remote keep-in-touch send is gated separately on the web side. Reject
+		// non-string payloads (as picked_agents / scan_complete do) so a
+		// malformed request cannot silently clear a previously stored address.
+		raw, ok := value.(string)
+		if !ok {
+			return fmt.Errorf("owner_email must be a string")
+		}
+		s.FormAnswers.OwnerEmail = sanitizeStr(raw)
+	case "blueprint_id":
+		s.FormAnswers.BlueprintID = normalizeBlueprintAnswer(sanitizeStr(value))
+	case "picked_agents":
+		raw, ok := value.([]interface{})
+		if !ok {
+			return fmt.Errorf("picked_agents must be an array")
+		}
+		bots := make([]string, 0, len(raw))
+		for _, v := range raw {
+			if slug := strings.TrimSpace(fmt.Sprintf("%v", v)); slug != "" {
+				bots = append(bots, onboardingSanitizeString(slug))
+			}
+		}
+		s.FormAnswers.PickedBots = bots
+	case "scan_complete":
+		b, ok := value.(bool)
+		if !ok {
+			return fmt.Errorf("scan_complete must be a boolean")
+		}
+		s.FormAnswers.ScanComplete = b
+	case "task_prompt":
+		prompt := sanitizeStr(value)
+		if prompt == "" {
+			return fmt.Errorf("task_prompt required")
+		}
+		s.FormAnswers.TaskPrompt = prompt
+	default:
+		return fmt.Errorf("unknown field %q", field)
+	}
+	return nil
+}
+
+func normalizeBlueprintAnswer(value string) string {
+	switch strings.TrimSpace(value) {
+	case blankSlateStarterTemplateID, "from-scratch", "blank-slate":
+		return ""
+	default:
+		return strings.TrimSpace(value)
+	}
+}
+
+// onboardingSanitizeString collapses structural delimiters that could be used
+// for confused-deputy injection in CEO suggestion payloads. Mirrors the logic
+// of sanitizeContextValue in internal/teammcp/actions.go (kept in sync;
+// neither is imported by the other to avoid a circular dep — teammcp imports
+// team which imports onboarding).
+func onboardingSanitizeString(s string) string {
+	if s == "" {
+		return s
+	}
+	r := strings.NewReplacer(
+		"\r\n", " ",
+		"\n", " ",
+		"\r", " ",
+		" ", " ", // U+2028 LINE SEPARATOR
+		" ", " ", // U+2029 PARAGRAPH SEPARATOR
+		"•", "·", // U+2022 BULLET → U+00B7 MIDDLE DOT
+	)
+	cleaned := r.Replace(s)
+	return strings.Join(strings.Fields(cleaned), " ")
+}
+
+// HandleSuggestionAck handles POST /onboarding/suggestion/ack.
+// Body: {"suggestion_id": string}
+// Clears PendingSuggestion if the ID matches the current pending suggestion.
+// Idempotent: acking an already-cleared or mismatched ID is a no-op (200).
+func HandleSuggestionAck(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var body struct {
+		SuggestionID string `json:"suggestion_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "invalid json", http.StatusBadRequest)
+		return
+	}
+	id := strings.TrimSpace(body.SuggestionID)
+	if id == "" {
+		http.Error(w, "suggestion_id required", http.StatusBadRequest)
+		return
+	}
+
+	s, err := Load()
+	if err != nil {
+		http.Error(w, "failed to load state", http.StatusInternalServerError)
+		return
+	}
+
+	if s.PendingSuggestion != nil && s.PendingSuggestion.ID == id {
+		s.PendingSuggestion = nil
+		if err := Save(s); err != nil {
+			http.Error(w, "failed to save state", http.StatusInternalServerError)
+			return
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+}
+
+// HandleChecklistDismiss handles POST /onboarding/checklist/dismiss.
+// Sets ChecklistDismissed=true so the UI stops showing the checklist.
+func HandleChecklistDismiss(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if err := DismissChecklist(); err != nil {
+		http.Error(w, "failed to dismiss checklist", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+}

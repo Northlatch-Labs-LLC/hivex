@@ -1,0 +1,188 @@
+package workspaces
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net/http"
+	"os"
+	"path/filepath"
+	"time"
+
+	"github.com/Northlatch-Labs-LLC/hivex/internal/brokeraddr"
+	"github.com/Northlatch-Labs-LLC/hivex/internal/config"
+)
+
+const (
+	migrationLockName = ".hivex-migration.lock"
+	// legacyBrokerPort is the historical default the pre-symmetric layout ran
+	// on. The migration still probes it (in addition to the launching binary's
+	// configured port) because the legacy ~/.hivex tree this migration mutates
+	// has historically been owned by a broker on 7890; renaming the tree out
+	// from under that broker would corrupt its state.
+	legacyBrokerPort = brokeraddr.DefaultPort
+	migrationProbeTO = 2 * time.Second
+)
+
+// brokerRunningFn is a var so tests can inject a controlled probe result
+// without spinning up a real HTTP server on the legacy port 7890.
+var brokerRunningFn = isBrokerRunning
+
+// MigrateToSymmetric migrates the legacy single-workspace layout
+// (~/.hivex/) to the symmetric multi-workspace layout
+// (~/.hivex-spaces/main/.hivex/) on first workspace-aware launch.
+//
+// Steps:
+//  1. Acquire migration lock at <home>/.hivex-migration.lock.
+//  2. If registry.json already exists, no-op (idempotent).
+//  3. Probe broker port 7890; abort if a broker is running.
+//  4. Atomic rename ~/.hivex → ~/.hivex-spaces/main/.hivex.
+//  5. Create compatibility symlink ~/.hivex → ~/.hivex-spaces/main/.hivex.
+//  6. Initialize registry.json with the single "main" entry.
+//  7. Release lock.
+//
+// Recovery from a partial rename (power loss / SIGKILL mid-step) is handled
+// by hivex workspace doctor, not re-entrant migration.
+func MigrateToSymmetric() error {
+	// user-global; intentionally NOT under HIVEX_RUNTIME_HOME — the migration
+	// operates on the legacy ~/.hivex at the user's REAL home, and the lock
+	// lives next to it. Using RuntimeHomeDir would point at a per-workspace
+	// path that has no legacy tree to migrate.
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		// Fall back to RuntimeHomeDir for tests that explicitly clear HOME.
+		home = config.RuntimeHomeDir()
+	}
+	if home == "" {
+		return errors.New("workspaces: migrate: cannot resolve home directory")
+	}
+
+	// Ensure home exists so lock open doesn't fail on fresh / test setups.
+	if err := os.MkdirAll(home, 0o700); err != nil {
+		return fmt.Errorf("workspaces: migrate: mkdir %s: %w", home, err)
+	}
+
+	lockPath := filepath.Join(home, migrationLockName)
+	lf, err := openMigrationLock(lockPath)
+	if err != nil {
+		return fmt.Errorf("workspaces: migrate: acquire lock: %w", err)
+	}
+	defer releaseMigrationLock(lf)
+
+	// Idempotency: if registry already exists, nothing to do.
+	rp, err := registryPath()
+	if err != nil {
+		return err
+	}
+	if _, err := os.Stat(rp); err == nil {
+		_ = EnsureCacheBackupExclusions()
+		return nil // already migrated
+	}
+
+	// Guard: refuse to migrate if a broker is actually running on either the
+	// launching binary's configured port or the legacy default 7890. The
+	// migration rewrites ~/.hivex, so any live broker pointing at that tree
+	// must be stopped first. Probe order matters only for the error message —
+	// we report whichever port we actually found.
+	configuredPort := brokeraddr.ResolvePort()
+	probePorts := []int{configuredPort}
+	if configuredPort != legacyBrokerPort {
+		probePorts = append(probePorts, legacyBrokerPort)
+	}
+	for _, port := range probePorts {
+		if brokerRunningFn(port) {
+			return fmt.Errorf("workspaces: migrate: broker is running on port %d; "+
+				"stop hivebot before upgrading, then re-run this command", port)
+		}
+	}
+
+	oldPath := filepath.Join(home, ".hivex")
+	spacesD, err := spacesDir()
+	if err != nil {
+		return err
+	}
+	mainRuntimeHome := filepath.Join(spacesD, "main")
+	newPath := filepath.Join(mainRuntimeHome, ".hivex")
+
+	// Only rename if the old directory exists and is NOT already a symlink.
+	if info, err := os.Lstat(oldPath); err == nil && info.Mode()&os.ModeSymlink == 0 {
+		if err := os.MkdirAll(mainRuntimeHome, 0o700); err != nil {
+			return fmt.Errorf("workspaces: migrate: mkdir %s: %w", mainRuntimeHome, err)
+		}
+		if err := os.Rename(oldPath, newPath); err != nil {
+			return fmt.Errorf("workspaces: migrate: rename %s → %s: %w", oldPath, newPath, err)
+		}
+	} else if errors.Is(err, os.ErrNotExist) {
+		// Fresh install — just create the dir.
+		if err := os.MkdirAll(newPath, 0o700); err != nil {
+			return fmt.Errorf("workspaces: migrate: mkdir %s: %w", newPath, err)
+		}
+	}
+
+	// Compatibility symlink: ~/.hivex → ~/.hivex-spaces/main/.hivex
+	if _, err := os.Lstat(oldPath); err == nil {
+		_ = os.Remove(oldPath)
+	}
+	if err := os.Symlink(newPath, oldPath); err != nil && !errors.Is(err, os.ErrExist) {
+		return fmt.Errorf("workspaces: migrate: symlink %s → %s: %w", oldPath, newPath, err)
+	}
+
+	// Initialize registry.
+	now := time.Now().UTC()
+	reg := &Registry{
+		Version:    Version,
+		CLICurrent: "main",
+		Workspaces: []*Workspace{
+			{
+				Name:        "main",
+				RuntimeHome: mainRuntimeHome,
+				BrokerPort:  MainBrokerPort,
+				WebPort:     MainWebPort,
+				State:       StateNeverStarted,
+				CreatedAt:   now,
+				LastUsedAt:  now,
+			},
+		},
+	}
+	if err := writeUnderLock(reg); err != nil {
+		return err
+	}
+	_ = EnsureCacheBackupExclusions()
+	return nil
+}
+
+// isBrokerRunning probes port via HTTP HEAD with a short timeout.
+func isBrokerRunning(port int) bool {
+	client := &http.Client{Timeout: migrationProbeTO}
+	url := fmt.Sprintf("http://127.0.0.1:%d/", port)
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodHead, url, nil)
+	if err != nil {
+		return false
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return false
+	}
+	resp.Body.Close()
+	return true
+}
+
+func openMigrationLock(path string) (*os.File, error) {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	if err := lockFileExclusiveNonBlocking(f); err != nil {
+		_ = f.Close()
+		return nil, fmt.Errorf("another migration is in progress (lock %s): %w", path, err)
+	}
+	return f, nil
+}
+
+func releaseMigrationLock(f *os.File) {
+	if f == nil {
+		return
+	}
+	_ = unlockFile(f)
+	_ = f.Close()
+}

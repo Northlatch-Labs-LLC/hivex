@@ -1,0 +1,29 @@
+{
+  "completed_at": "2026-09-18T22:08:43Z",
+  "version": 2,
+  "checklist_dismissed": false,
+  "checklist": [
+    {
+      "id": "pick_team",
+      "done": false
+    },
+    {
+      "id": "second_key",
+      "done": false
+    },
+    {
+      "id": "github_repo",
+      "done": false
+    },
+    {
+      "id": "github_star",
+      "done": false
+    },
+    {
+      "id": "discord",
+      "done": false
+    }
+  ],
+  "phase": "complete",
+  "form_answers": {}
+}

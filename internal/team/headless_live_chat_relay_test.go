@@ -1,0 +1,541 @@
+package team
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"os"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/Northlatch-Labs-LLC/hivex/internal/bot"
+)
+
+// TestHeadlessRunnersWireLiveChatRelay guards against the regression where
+// headlessLiveChatRelay exists but no production runner actually constructs
+// one. Symptom: bots stay silent during a turn — only the end-of-turn
+// final message lands in the channel, so the room sees a multi-minute gap
+// followed by a single summary post. The relay infrastructure was added
+// but its wire-up to the four runners regressed once before; this test
+// keeps the connection visible at build time.
+func TestHeadlessRunnersWireLiveChatRelay(t *testing.T) {
+	runners := []string{
+		"headless_claude.go",
+		"headless_codex_runner.go",
+		"headless_opencode.go",
+		"headless_openai_compat.go",
+	}
+	for _, file := range runners {
+		data, err := os.ReadFile(file)
+		if err != nil {
+			t.Fatalf("read %s: %v", file, err)
+		}
+		if !strings.Contains(string(data), "newHeadlessLiveChatRelay") {
+			t.Errorf("%s: missing newHeadlessLiveChatRelay wiring — without it the bot goes silent during a turn and only the final summary lands in-channel", file)
+		}
+	}
+}
+
+func TestHeadlessLiveChatRelayPostsStreamedTextToChannel(t *testing.T) {
+	b := newTestBroker(t)
+	root, err := b.PostMessage("you", "team", "What is happening?", nil, "")
+	if err != nil {
+		t.Fatalf("post human message: %v", err)
+	}
+	l := &Launcher{broker: b}
+	startedAt := time.Now().UTC().Add(-1 * time.Second)
+	var logs []string
+	relay := newHeadlessLiveChatRelay(
+		l,
+		"cos",
+		"team",
+		fmt.Sprintf(`Reply using team_broadcast with reply_to_id "%s".`, root.ID),
+		func(line string) { logs = append(logs, line) },
+	)
+
+	relay.OnText("I will check the live stream now.")
+
+	msgs := b.ChannelMessages("team")
+	if len(msgs) != 2 {
+		t.Fatalf("expected human root + streamed bot message, got %d: %+v", len(msgs), msgs)
+	}
+	got := msgs[1]
+	if got.From != "cos" || got.Content != "I will check the live stream now." || got.ReplyTo != root.ID {
+		t.Fatalf("unexpected streamed message: %+v", got)
+	}
+	if len(logs) != 1 {
+		t.Fatalf("expected relay log entry, got %+v", logs)
+	}
+
+	_, posted, err := l.postHeadlessFinalMessageIfSilent("cos", "team", "", "late summary", startedAt)
+	if err != nil {
+		t.Fatalf("fallback post: %v", err)
+	}
+	if posted {
+		t.Fatal("expected final fallback to skip after streamed text was posted")
+	}
+}
+
+func TestOpenAICompatLiveChatRelayDoesNotPostJSONToolShape(t *testing.T) {
+	b := newTestBroker(t)
+	if _, err := b.PostMessage("you", "team", "Please do the task.", nil, ""); err != nil {
+		t.Fatalf("post human message: %v", err)
+	}
+	l := &Launcher{broker: b}
+	relay := newHeadlessLiveChatRelay(l, "cos", "team", "", nil)
+	sinks := &fakeTurnSinks{}
+	st := newOpenAICompatTurnState(sinks, relay)
+
+	st.onText(`{"name":`)
+	st.onText(`"team_broadcast","arguments":`)
+	st.onText(`{"channel":"team","content":"hello"}}`)
+	st.onToolUseChunk("team_broadcast", `{"channel":"team"}`)
+
+	msgs := b.ChannelMessages("team")
+	if len(msgs) != 1 {
+		t.Fatalf("expected only the human root; JSON tool stream leaked to chat: %+v", msgs)
+	}
+}
+
+func TestHeadlessLiveChatRelayReportsIssueImmediately(t *testing.T) {
+	b := newTestBroker(t)
+	root, err := b.PostMessage("you", "team", "Open the browser.", nil, "")
+	if err != nil {
+		t.Fatalf("post human message: %v", err)
+	}
+	l := &Launcher{broker: b}
+	relay := newHeadlessLiveChatRelay(
+		l,
+		"cos",
+		"team",
+		fmt.Sprintf(`Reply using team_broadcast with reply_to_id "%s".`, root.ID),
+		nil,
+	)
+
+	relay.ReportIssue("browser access is not available")
+
+	msgs := b.ChannelMessages("team")
+	if len(msgs) != 3 {
+		t.Fatalf("expected issue to post immediately, got %+v", msgs)
+	}
+	got := msgs[1]
+	if got.From != "cos" || got.Kind != botIssueMessageKind || got.ReplyTo != root.ID || got.Content != "Incident: browser access is not available" {
+		t.Fatalf("unexpected issue message: %+v", got)
+	}
+	if approval := msgs[2]; approval.From != "system" || approval.Kind != "approval" || approval.EventID == "" || approval.Content == "" {
+		t.Fatalf("expected inline approval recommendation, got %+v", approval)
+	}
+	if tasks := b.AllTasks(); len(tasks) != 0 {
+		t.Fatalf("expected issue report to ask before creating self-heal task, got %+v", tasks)
+	}
+	requests := b.Requests("team", false)
+	if len(requests) != 1 || requests[0].RecommendedID != "approve" {
+		t.Fatalf("expected recommended approval request, got %+v", requests)
+	}
+}
+
+func TestHeadlessLiveChatRelayFlushesBufferedTextBeforeIssue(t *testing.T) {
+	b := newTestBroker(t)
+	l := &Launcher{broker: b}
+	relay := newHeadlessLiveChatRelay(l, "cos", "team", "", nil)
+
+	relay.OnText("I found context and will continue")
+	relay.ReportIssue("browser access is not available")
+
+	msgs := b.ChannelMessages("team")
+	if len(msgs) != 3 {
+		t.Fatalf("expected prose, issue, and approval messages, got %+v", msgs)
+	}
+	if got := msgs[0].Content; got != "I found context and will continue" {
+		t.Fatalf("expected buffered prose to post first, got %q", got)
+	}
+	if msgs[1].Kind != botIssueMessageKind {
+		t.Fatalf("expected issue second, got %+v", msgs)
+	}
+}
+
+func TestHeadlessLiveChatRelayPreservesWhitespaceChunks(t *testing.T) {
+	b := newTestBroker(t)
+	l := &Launcher{broker: b}
+	relay := newHeadlessLiveChatRelay(l, "cos", "team", "", nil)
+
+	relay.OnText("Starting live")
+	relay.OnText(" ")
+	relay.OnText("now.")
+
+	msgs := b.ChannelMessages("team")
+	if len(msgs) != 1 {
+		t.Fatalf("expected one flushed prose message, got %+v", msgs)
+	}
+	if got := msgs[0].Content; got != "Starting live now." {
+		t.Fatalf("expected whitespace chunk to be preserved, got %q", got)
+	}
+}
+
+func TestOpenAICompatToolErrorReportsIssueToChat(t *testing.T) {
+	b := newTestBroker(t)
+	if _, err := b.PostMessage("you", "team", "Use the browser.", nil, ""); err != nil {
+		t.Fatalf("post human message: %v", err)
+	}
+	l := &Launcher{broker: b}
+	relay := newHeadlessLiveChatRelay(l, "cos", "team", "", nil)
+	sinks := &fakeTurnSinks{}
+	st := newOpenAICompatTurnState(sinks, relay)
+
+	st.onToolResult("browser_open", "ERROR: browser access is not available", nil)
+
+	msgs := b.ChannelMessages("team")
+	if len(msgs) != 3 {
+		t.Fatalf("expected tool error to post to chat, got %+v", msgs)
+	}
+	if got := msgs[1].Content; got != "Incident: ERROR: browser access is not available" {
+		t.Fatalf("unexpected issue content: %q", got)
+	}
+	if msgs[1].Kind != botIssueMessageKind {
+		t.Fatalf("expected agent_issue kind, got %+v", msgs[1])
+	}
+}
+
+func TestReportIncidentSuppressesStructuredPayloads(t *testing.T) {
+	b := newTestBroker(t)
+
+	_, _, posted, err := b.ReportIncident("cos", "team", "", `{"error":"browser access is not available"}`)
+	if err != nil {
+		t.Fatalf("report incident: %v", err)
+	}
+	if posted {
+		t.Fatal("expected structured JSON payload to be suppressed")
+	}
+	if len(b.ChannelMessages("team")) != 0 {
+		t.Fatalf("expected no chat messages, got %+v", b.ChannelMessages("team"))
+	}
+	if len(b.Incidents()) != 0 {
+		t.Fatalf("expected no incidents, got %+v", b.Incidents())
+	}
+}
+
+func TestReportIncidentDedupesRepeatedStreamIssue(t *testing.T) {
+	b := newTestBroker(t)
+	l := &Launcher{broker: b}
+	relay := newHeadlessLiveChatRelay(l, "cos", "team", "", nil)
+
+	relay.ReportIssue("browser access is not available")
+	relay.ReportIssue("ERROR: browser access is not available")
+
+	msgs := b.ChannelMessages("team")
+	if len(msgs) != 2 {
+		t.Fatalf("expected one incident message, got %+v", msgs)
+	}
+	incidents := b.Incidents()
+	if len(incidents) != 1 || incidents[0].Count != 2 {
+		t.Fatalf("expected one counted incident, got %+v", incidents)
+	}
+	requests := b.Requests("team", false)
+	if len(requests) != 1 {
+		t.Fatalf("expected one approval request, got %+v", requests)
+	}
+}
+
+func TestReportIncidentAttachesActiveTaskAndWaitsForApproval(t *testing.T) {
+	b := newTestBroker(t)
+	ensureTestMemberAccess(b, "team", "eng", "Engineer")
+	task, reused, err := b.EnsurePlannedTask(plannedTaskInput{
+		Channel:   "team",
+		Title:     "Use the browser",
+		Owner:     "eng",
+		CreatedBy: "cos",
+		TaskType:  "feature",
+	})
+	if err != nil || reused {
+		t.Fatalf("ensure task: %v reused=%v", err, reused)
+	}
+
+	if _, _, posted, err := b.ReportIncident("eng", "team", "", "browser access is not available"); err != nil || !posted {
+		t.Fatalf("report incident: posted=%v err=%v", posted, err)
+	}
+
+	incidents := b.Incidents()
+	if len(incidents) != 1 || incidents[0].TaskID != task.ID {
+		t.Fatalf("expected incident attached to active task %s, got %+v", task.ID, incidents)
+	}
+	var updated teamTask
+	for _, candidate := range b.AllTasks() {
+		if candidate.ID == task.ID {
+			updated = candidate
+			break
+		}
+	}
+	if updated.Blocked() || updated.Status() != "in_progress" {
+		t.Fatalf("expected active task not to be blocked before approval, got %+v", updated)
+	}
+	if len(b.AllTasks()) != 1 {
+		t.Fatalf("expected no self-heal task before approval, got %+v", b.AllTasks())
+	}
+}
+
+func TestApprovedIncidentCreatesSelfHealTask(t *testing.T) {
+	b := newTestBroker(t)
+	ensureTestMemberAccess(b, "team", "eng", "Engineer")
+	if err := b.StartOnPort(0); err != nil {
+		t.Fatalf("start broker: %v", err)
+	}
+	defer b.Stop()
+
+	if _, _, posted, err := b.ReportIncident("eng", "team", "", "browser access is not available"); err != nil || !posted {
+		t.Fatalf("report incident: posted=%v err=%v", posted, err)
+	}
+	requests := b.Requests("team", false)
+	if len(requests) != 1 {
+		t.Fatalf("expected approval request, got %+v", requests)
+	}
+	body, err := json.Marshal(map[string]any{
+		"id":        requests[0].ID,
+		"choice_id": "approve",
+	})
+	if err != nil {
+		t.Fatalf("marshal request answer: %v", err)
+	}
+	req, err := http.NewRequest(http.MethodPost, "http://"+b.Addr()+"/requests/answer", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("build request answer: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+b.Token())
+	req.Header.Set("Content-Type", "application/json")
+	client := http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("answer approval: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected approval answer 200, got %d", resp.StatusCode)
+	}
+
+	// The incident carries no parent TaskID, so the title falls through to the
+	// `"[@<slug>] <verb> — bot couldn't continue"` form. Match on
+	// recognition primitive + bot attribution rather than a hardcoded
+	// title so this stays robust to future copy edits.
+	wantTitle := selfHealingTaskTitle("eng", "", "", bot.EscalationCapabilityGap)
+	var found bool
+	for _, task := range b.AllTasks() {
+		if isSelfHealingTask(&task) && task.Title == wantTitle {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected approved self-heal task (title=%q), got %+v", wantTitle, b.AllTasks())
+	}
+	incidents := b.Incidents()
+	if len(incidents) != 1 || incidents[0].SelfHealTaskID == "" {
+		t.Fatalf("expected incident to record self-heal task, got %+v", incidents)
+	}
+}
+
+func TestAnsweredIncidentApprovalDoesNotCreateDuplicateRequest(t *testing.T) {
+	b := newTestBroker(t)
+	ensureTestMemberAccess(b, "team", "eng", "Engineer")
+
+	now := time.Now().UTC().Format(time.RFC3339)
+	b.mu.Lock()
+	b.requests = append(b.requests, humanInterview{
+		ID:        "request-issue-1",
+		Kind:      "approval",
+		Status:    "answered",
+		From:      "system",
+		Channel:   "team",
+		Title:     "Approve self-heal",
+		Question:  "Proceed?",
+		CreatedAt: now,
+		UpdatedAt: now,
+		Answered:  &interviewAnswer{ChoiceID: "approve", AnsweredAt: now},
+	})
+	b.incidents = append(b.incidents, incidentRecord{
+		ID:                "issue-1",
+		Bot:               "eng",
+		Channel:           "team",
+		Detail:            "browser access is not available",
+		NormalizedKey:     normalizedIncidentKey("eng", "team", "browser access is not available"),
+		ApprovalRequestID: "request-issue-1",
+		Count:             1,
+		CreatedAt:         now,
+		UpdatedAt:         now,
+	})
+	b.ensureSelfHealApprovalRequestLocked(&b.incidents[0], incidentClassification{
+		Visible:       true,
+		CapabilityGap: true,
+		Severity:      "warning",
+	}, "browser access is not available")
+	b.mu.Unlock()
+
+	requests := b.Requests("team", true)
+	if got := len(requests); got != 1 {
+		t.Fatalf("expected answered approval to be reused, got %d requests: %+v", got, requests)
+	}
+	incidents := b.Incidents()
+	if len(incidents) != 1 || incidents[0].SelfHealTaskID == "" {
+		t.Fatalf("expected answered approval to create one self-heal task, got incidents=%+v tasks=%+v", incidents, b.AllTasks())
+	}
+}
+
+func TestApprovedIncidentSelfHealFailureSurfacesToChat(t *testing.T) {
+	// SKIPPED once #general is retired, and the reason is worth reading.
+	//
+	// This test asserts that a FAILED self-heal creation surfaces to chat. It
+	// never injected a failure: requestSelfHealingLocked resolved the task's
+	// home to "general", the fixture did not have a #general, and creation
+	// failed as a side effect. The assertion was riding on a room the fixture
+	// happened not to seed.
+	//
+	// With the lobby retired the resolver returns the owner's DM (or "", which
+	// is legal), creation succeeds, and there is nothing to surface. The
+	// behaviour is correct; the test has no failure to observe.
+	//
+	// Making this meaningful needs a real injection point in
+	// requestSelfHealingLocked rather than a room that happens to be missing.
+	// Skipping rather than deleting: the property is worth testing, and
+	// rewriting it to assert success would quietly drop the coverage.
+	if !generalChannelEnabled() {
+		t.Skip("failure condition was an artifact of #general being absent; needs a real injection point")
+	}
+	b := newTestBroker(t)
+	ensureTestMemberAccess(b, "team", "eng", "Engineer")
+
+	now := time.Now().UTC().Format(time.RFC3339)
+	b.mu.Lock()
+	b.channels = nil
+	b.requests = append(b.requests, humanInterview{
+		ID:        "request-issue-1",
+		Kind:      "approval",
+		Status:    "answered",
+		From:      "system",
+		Channel:   "team",
+		Title:     "Approve self-heal",
+		Question:  "Proceed?",
+		CreatedAt: now,
+		UpdatedAt: now,
+		Answered:  &interviewAnswer{ChoiceID: "approve", AnsweredAt: now},
+	})
+	b.incidents = append(b.incidents, incidentRecord{
+		ID:                "issue-1",
+		Bot:               "eng",
+		Channel:           "team",
+		Detail:            "browser access is not available",
+		NormalizedKey:     normalizedIncidentKey("eng", "team", "browser access is not available"),
+		ApprovalRequestID: "request-issue-1",
+		Count:             1,
+		CreatedAt:         now,
+		UpdatedAt:         now,
+	})
+	b.maybeCreateApprovedSelfHealTaskLocked(b.requests[0])
+	b.maybeCreateApprovedSelfHealTaskLocked(b.requests[0])
+	b.mu.Unlock()
+
+	incidents := b.Incidents()
+	if len(incidents) != 1 || incidents[0].SelfHealError == "" {
+		t.Fatalf("expected self-heal creation error to be recorded, got %+v", incidents)
+	}
+	msgs := b.ChannelMessages("team")
+	if len(msgs) != 1 {
+		t.Fatalf("expected one surfaced failure message, got %+v", msgs)
+	}
+	if got := msgs[0]; got.From != "system" || got.Kind != botIssueMessageKind || !strings.Contains(got.Content, "could not be created") {
+		t.Fatalf("unexpected surfaced failure message: %+v", got)
+	}
+}
+
+// TestMaybeCreateApprovedSelfHealTask_OverflowMarksError guards that when an
+// approved self-heal request lands at the per-bot cap and merges into
+// another self-heal lane, the incident records the divergence in
+// SelfHealError. Without this marker, the incident would silently link to a
+// task whose original TaskID is unrelated, with no observable signal of the
+// overflow merge.
+func TestMaybeCreateApprovedSelfHealTask_OverflowMarksError(t *testing.T) {
+	b := newTestBroker(t)
+	l := &Launcher{broker: b}
+	ensureTestMemberAccess(b, "team", "eng", "Engineer")
+
+	// Pin @eng at the cap with self-heal tasks for taskIDs the incident does
+	// not match. The approved request below carries a fresh TaskID, so the
+	// exact-reuse path misses and we fall into overflow merge.
+	for i := 0; i < maxActiveSelfHealsPerBot; i++ {
+		l.postEscalation("eng", fmt.Sprintf("eng-pre-%d", i), bot.EscalationStuck, "earlier")
+	}
+	if got := countActiveSelfHealsForBot(b, "eng"); got != maxActiveSelfHealsPerBot {
+		t.Fatalf("setup: expected @eng pinned at cap (%d), got %d", maxActiveSelfHealsPerBot, got)
+	}
+
+	now := time.Now().UTC().Format(time.RFC3339)
+	b.mu.Lock()
+	b.requests = append(b.requests, humanInterview{
+		ID:        "request-overflow-1",
+		Kind:      "approval",
+		Status:    "answered",
+		From:      "system",
+		Channel:   "team",
+		Title:     "Approve self-heal",
+		Question:  "Proceed?",
+		CreatedAt: now,
+		UpdatedAt: now,
+		Answered:  &interviewAnswer{ChoiceID: "approve", AnsweredAt: now},
+	})
+	b.incidents = append(b.incidents, incidentRecord{
+		ID:                "issue-overflow-1",
+		Bot:               "eng",
+		Channel:           "team",
+		TaskID:            "eng-fresh-1",
+		Detail:            "browser access is not available",
+		NormalizedKey:     normalizedIncidentKey("eng", "team", "browser access is not available"),
+		ApprovalRequestID: "request-overflow-1",
+		Count:             1,
+		CreatedAt:         now,
+		UpdatedAt:         now,
+	})
+	b.maybeCreateApprovedSelfHealTaskLocked(b.requests[len(b.requests)-1])
+	b.mu.Unlock()
+
+	if got := countActiveSelfHealsForBot(b, "eng"); got != maxActiveSelfHealsPerBot {
+		t.Fatalf("active count must stay at cap after overflow merge, got %d", got)
+	}
+	incidents := b.Incidents()
+	if len(incidents) != 1 {
+		t.Fatalf("expected one incident, got %+v", incidents)
+	}
+	got := incidents[0]
+	if got.SelfHealTaskID == "" {
+		t.Fatalf("expected SelfHealTaskID to bind to the overflow lane, got empty")
+	}
+	if !strings.Contains(got.SelfHealError, "merged into bot self-heal overflow lane") {
+		t.Fatalf("expected SelfHealError to record overflow merge, got %q", got.SelfHealError)
+	}
+	// The bound task must NOT be the incident's own would-be title — it is the
+	// overflow target.
+	expectedTitle := selfHealingTaskTitle("eng", "eng-fresh-1", "", bot.EscalationCapabilityGap)
+	for _, task := range b.AllTasks() {
+		if task.ID == got.SelfHealTaskID && task.Title == expectedTitle {
+			t.Fatalf("overflow case must not bind to the incident's own self-heal title, got task=%+v", task)
+		}
+	}
+}
+
+func TestIncidentDoesNotCountAsSubstantiveProgress(t *testing.T) {
+	b := newTestBroker(t)
+	l := &Launcher{broker: b}
+	startedAt := time.Now().UTC().Add(-1 * time.Second)
+
+	if _, _, posted, err := b.ReportIncident("cos", "team", "", "browser access is not available"); err != nil || !posted {
+		t.Fatalf("report incident: posted=%v err=%v", posted, err)
+	}
+	if l.botPostedSubstantiveMessageSince("cos", startedAt) {
+		t.Fatal("agent_issue should not count as substantive progress")
+	}
+
+	if _, err := b.PostMessage("cos", "team", "I can continue with the code inspection.", nil, ""); err != nil {
+		t.Fatalf("post normal message: %v", err)
+	}
+	if !l.botPostedSubstantiveMessageSince("cos", startedAt) {
+		t.Fatal("normal streamed prose should count as substantive progress")
+	}
+}

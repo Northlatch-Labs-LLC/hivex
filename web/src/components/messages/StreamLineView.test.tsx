@@ -1,0 +1,411 @@
+import { cleanup, render, screen } from "@testing-library/react";
+import { afterEach, describe, expect, it } from "vitest";
+
+import { useAppStore } from "../../stores/app";
+import { StreamLineView } from "./StreamLineView";
+
+afterEach(() => {
+  useAppStore.setState({ computerStates: {} });
+});
+
+describe("<StreamLineView>", () => {
+  it("renders Claude assistant text and tool-use blocks", () => {
+    render(
+      <StreamLineView
+        line={{
+          id: 1,
+          data: "",
+          parsed: {
+            type: "assistant",
+            message: {
+              content: [
+                { type: "text", text: "I am posting the update now." },
+                {
+                  type: "tool_use",
+                  name: "team_broadcast",
+                  input: { channel: "general", content: "Done" },
+                },
+              ],
+            },
+          },
+        }}
+      />,
+    );
+
+    expect(
+      screen.getByText("I am posting the update now."),
+    ).toBeInTheDocument();
+    expect(screen.getByText("team_broadcast")).toBeInTheDocument();
+    expect(screen.getByText("Done")).toBeInTheDocument();
+  });
+
+  it("renders structured MCP tool audit events", () => {
+    render(
+      <StreamLineView
+        line={{
+          id: 1,
+          data: "",
+          parsed: {
+            type: "mcp_tool_event",
+            phase: "call",
+            tool: "team_broadcast",
+            arguments: { channel: "general", content: "Exact content" },
+          },
+        }}
+      />,
+    );
+
+    expect(screen.getByText("call: team_broadcast")).toBeInTheDocument();
+    expect(screen.getByText("Exact content")).toBeInTheDocument();
+  });
+
+  it("does not render an Error chip for tool events that omit the error field", () => {
+    // Regression: the broker emits mcp_tool_event with `error` either
+    // missing entirely (call phase) or set to "" (successful result).
+    // The previous `error !== null` check let undefined pass through
+    // and rendered an "× ERROR / undefined" chip on every successful
+    // tool call. The fix treats null AND undefined AND "" as "no
+    // error". This test would fail under the old code because
+    // `screen.getByText("✗")` (or any error glyph) would match.
+    const { container } = render(
+      <StreamLineView
+        line={{
+          id: 1,
+          data: "",
+          parsed: {
+            type: "mcp_tool_event",
+            phase: "result",
+            tool: "team_broadcast",
+            arguments: { channel: "general", content: "Done" },
+            result: "Posted to #general as @cos",
+            // error: undefined — key intentionally omitted to match
+            // what the broker actually sends for a successful call.
+          },
+        }}
+      />,
+    );
+    // No "Error" summary chip in the closed-card view.
+    expect(container.querySelector(".cc-tool-error")).toBeNull();
+    // Sanity: nothing leaks the literal string "undefined" as content.
+    expect(container.textContent).not.toMatch(/undefined/);
+  });
+
+  it("does render the Error chip when the tool event reports a real error", () => {
+    render(
+      <StreamLineView
+        line={{
+          id: 1,
+          data: "",
+          parsed: {
+            type: "mcp_tool_event",
+            phase: "error",
+            tool: "broker_post_message",
+            arguments: { channel: "general" },
+            error: "permission denied",
+          },
+        }}
+      />,
+    );
+    // Closed-card "× <truncated error>" summary visible.
+    expect(screen.getByText(/permission denied/)).toBeInTheDocument();
+  });
+
+  it("renders a HeadlessEvent idle envelope as an idle status card", () => {
+    // Pin the discriminator-first routing: when parsed.kind === "headless_event"
+    // the view must render the typed envelope and not fall through to the
+    // provider-native branches (assistant/mcp_tool_event/...).
+    render(
+      <StreamLineView
+        line={{
+          id: 1,
+          data: "",
+          parsed: {
+            kind: "headless_event",
+            type: "idle",
+            provider: "claude",
+            agent: "cos",
+            text: "reply ready · ttft 90ms",
+            status: "idle",
+            metrics: { total_ms: 1500, first_text_ms: 90 },
+          },
+        }}
+      />,
+    );
+    expect(screen.getByText("idle")).toBeInTheDocument();
+    expect(screen.getByText("claude")).toBeInTheDocument();
+    expect(screen.getByText(/reply ready/)).toBeInTheDocument();
+  });
+
+  it("renders a HeadlessEvent error envelope with the failure detail", () => {
+    render(
+      <StreamLineView
+        line={{
+          id: 1,
+          data: "",
+          parsed: {
+            kind: "headless_event",
+            type: "error",
+            provider: "codex",
+            agent: "eng",
+            text: "auth: 401 unauthorized",
+            detail: "auth: 401 unauthorized",
+            status: "error",
+          },
+        }}
+      />,
+    );
+    expect(screen.getByText("error")).toBeInTheDocument();
+    expect(screen.getByText("codex")).toBeInTheDocument();
+    expect(screen.getByText("auth: 401 unauthorized")).toBeInTheDocument();
+  });
+
+  it("renders a HeadlessEvent text envelope as a thinking block", () => {
+    render(
+      <StreamLineView
+        line={{
+          id: 1,
+          data: "",
+          parsed: {
+            kind: "headless_event",
+            type: "text",
+            provider: "claude",
+            agent: "cos",
+            text: "Shipping the update now",
+            status: "active",
+            turn_id: "abc123",
+          },
+        }}
+      />,
+    );
+    expect(screen.getByText("Shipping the update now")).toBeInTheDocument();
+  });
+
+  it("renders a HeadlessEvent tool_use envelope as a tool call card", () => {
+    render(
+      <StreamLineView
+        line={{
+          id: 1,
+          data: "",
+          parsed: {
+            kind: "headless_event",
+            type: "tool_use",
+            provider: "codex",
+            agent: "eng",
+            tool_name: "team_broadcast",
+            detail: '{"channel":"general","content":"Done"}',
+            status: "active",
+            turn_id: "xyz789",
+          },
+        }}
+      />,
+    );
+    expect(screen.getByText("team_broadcast")).toBeInTheDocument();
+  });
+
+  it("renders a HeadlessEvent manifest with tool badges and stats", () => {
+    render(
+      <StreamLineView
+        line={{
+          id: 1,
+          data: "",
+          parsed: {
+            kind: "headless_event",
+            type: "manifest",
+            provider: "claude",
+            agent: "cos",
+            turn_id: "abc123",
+            status: "idle",
+            text_len: 1420,
+            tool_calls: [
+              { tool_name: "Bash", count: 2 },
+              { tool_name: "Read", count: 3 },
+            ],
+            metrics: { total_ms: 2000, input_tokens: 500, output_tokens: 300 },
+          },
+        }}
+      />,
+    );
+    // Tool badges appear with count suffix when count > 1
+    expect(screen.getByText("Bash ×2")).toBeInTheDocument();
+    expect(screen.getByText("Read ×3")).toBeInTheDocument();
+    // Text byte stat
+    expect(screen.getByText("1,420 bytes")).toBeInTheDocument();
+    // Token stat (500 + 300 = 800)
+    expect(screen.getByText("800 tok")).toBeInTheDocument();
+  });
+
+  it("renders a HeadlessEvent manifest with no tools as null", () => {
+    const { container } = render(
+      <StreamLineView
+        line={{
+          id: 1,
+          data: "",
+          parsed: {
+            kind: "headless_event",
+            type: "manifest",
+            provider: "codex",
+            agent: "eng",
+            turn_id: "t1",
+            status: "idle",
+            text_len: 0,
+          },
+        }}
+      />,
+    );
+    // Zero tools + zero textLen → hasStats false → renders nothing
+    expect(container.firstChild).toBeNull();
+  });
+
+  it("renders Codex completed message content arrays", () => {
+    render(
+      <StreamLineView
+        line={{
+          id: 1,
+          data: "",
+          parsed: {
+            type: "item.completed",
+            item: {
+              type: "message",
+              content: [{ type: "output_text", text: "Final Codex answer" }],
+            },
+          },
+        }}
+      />,
+    );
+
+    expect(screen.getByText("Final Codex answer")).toBeInTheDocument();
+  });
+});
+
+describe("<StreamLineView> bot computers", () => {
+  const FRAME = "data:image/jpeg;base64,/9j/AAA";
+
+  it("renders a settled computer_frame line as an image card", () => {
+    render(
+      <StreamLineView
+        line={{
+          id: 1,
+          data: "",
+          parsed: {
+            kind: "computer_frame",
+            slug: "growth",
+            data_url: FRAME,
+            at: 1725,
+            final: true,
+          },
+        }}
+      />,
+    );
+
+    const img = screen.getByAltText("growth's screen");
+    expect(img).toHaveAttribute("src", FRAME);
+    expect(screen.getByTestId("stream-computer-frame")).toBeInTheDocument();
+  });
+
+  it("drops a computer_frame line that carries no image bytes", () => {
+    const { container } = render(
+      <StreamLineView
+        line={{
+          id: 1,
+          data: "",
+          parsed: { kind: "computer_frame", slug: "growth", data_url: "" },
+        }}
+      />,
+    );
+    expect(container).toBeEmptyDOMElement();
+  });
+
+  it("shows the bot's live frame as a thumbnail on mcp__computer__ tool cards", () => {
+    useAppStore.getState().recordComputerEvent({
+      slug: "growth",
+      state: "ready",
+      frame: FRAME,
+      at: 1,
+    });
+
+    render(
+      <StreamLineView
+        line={{
+          id: 1,
+          data: "",
+          parsed: {
+            kind: "headless_event",
+            type: "tool_use",
+            agent: "growth",
+            tool_name: "mcp__computer__click",
+            detail: '{"x": 120, "y": 44}',
+          },
+        }}
+      />,
+    );
+
+    expect(screen.getByText("mcp__computer__click")).toBeInTheDocument();
+    expect(screen.getByTestId("cc-tool-thumb")).toHaveAttribute("src", FRAME);
+  });
+
+  it("falls back to the stream's botSlug when the event has no bot field", () => {
+    useAppStore.getState().recordComputerEvent({
+      slug: "growth",
+      state: "ready",
+      frame: FRAME,
+    });
+
+    render(
+      <StreamLineView
+        agentSlug="growth"
+        line={{
+          id: 1,
+          data: "",
+          parsed: {
+            kind: "headless_event",
+            type: "tool_result",
+            tool_name: "mcp__computer__screenshot",
+            text: "ok",
+          },
+        }}
+      />,
+    );
+
+    expect(screen.getByTestId("cc-tool-thumb")).toBeInTheDocument();
+  });
+
+  it("shows no thumbnail when there is no frame, and none on other tools", () => {
+    render(
+      <StreamLineView
+        line={{
+          id: 1,
+          data: "",
+          parsed: {
+            kind: "headless_event",
+            type: "tool_use",
+            agent: "growth",
+            tool_name: "mcp__computer__click",
+          },
+        }}
+      />,
+    );
+    expect(screen.queryByTestId("cc-tool-thumb")).not.toBeInTheDocument();
+    cleanup();
+
+    useAppStore.getState().recordComputerEvent({
+      slug: "growth",
+      state: "ready",
+      frame: FRAME,
+    });
+    render(
+      <StreamLineView
+        line={{
+          id: 2,
+          data: "",
+          parsed: {
+            kind: "headless_event",
+            type: "tool_use",
+            agent: "growth",
+            tool_name: "team_broadcast",
+          },
+        }}
+      />,
+    );
+    expect(screen.queryByTestId("cc-tool-thumb")).not.toBeInTheDocument();
+  });
+});

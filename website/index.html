@@ -1,0 +1,1432 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>hivebot: the open source Grok Bot, bots you (almost) control</title>
+<meta name="description" content="The open source Grok Bot. hivebots automate your menial work via AI models and build you microapps to manage the outcome, so you have a false sense of control.">
+<link rel="canonical" href="https://hive.bot">
+<meta property="og:title" content="hivebot: the open source Grok Bot, bots you (almost) control">
+<meta property="og:description" content="hivebot is the open source Grok Bot. hivebots automate your menial work via AI models and build you microapps to manage the outcome, so that you have a false sense of control.">
+<meta property="og:type" content="website">
+<meta property="og:url" content="https://hive.bot">
+<meta property="og:site_name" content="hivebot">
+<meta property="og:locale" content="en_US">
+<meta property="og:image" content="https://hive.bot/og-image.png?v=3">
+<meta property="og:image:type" content="image/png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="The round green hivebot mark over the words: hivebot, the open source Grok Bot. Bots that collaborate, make apps, and have their own computers.">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="hivebot: the open source Grok Bot, bots you (almost) control">
+<meta name="twitter:description" content="hivebot is the open source Grok Bot. hivebots automate your menial work via AI models and build you microapps to manage the outcome, so that you have a false sense of control.">
+<meta name="twitter:image" content="https://hive.bot/og-image.png?v=3">
+<meta name="twitter:image:alt" content="The round green hivebot mark over the words: hivebot, the open source Grok Bot. Bots that collaborate, make apps, and have their own computers.">
+<!-- theme-color cannot reference a CSS custom property, so these two are the
+     only brand colors outside :root. They must track --paper in each mode. -->
+<meta name="theme-color" content="#F4F3EF" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#121214" media="(prefers-color-scheme: dark)">
+<link rel="icon" type="image/svg+xml" href="favicon.svg">
+<link rel="icon" type="image/png" sizes="96x96" href="favicon-96.png">
+<link rel="icon" type="image/png" sizes="32x32" href="favicon-32.png">
+<link rel="apple-touch-icon" sizes="180x180" href="apple-touch-icon.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&family=VT323:wght@400&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@graph": [
+    {
+      "@type": "Organization",
+      "@id": "https://hive.bot/#org",
+      "name": "hivebot",
+      "url": "https://hive.bot",
+      "logo": "https://hive.bot/apple-touch-icon.png",
+      "sameAs": [
+        "https://github.com/Northlatch-Labs-LLC/hivebot",
+        "https://www.npmjs.com/package/hivebot",
+        "https://discord.gg/gjSySC3PzV",
+        "https://news.ycombinator.com/item?id=47899844"
+      ]
+    },
+    {
+      "@type": "WebSite",
+      "@id": "https://hive.bot/#website",
+      "url": "https://hive.bot",
+      "name": "hivebot",
+      "publisher": { "@id": "https://hive.bot/#org" },
+      "inLanguage": "en"
+    },
+    {
+      "@type": "SoftwareApplication",
+      "@id": "https://hive.bot/#app",
+      "name": "hivebot",
+      "alternateName": ["open source Grok Bot", "open source grokbot", "Grok Bot alternative"],
+      "url": "https://hive.bot",
+      "applicationCategory": "DeveloperApplication",
+      "applicationSubCategory": "AI bots",
+      "operatingSystem": "macOS, Linux, Windows",
+      "description": "hivebot is the open source Grok Bot. hivebots automate your menial work via AI models and build you microapps to manage the outcome, so that you have a false sense of control. Runs on your machine with Claude Code, Codex, or a local model.",
+      "keywords": "open source grok bot, grokbot alternative, self-hosted AI bots, AI teammates, microapps, Claude Code, Codex",
+      "isAccessibleForFree": true,
+      "license": "https://github.com/Northlatch-Labs-LLC/hivebot/blob/main/LICENSE",
+      "codeRepository": "https://github.com/Northlatch-Labs-LLC/hivebot",
+      "installUrl": "https://www.npmjs.com/package/hivebot",
+      "sameAs": ["https://github.com/Northlatch-Labs-LLC/hivebot", "https://www.npmjs.com/package/hivebot"],
+      "downloadUrl": "https://hive.bot/download.html",
+      "offers": {
+        "@type": "Offer",
+        "price": 0,
+        "priceCurrency": "USD"
+      },
+      "publisher": { "@id": "https://hive.bot/#org" }
+    }
+  ]
+}
+</script>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  /* ════════════════════════════════════════════════════════════════════
+     hivebot BRAND PALETTE. Single source of truth.
+
+     Six semantics, one accent:
+       ink     foreground, near-black on light, bone on dark
+       paper   page background
+       raised  cards and panels lifted off the page
+       line    hairline borders
+       mute    secondary text
+       accent  "bloodshot". The eye, errors, and destructive actions
+               ONLY. It is never decoration.
+
+     Never pure black or pure white, in either mode.
+
+     The ONE exception to the monochrome rule is the bot marks. Their
+     twelve muted body colors are not decoration either: a bot's color
+     is derived from its slug and identifies it, the same way its shape
+     does, so the roster reads as a set of individuals rather than a
+     paint chart. Those values live in web/src/lib/blobAvatar.ts and are
+     injected from there, never retyped.
+     ═══════════════════════════════════════════════════════════════════ */
+  :root {
+    color-scheme: light dark;
+
+    /* -- channel sources, LIGHT ------------------------------------ */
+    --ink-rgb: 14,14,17;
+    --paper-rgb: 244,243,239;
+    --accent-rgb: 200,64,47;
+
+    /* -- named semantics ------------------------------------------- */
+    --ink: rgb(var(--ink-rgb));
+    --paper: rgb(var(--paper-rgb));
+    --raised: #FBFAF7;
+    --line: #D8D5CD;
+    --mute: #6E6C66;
+    --accent: rgb(var(--accent-rgb));
+
+    /* -- derived translucent variants ------------------------------ */
+    --ink-glow: rgba(var(--ink-rgb), 0.10);
+    --ink-halo: rgba(var(--ink-rgb), 0.04);
+    --ink-soft: rgba(var(--ink-rgb), 0.28);
+    --ink-strong: rgba(var(--ink-rgb), 0.75);
+    --scanline: rgba(var(--ink-rgb), 0.045);
+
+    /* -- legacy aliases -------------------------------------------- */
+    /* The rules below this block were authored against these names.
+       They now resolve to the semantics above, which is why the whole
+       page re-skins from the triplets alone. --yellow* are historical
+       names for "the mark color", not yellow. */
+    --bg: var(--paper);
+    --surface: var(--raised);
+    --surface-high: var(--raised);
+    --border: var(--line);
+    --text: var(--ink);
+    --text-muted: var(--mute);
+    --yellow: var(--ink);
+    --yellow-dark: var(--ink);
+    --yellow-glow: var(--ink-glow);
+    --accent-halo: var(--ink-halo);
+    --bg2: var(--surface);
+    --bg3: var(--surface-high);
+    --yellow-dim: var(--yellow-glow);
+    --accent-lime: var(--ink);
+    --text-dim: var(--text-muted);
+
+    --font-display: 'Press Start 2P', monospace;
+    --font-vt: 'VT323', monospace;
+    --font-mono: 'DM Mono', monospace;
+  }
+
+  /* Dark mode redefines ONLY the sources. Every derived value and alias
+     follows automatically. */
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --ink-rgb: 237,235,228;
+      --paper-rgb: 18,18,20;
+      --accent-rgb: 224,86,63;
+      --raised: #191919;
+      --line: #2E2D2A;
+      --mute: #8B8880;
+    }
+  }
+
+  html { scroll-behavior: smooth; }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--font-mono);
+    line-height: 1.6;
+    min-height: 100vh;
+    overflow-x: hidden;
+  }
+
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+  /* ── NAV ─────────────────────────────────────────────── */
+  nav {
+    position: fixed; top: 0; left: 0; right: 0; z-index: 100;
+    height: 44px;
+    background: var(--bg);
+    border-bottom: 2px solid var(--yellow);
+    display: flex; align-items: center;
+    padding: 0 24px;
+    gap: 24px;
+  }
+  .nav-logo {
+    display: flex; align-items: center; gap: 10px;
+    text-decoration: none;
+    margin-right: auto;
+  }
+  .nav-social { display: flex; align-items: center; gap: 4px; }
+  .nav-social-link {
+    display: flex; align-items: center; gap: 5px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--text-dim);
+    text-decoration: none;
+    letter-spacing: 0.04em;
+    transition: color 0.15s;
+    min-width: 44px; min-height: 44px; padding: 0 10px;
+    justify-content: center;
+  }
+  .nav-social-link:hover { color: var(--yellow); }
+  .nav-social-link svg { flex-shrink: 0; }
+  .nav-star-count { font-size: 10px; }
+  .nav-badge {
+    font-family: var(--font-display);
+    font-size: 8px;
+    color: var(--bg);
+    background: var(--yellow);
+    padding: 0 12px;
+    min-height: 44px;
+    border: none;
+    white-space: nowrap;
+    display: inline-flex;
+    align-items: center;
+    text-decoration: none;
+  }
+
+  /* ── HERO ─────────────────────────────────────────── */
+  .hero {
+    padding-top: 88px;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    position: relative;
+    overflow: hidden;
+  }
+
+  .hero::before {
+    content: '';
+    position: absolute; inset: 0;
+    background:
+      radial-gradient(ellipse 700px 400px at 50% 48%, var(--accent-halo) 0%, transparent 70%),
+      repeating-linear-gradient(
+        0deg,
+        transparent,
+        transparent 3px,
+        var(--scanline) 3px,
+        var(--scanline) 4px
+      );
+    pointer-events: none; z-index: 1;
+  }
+
+  .hero-inner {
+    position: relative; z-index: 2;
+    display: flex; flex-direction: column;
+    align-items: center;
+    text-align: center;
+    padding: 0 24px;
+    max-width: 900px;
+    width: 100%;
+  }
+
+  /* ── THE MARK ─────────────────────────────────────── */
+  /* Two hollow pixel eyes on an 11x15 grid. Outlines only: the emptiness is
+     the joke. Never fill them. currentColor throughout, so the mark inverts
+     for free in dark mode and on ink-filled surfaces. */
+  .hivebot-mark { width: auto; color: var(--ink); display: block; }
+  .nav-mark { height: 18px; flex-shrink: 0; }
+  .hero-mark { height: clamp(76px, 13vw, 124px); margin: 0 auto 14px; }
+  .hero-bots {
+    display: flex;
+    justify-content: center;
+    gap: clamp(8px, 1.6vw, 16px);
+    margin: 0 auto 26px;
+  }
+  .hero-bot { height: clamp(26px, 4vw, 40px); width: auto; display: block; }
+  /* Same discrete blink as the roster marks; eyes narrow, never fully shut. */
+  .hero-bot .blob-open { animation: blob-eye-open 5.6s steps(1, end) infinite; }
+  .hero-bot .blob-shut { animation: blob-eye-shut 5.6s steps(1, end) infinite; }
+  .hero-bot-1 path { animation-delay: 0.7s; }
+  .hero-bot-2 path { animation-delay: 2.1s; }
+  .hero-bot-3 path { animation-delay: 3.4s; }
+  .hero-bot-4 path { animation-delay: 1.3s; }
+  .hero-bot-5 path { animation-delay: 4.6s; }
+  .is-page-hidden .hero-bot path { animation-play-state: paused; }
+  .footer-mark { height: 16px; flex-shrink: 0; }
+
+  .nav-wordmark {
+    font-family: var(--font-display);
+    font-size: 12px;
+    letter-spacing: -0.03em;
+    color: var(--ink);
+    text-transform: lowercase;
+  }
+
+  /* The eyes narrow and widen, like someone actually looking at something.
+     Applied ONLY to the hero copy: below roughly 24px the whole travel is a
+     couple of pixels and reads as a wobble, so the nav and footer marks ship
+     the static open state. */
+  .hero-mark .hivebot-eyes {
+    transform-box: fill-box;
+    transform-origin: center;
+    animation: hivebot-look 3.2s ease-in-out infinite alternate;
+  }
+  @keyframes hivebot-look {
+    from { transform: scaleY(1); }
+    to   { transform: scaleY(0.42); }
+  }
+  .is-page-hidden .hero-mark .hivebot-eyes { animation-play-state: paused; }
+
+
+  .hero-title {
+    font-family: var(--font-display);
+    /* Set slightly small for the space it occupies. It is not shouting. */
+    font-size: clamp(30px, 5.6vw, 54px);
+    color: var(--ink);
+    line-height: 1.1;
+    letter-spacing: -0.035em;
+    text-transform: lowercase;
+    margin-bottom: 18px;
+  }
+  .hero-lede {
+    font-family: var(--font-display);
+    font-size: clamp(13px, 1.9vw, 18px);
+    line-height: 1.6;
+    color: var(--ink);
+    letter-spacing: -0.01em;
+    margin-bottom: 18px;
+  }
+  .visually-hidden {
+    position: absolute !important;
+    width: 1px; height: 1px;
+    padding: 0; margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
+  }
+  .hero-tagline {
+    font-family: var(--font-mono);
+    font-size: clamp(14px, 1.8vw, 17px);
+    color: var(--text);
+    line-height: 1.7;
+    max-width: 600px;
+    margin-bottom: 40px;
+  }
+
+  .install-wrap {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 0;
+    margin-bottom: 32px;
+    width: 100%;
+    max-width: 560px;
+    scroll-margin-top: 60px;
+  }
+
+  .install-tabs { display: flex; width: 100%; }
+  .install-tab {
+    flex: 1;
+    min-height: 44px;
+    padding: 10px 12px;
+    font-family: var(--font-display);
+    font-size: 8px;
+    letter-spacing: 0.08em;
+    color: var(--text-dim);
+    background: var(--bg);
+    border: 2px solid var(--yellow-dark);
+    border-bottom: 2px solid var(--yellow);
+    cursor: pointer;
+    text-align: center;
+    transition: color 0.15s, background 0.15s;
+  }
+  .install-tab.active {
+    color: var(--yellow);
+    background: var(--bg3);
+    border: 2px solid var(--yellow);
+    border-bottom: 2px solid var(--bg3);
+  }
+
+  .install-block {
+    width: 100%;
+    background: var(--bg3);
+    border: 2px solid var(--yellow);
+    border-top: none;
+    box-shadow: 4px 4px 0 var(--yellow-dark);
+    display: none;
+    flex-direction: column;
+    gap: 6px;
+    padding: 14px 20px;
+  }
+  .install-block.active { display: flex; }
+
+  .install-line {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    width: 100%;
+    min-height: 44px;
+    padding: 0;
+    color: inherit;
+    background: transparent;
+    border: 0;
+    cursor: pointer;
+    text-align: left;
+  }
+  .install-line:hover,
+  .install-line:focus-visible { background: var(--bg2); }
+
+  .install-prompt {
+    font-family: var(--font-mono);
+    font-size: 14px;
+    color: var(--accent-lime);
+    flex-shrink: 0;
+  }
+  .install-cmd {
+    font-family: var(--font-mono);
+    font-size: 14px;
+    color: var(--text);
+    flex: 1;
+    text-align: left;
+    overflow-wrap: anywhere;
+  }
+  .install-copy {
+    font-family: var(--font-display);
+    font-size: 8px;
+    color: var(--text-dim);
+    flex-shrink: 0;
+    letter-spacing: 0.08em;
+  }
+  .install-copy.copied { color: var(--accent); }
+
+  .install-note {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--text-dim);
+    margin-top: 16px;
+  }
+
+  .hero-ctas {
+    display: flex; gap: 16px; align-items: center; flex-wrap: wrap; justify-content: center;
+  }
+  .hero-badges {
+    display: flex; gap: 16px; align-items: center; flex-wrap: wrap; justify-content: center;
+    margin-top: 28px;
+  }
+  .hn-badge { display: inline-flex; line-height: 0; }
+  .hn-badge img { height: 48px; width: auto; display: block; }
+
+  .btn-primary {
+    font-family: var(--font-display);
+    font-size: 10px;
+    color: var(--bg);
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    background: var(--yellow);
+    border: none;
+    padding: 14px 24px;
+    cursor: pointer;
+    box-shadow: 4px 4px 0 var(--yellow-dark);
+    text-decoration: none;
+    letter-spacing: 0.06em;
+  }
+  .btn-primary:hover { transform: translate(-1px, -1px); box-shadow: 5px 5px 0 var(--yellow-dark); }
+  .btn-primary:active { transform: translate(2px, 2px); box-shadow: 2px 2px 0 var(--yellow-dark); }
+
+  .btn-ghost {
+    font-family: var(--font-display);
+    font-size: 10px;
+    color: var(--yellow);
+    background: transparent;
+    border: 2px solid var(--yellow);
+    padding: 12px 22px;
+    cursor: pointer;
+    box-shadow: 3px 3px 0 var(--yellow-dark);
+    text-decoration: none;
+    display: inline-flex;
+    align-items: center;
+    letter-spacing: 0.06em;
+  }
+  .btn-ghost:hover { background: var(--yellow-dim); }
+
+  /* ── AMBIENT STRIP ────────────────────────────────── */
+  .ambient-strip {
+    background: var(--yellow);
+    padding: 12px 0;
+    overflow: hidden;
+    white-space: nowrap;
+    border-top: 2px solid var(--yellow-dark);
+    border-bottom: 2px solid var(--yellow-dark);
+  }
+  .ambient-scroll {
+    display: inline-flex; gap: 64px;
+    animation: marquee 120s steps(240, end) infinite;
+    will-change: transform;
+  }
+  .is-page-hidden .ambient-scroll { animation-play-state: paused; }
+  @keyframes marquee {
+    from { transform: translateX(0); }
+    to { transform: translateX(-50%); }
+  }
+  .ambient-item {
+    font-family: var(--font-vt);
+    font-size: 22px;
+    color: var(--bg);
+    letter-spacing: 0.06em;
+    flex-shrink: 0;
+  }
+
+  /* ── SECTIONS ─────────────────────────────────────── */
+  /* scroll-margin keeps an external deep link to #message or #trust from
+     landing underneath the 44px fixed nav. */
+  section { padding: 60px 24px; max-width: 1000px; margin: 0 auto; scroll-margin-top: 56px; }
+  /* Rhythm, not a metronome. The roster sits close under the ticker it
+     follows, and the punchline gets the most air on the page. */
+  #roster { padding-top: 52px; }
+  #price { padding-top: 80px; padding-bottom: 72px; }
+
+  .section-eyebrow {
+    font-family: var(--font-display);
+    font-size: 8px;
+    color: var(--yellow);
+    letter-spacing: 0.14em;
+    margin-bottom: 16px;
+    display: flex; align-items: center; gap: 12px;
+  }
+  .section-eyebrow::after {
+    content: '';
+    flex: 1;
+    height: 2px;
+    background: var(--yellow-dark);
+  }
+  .section-eyebrow::before {
+    content: '';
+    width: 8px; height: 8px;
+    background: var(--accent-lime);
+    flex-shrink: 0;
+  }
+
+  /* Press Start 2P advances about one em per character, so a title is
+     roughly as wide as its character count times its size. 32px keeps the
+     longest line here inside the 1000px measure instead of ragging to
+     three lines. */
+  .section-title {
+    font-family: var(--font-display);
+    font-size: clamp(20px, 2.8vw, 32px);
+    color: var(--text);
+    line-height: 1.45;
+    margin-bottom: 14px;
+  }
+
+  .section-sub {
+    font-family: var(--font-vt);
+    font-size: clamp(20px, 2.4vw, 26px);
+    color: var(--mute);
+    letter-spacing: 0.02em;
+    margin-bottom: 22px;
+  }
+
+  .section-body {
+    font-family: var(--font-mono);
+    font-size: 16px;
+    color: var(--text);
+    line-height: 1.8;
+    max-width: 640px;
+    margin-bottom: 38px;
+  }
+
+  /* ── THE ROSTER ───────────────────────────────────── */
+  /* A staff list, not a card grid. Each row is one bot: its mark, its
+     name, and what it is currently doing instead of the work. The marks
+     are the product's real avatars, injected from blobAvatar.ts. */
+  .roster {
+    list-style: none;
+    border-top: 2px solid var(--yellow-dark);
+  }
+  .roster li {
+    display: flex;
+    align-items: center;
+    gap: clamp(16px, 3vw, 28px);
+    padding: 12px 4px;
+    border-bottom: 1px solid var(--line);
+  }
+  /* Sized to a whole multiple of the 16px grid (64 = 4x, 48 = 3x on small
+     screens). At a fractional scale the renderer has to round some cells to
+     2px and some to 3px, and the silhouette edge goes visibly lumpy. The
+     source file rounds to whole device pixels for the same reason.
+
+     The eyes are punched OUT of the body with fill-rule evenodd, exactly as
+     the app clears them, so the paper shows through and the mark needs no
+     knowledge of the background in either theme. */
+  .roster-mark {
+    width: 64px;
+    height: 64px;
+    flex-shrink: 0;
+  }
+  .roster-name {
+    font-family: var(--font-display);
+    font-size: 11px;
+    letter-spacing: 0.02em;
+    color: var(--ink);
+    width: 11ch;
+    flex-shrink: 0;
+  }
+  .roster-doing {
+    font-family: var(--font-mono);
+    font-size: 14.5px;
+    line-height: 1.6;
+    color: var(--mute);
+  }
+
+  /* Eyes narrow, they never shut: a closed mark reads as broken rather
+     than as blinking. Discrete swap, no tween, to match the pixel grid. */
+  .blob-shut { opacity: 0; }
+  .roster-mark .blob-open { animation: blob-eye-open 5.6s steps(1, end) infinite; }
+  .roster-mark .blob-shut { animation: blob-eye-shut 5.6s steps(1, end) infinite; }
+  @keyframes blob-eye-open { 0%, 93% { opacity: 1; } 94%, 100% { opacity: 0; } }
+  @keyframes blob-eye-shut { 0%, 93% { opacity: 0; } 94%, 100% { opacity: 1; } }
+  .roster li:nth-child(1) .roster-mark path { animation-delay: 0s; }
+  .roster li:nth-child(2) .roster-mark path { animation-delay: 1.7s; }
+  .roster li:nth-child(3) .roster-mark path { animation-delay: 3.1s; }
+  .roster li:nth-child(4) .roster-mark path { animation-delay: 0.9s; }
+  .roster li:nth-child(5) .roster-mark path { animation-delay: 4.3s; }
+  .roster li:nth-child(6) .roster-mark path { animation-delay: 2.4s; }
+  .is-page-hidden .roster-mark path { animation-play-state: paused; }
+
+  /* ── DIRECT MESSAGE DEMO ──────────────────────────── */
+  /* This is a DM with ONE bot, deliberately. The product has no channels:
+     a human talks to exactly one bot at a time, and mentioning another
+     makes the bot you are talking to go consult it and report back. The
+     consulted bots never appear as speakers in the log, which is why they
+     are rendered as a subordinate aside rather than as messages. A demo
+     showing five bots piling into one room would be selling the exact
+     surface the DM model exists to replace. */
+  .dm {
+    max-width: 620px;
+    border: 2px solid var(--yellow);
+    background: var(--bg3);
+    box-shadow: 4px 4px 0 var(--yellow-dark);
+  }
+
+  .dm-header {
+    display: flex; align-items: center; gap: 12px;
+    padding: 12px 16px;
+    border-bottom: 2px solid var(--yellow-dark);
+  }
+  .dm-header-name {
+    font-family: var(--font-display);
+    font-size: 10px;
+    color: var(--ink);
+  }
+  .dm-header-kind {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--mute);
+    margin-left: auto;
+  }
+
+  .dm-log {
+    display: flex; flex-direction: column; gap: 14px;
+    padding: 16px;
+  }
+
+  .dm-row { display: flex; gap: 12px; align-items: flex-start; }
+  /* You sit on the other side, so the one-to-one shape is legible at a
+     glance without a label saying "one to one". */
+  .dm-row.you { flex-direction: row-reverse; }
+
+  /* 32px and 16px are whole multiples of the 16px grid. See .roster-mark. */
+  .dm-avatar { width: 32px; height: 32px; flex-shrink: 0; }
+  /* You are the one square with no eyes in it. */
+  .dm-avatar.you { background: var(--yellow); }
+
+  .dm-bubble {
+    font-family: var(--font-vt); font-size: 20px;
+    line-height: 1.4; color: var(--text);
+    background: var(--bg);
+    border: 2px solid var(--yellow-dark);
+    padding: 9px 14px;
+  }
+  .dm-row.you .dm-bubble {
+    background: var(--yellow-dim);
+    border-color: var(--yellow);
+    color: var(--yellow);
+  }
+
+  /* The side trip. Dashed, muted, and indented under the bot you are
+     actually talking to, because none of this happens in your conversation. */
+  .dm-consult {
+    margin-left: 44px;
+    padding: 2px 0 2px 16px;
+    border-left: 2px dashed var(--line);
+    display: flex; flex-direction: column; gap: 9px;
+  }
+  .dm-consult-label {
+    font-family: var(--font-display);
+    font-size: 7px;
+    letter-spacing: 0.1em;
+    color: var(--mute);
+  }
+  .dm-consult-row { display: flex; align-items: center; gap: 10px; }
+  .dm-consult-mark { width: 16px; height: 16px; flex-shrink: 0; }
+  .dm-consult-name {
+    font-family: var(--font-mono); font-size: 11px;
+    color: var(--mute); width: 10ch; flex-shrink: 0;
+  }
+  .dm-consult-text {
+    font-family: var(--font-mono); font-size: 12.5px;
+    color: var(--mute); line-height: 1.5;
+  }
+
+  /* ── THE MICROAPP ─────────────────────────────────── */
+  /* Rendered inside the conversation, because that is where it arrives.
+     It is a static illustration: the buttons are spans, not <button>, so
+     nothing here is focusable or announces itself as an interactive
+     control that does nothing. The whole block sits inside the DM's
+     role="img", which carries the description. */
+  .microapp {
+    margin-left: 44px;
+    border: 2px solid var(--yellow);
+    background: var(--bg);
+    box-shadow: 3px 3px 0 var(--yellow-dark);
+  }
+  .microapp-bar {
+    display: flex; align-items: baseline; gap: 12px;
+    padding: 9px 12px;
+    border-bottom: 2px solid var(--yellow-dark);
+  }
+  .microapp-title {
+    font-family: var(--font-display); font-size: 8px;
+    letter-spacing: 0.06em; color: var(--ink);
+  }
+  .microapp-by {
+    font-family: var(--font-mono); font-size: 10.5px;
+    color: var(--mute); margin-left: auto;
+  }
+  .microapp-stats {
+    display: flex; gap: 2px;
+    background: var(--line);
+    border-bottom: 2px solid var(--yellow-dark);
+  }
+  .microapp-stat {
+    flex: 1; background: var(--bg3);
+    padding: 10px 12px;
+    display: flex; flex-direction: column; gap: 2px;
+  }
+  .microapp-stat-n {
+    font-family: var(--font-display); font-size: 15px;
+    line-height: 1.2; color: var(--ink);
+  }
+  .microapp-stat-l {
+    font-family: var(--font-mono); font-size: 10.5px;
+    color: var(--mute);
+  }
+  /* The only accent on the page outside the cursor, and it is doing its
+     documented job: the one thing that actually wants a human. */
+  .microapp-stat.need .microapp-stat-n { color: var(--accent); }
+
+  .microapp-rows { display: flex; flex-direction: column; }
+  .microapp-row {
+    display: flex; align-items: center; gap: 12px;
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--line);
+    font-family: var(--font-mono); font-size: 12.5px;
+  }
+  .microapp-row-what { color: var(--text); }
+  .microapp-row-state {
+    margin-left: auto; font-size: 10.5px;
+    letter-spacing: 0.04em;
+  }
+  .microapp-row-state.done { color: var(--mute); }
+  .microapp-row-state.need { color: var(--accent); }
+
+  .microapp-actions {
+    display: flex; gap: 8px; align-items: center;
+    padding: 12px;
+  }
+  .microapp-btn {
+    font-family: var(--font-display); font-size: 8px;
+    letter-spacing: 0.06em;
+    background: var(--yellow); color: var(--bg);
+    padding: 9px 14px;
+  }
+  .microapp-btn.ghost {
+    background: transparent; color: var(--mute);
+    border: 2px solid var(--line);
+  }
+
+  /* ── TRUST ────────────────────────────────────────── */
+  .trust-card {
+    background: var(--bg2);
+    border: 2px solid var(--yellow);
+    box-shadow: 4px 4px 0 var(--yellow-dark);
+    padding: clamp(24px, 4vw, 34px);
+  }
+  .trust-label {
+    font-family: var(--font-display);
+    font-size: 9px;
+    color: var(--yellow);
+    letter-spacing: 0.12em;
+    margin-bottom: 20px;
+  }
+  .trust-list {
+    list-style: none;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+  .trust-list li {
+    font-family: var(--font-mono);
+    font-size: 14.5px;
+    line-height: 1.65;
+    color: var(--text);
+    padding-left: 24px;
+    position: relative;
+  }
+  .trust-list li::before {
+    content: '+';
+    position: absolute;
+    left: 0;
+    top: 0;
+    color: var(--accent-lime);
+    font-family: var(--font-display);
+    font-size: 12px;
+    line-height: 1.6;
+  }
+
+  /* ── PRICE. The punchline, and the loudest thing on the page. ─────── */
+  /* Comparison strip. Same card language as the trust card, one table. */
+  .compare-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  .compare {
+    width: 100%;
+    border-collapse: collapse;
+    background: var(--bg2);
+    border: 2px solid var(--yellow);
+    box-shadow: 4px 4px 0 var(--yellow-dark);
+    font-family: var(--font-mono);
+    font-size: 14px;
+    line-height: 1.6;
+  }
+  .compare th, .compare td {
+    text-align: left;
+    vertical-align: top;
+    padding: 12px 14px;
+    border-bottom: 1px solid var(--line);
+  }
+  .compare th {
+    font-family: var(--font-display);
+    font-size: 8px;
+    letter-spacing: 0.12em;
+    color: var(--yellow);
+    white-space: nowrap;
+  }
+  .compare tbody th { color: var(--mute); font-family: var(--font-mono); font-size: 13px; letter-spacing: 0; width: 22%; }
+  .compare tbody tr:last-child td, .compare tbody tr:last-child th { border-bottom: 0; }
+  .compare-more {
+    display: inline-block;
+    margin-top: 22px;
+    font-family: var(--font-display);
+    font-size: 9px;
+    letter-spacing: 0.08em;
+    color: var(--yellow);
+    text-decoration: none;
+    border-bottom: 2px solid var(--yellow-dark);
+    padding-bottom: 4px;
+  }
+  .compare-more:hover { border-bottom-color: var(--accent); }
+  .compare-updated { font-family: var(--font-mono); font-size: 12px; color: var(--mute); margin-top: 14px; }
+
+  .price-block {
+    text-align: center;
+    padding: 12px 0 40px;
+  }
+  .price-headline {
+    font-family: var(--font-display);
+    font-size: clamp(56px, 15vw, 148px);
+    line-height: 1;
+    letter-spacing: -0.05em;
+    color: var(--ink);
+    text-transform: lowercase;
+  }
+  .price-sub {
+    font-family: var(--font-vt);
+    font-size: clamp(22px, 3.4vw, 34px);
+    color: var(--mute);
+    letter-spacing: 0.02em;
+    margin-top: 14px;
+  }
+  .price-terms {
+    font-family: var(--font-mono);
+    font-size: 14px;
+    line-height: 1.8;
+    color: var(--text);
+    max-width: 640px;
+    margin: 0 auto;
+    text-align: center;
+  }
+  .price-cta {
+    display: flex; gap: 16px; align-items: center;
+    justify-content: center; flex-wrap: wrap;
+    margin-top: 28px;
+  }
+  /* ── FOOTER ───────────────────────────────────────── */
+  footer {
+    padding: 40px 24px 36px;
+    max-width: 1000px;
+    margin: 0 auto;
+    border-top: 2px solid var(--yellow-dark);
+  }
+  .footer-top {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 24px 40px;
+    align-items: flex-start;
+    justify-content: space-between;
+  }
+  .footer-logo {
+    display: flex; align-items: center; gap: 10px;
+    font-family: var(--font-display);
+    font-size: 9px;
+    color: var(--yellow);
+    letter-spacing: 0.05em;
+  }
+  .footer-sub {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--text-dim);
+    margin-top: 10px;
+  }
+  .footer-links { display: flex; gap: 20px; flex-wrap: wrap; }
+  .footer-links a {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--text-dim);
+    text-decoration: none;
+    display: inline-flex;
+    align-items: center;
+    min-height: 44px;
+  }
+  .footer-links a:hover { color: var(--yellow); }
+  .footer-legal {
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    line-height: 1.75;
+    color: var(--mute);
+    margin-top: 26px;
+    padding-top: 22px;
+    border-top: 1px solid var(--line);
+    max-width: 80ch;
+  }
+
+  /* ── RESPONSIVE ──────────────────────────────────── */
+  @media (max-width: 720px) {
+    section { padding: 60px 20px; }
+    .roster li { flex-wrap: wrap; gap: 14px; padding: 14px 2px; }
+    .roster-mark { width: 48px; height: 48px; }
+    .roster-name { width: auto; }
+    .roster-doing { flex-basis: 100%; font-size: 14px; }
+    .dm-log { padding: 14px; gap: 12px; }
+    .dm-bubble { font-size: 19px; }
+    /* The consult aside stops being an indent and becomes a stacked block:
+       at 390px a 44px margin plus a 10ch name column leaves nothing for the
+       line itself. */
+    .dm-consult { margin-left: 12px; padding-left: 12px; }
+    .dm-consult-row { align-items: flex-start; flex-wrap: wrap; gap: 4px 10px; }
+    .dm-consult-name { width: auto; }
+    .dm-consult-text { flex-basis: 100%; }
+    .microapp { margin-left: 0; }
+    .microapp-stats { flex-wrap: wrap; }
+    .microapp-stat { flex-basis: 30%; }
+    .microapp-actions { flex-wrap: wrap; }
+  }
+  @media (max-width: 640px) {
+    .nav-star-count { display: none; }
+    .nav-wordmark { display: none; }
+    .nav-social-link { padding: 0 8px; }
+    .nav-badge { padding: 0 10px; }
+    .footer-top { flex-direction: column; }
+    .price-block { padding-bottom: 28px; }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after {
+      animation-duration: 0.001ms !important;
+      animation-iteration-count: 1 !important;
+      scroll-behavior: auto !important;
+      transition-duration: 0.001ms !important;
+    }
+    .ambient-scroll,
+    .hero-mark .hivebot-eyes,
+    .hero-bot path,
+    .roster-mark path {
+      animation: none !important;
+    }
+    .btn-primary:hover,
+    .btn-primary:active { transform: none; }
+  }
+</style>
+</head>
+<body>
+
+<!-- NAV. Four things. The page is short enough that section anchors were
+     scaffolding for a site that no longer exists. -->
+<nav>
+  <a class="nav-logo" href="#top" aria-label="hivebot, back to top">
+    <svg class="hivebot-mark nav-mark" viewBox="0 0 11 15" shape-rendering="crispEdges" aria-hidden="true"><g class="hivebot-eyes" fill="currentColor"><rect x="1" y="1" width="2" height="1"/><rect x="0" y="2" width="1" height="11"/><rect x="3" y="2" width="1" height="11"/><rect x="1" y="13" width="2" height="1"/><rect x="8" y="1" width="2" height="1"/><rect x="7" y="2" width="1" height="11"/><rect x="10" y="2" width="1" height="11"/><rect x="8" y="13" width="2" height="1"/></g></svg>
+    <span class="nav-wordmark">hivebot</span>
+  </a>
+  <div class="nav-social">
+    <a class="nav-social-link" href="https://github.com/Northlatch-Labs-LLC/hivebot" target="_blank" rel="noopener" aria-label="GitHub">
+      <svg viewBox="0 0 16 16" width="15" height="15" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>
+      <span class="nav-star-count" id="navStars">&#9733;</span>
+    </a>
+    <a class="nav-badge" href="#install">INSTALL</a>
+  </div>
+</nav>
+
+<main>
+
+<!-- 1. HERO -->
+<section class="hero" id="top">
+  <div class="hero-inner">
+
+    <svg class="hivebot-mark hero-mark" viewBox="0 0 11 15" role="img" aria-label="The hivebot mark: two hollow eyes. They are yours."><title>hivebot</title><g class="hivebot-eyes" fill="currentColor"><rect x="1" y="1" width="2" height="1"/><rect x="0" y="2" width="1" height="11"/><rect x="3" y="2" width="1" height="11"/><rect x="1" y="13" width="2" height="1"/><rect x="8" y="1" width="2" height="1"/><rect x="7" y="2" width="1" height="11"/><rect x="10" y="2" width="1" height="11"/><rect x="8" y="13" width="2" height="1"/></g></svg>
+    <!-- The five bots, already at work under the mark. Same silhouettes and
+         colours as the roster below (generated from web/src/lib/blobAvatar.ts,
+         so they cannot drift from what the app renders), same never-fully-shut
+         blink, staggered so they read as individuals rather than a chorus. -->
+    <div class="hero-bots" aria-label="Five hivebots: filer, reconciler, triager, scheduler, and chaser" role="img">
+      <svg class="hero-bot hero-bot-1" viewBox="0 0 16 16" shape-rendering="crispEdges" aria-hidden="true" focusable="false"><path class="blob-open" fill="#8b6bb1" fill-rule="evenodd" d="M3 2H6V3H3ZM2 3H7V4H2ZM2 4H14V5H2ZM1 5H15V11H1ZM2 11H14V13H2ZM4 13H12V14H4ZM5 5H7V9H5ZM9 5H11V9H9Z"/><path class="blob-shut" fill="#8b6bb1" fill-rule="evenodd" d="M3 2H6V3H3ZM2 3H7V4H2ZM2 4H14V5H2ZM1 5H15V11H1ZM2 11H14V13H2ZM4 13H12V14H4ZM5 5H7V7H5ZM9 5H11V7H9Z"/></svg>
+      <svg class="hero-bot hero-bot-2" viewBox="0 0 16 16" shape-rendering="crispEdges" aria-hidden="true" focusable="false"><path class="blob-open" fill="#3f9c8f" fill-rule="evenodd" d="M5 1H10V2H5ZM3 2H12V3H3ZM2 3H13V4H2ZM2 4H14V5H2ZM1 5H14V6H1ZM1 6H15V10H1ZM2 10H15V11H2ZM2 11H14V12H2ZM3 12H14V13H3ZM4 13H12V14H4ZM6 14H10V15H6ZM5 5H7V9H5ZM9 5H11V9H9Z"/><path class="blob-shut" fill="#3f9c8f" fill-rule="evenodd" d="M5 1H10V2H5ZM3 2H12V3H3ZM2 3H13V4H2ZM2 4H14V5H2ZM1 5H14V6H1ZM1 6H15V10H1ZM2 10H15V11H2ZM2 11H14V12H2ZM3 12H14V13H3ZM4 13H12V14H4ZM6 14H10V15H6ZM5 5H7V7H5ZM9 5H11V7H9Z"/></svg>
+      <svg class="hero-bot hero-bot-3" viewBox="0 0 16 16" shape-rendering="crispEdges" aria-hidden="true" focusable="false"><path class="blob-open" fill="#a8546b" fill-rule="evenodd" d="M6 1H10V2H6ZM4 2H12V3H4ZM3 3H13V4H3ZM2 4H14V6H2ZM1 6H15V15H1ZM5 5H7V9H5ZM9 5H11V9H9Z"/><path class="blob-shut" fill="#a8546b" fill-rule="evenodd" d="M6 1H10V2H6ZM4 2H12V3H4ZM3 3H13V4H3ZM2 4H14V6H2ZM1 6H15V15H1ZM5 5H7V7H5ZM9 5H11V7H9Z"/></svg>
+      <svg class="hero-bot hero-bot-4" viewBox="0 0 16 16" shape-rendering="crispEdges" aria-hidden="true" focusable="false"><path class="blob-open" fill="#8a7a2e" fill-rule="evenodd" d="M7 1H9V2H7ZM6 2H10V4H6ZM5 4H11V5H5ZM4 5H12V6H4ZM3 6H13V7H3ZM2 7H14V9H2ZM1 9H15V12H1ZM2 12H14V13H2ZM3 13H13V14H3ZM5 14H11V15H5ZM5 5H7V9H5ZM9 5H11V9H9Z"/><path class="blob-shut" fill="#8a7a2e" fill-rule="evenodd" d="M7 1H9V2H7ZM6 2H10V4H6ZM5 4H11V5H5ZM4 5H12V6H4ZM3 6H13V7H3ZM2 7H14V9H2ZM1 9H15V12H1ZM2 12H14V13H2ZM3 13H13V14H3ZM5 14H11V15H5ZM5 5H7V7H5ZM9 5H11V7H9Z"/></svg>
+      <svg class="hero-bot hero-bot-5" viewBox="0 0 16 16" shape-rendering="crispEdges" aria-hidden="true" focusable="false"><path class="blob-open" fill="#6b7fd7" fill-rule="evenodd" d="M3 3H13V4H3ZM1 4H15V5H1ZM0 5H16V11H0ZM1 11H15V12H1ZM2 12H14V13H2ZM5 5H7V9H5ZM9 5H11V9H9Z"/><path class="blob-shut" fill="#6b7fd7" fill-rule="evenodd" d="M3 3H13V4H3ZM1 4H15V5H1ZM0 5H16V11H0ZM1 11H15V12H1ZM2 12H14V13H2ZM5 5H7V7H5ZM9 5H11V7H9Z"/></svg>
+    </div>
+
+
+    <!-- The hidden half of the H1 is what a screen reader announces and what
+         search engines read, so it carries the same thesis as the tab title. -->
+    <h1 class="hero-title">hivebot<span class="visually-hidden">, the open source Grok Bot. Bots you almost control</span></h1>
+
+    <p class="hero-lede">open source bots that (almost) serve you</p>
+
+    <p class="hero-tagline">
+      hivebots automate your menial work via AI models and build you microapps to manage the outcome, so that you have a false sense of control.
+    </p>
+
+    <div class="install-wrap" id="install">
+      <div class="install-tabs" role="tablist" aria-label="Install options">
+        <button class="install-tab active" id="installTabNpx" type="button" role="tab" aria-selected="true" aria-controls="installBlock">NPX</button>
+        <button class="install-tab" id="installTabBuild" type="button" role="tab" aria-selected="false" aria-controls="installBlockBuild" tabindex="-1">CLONE + BUILD</button>
+      </div>
+      <div class="install-block active" id="installBlock" data-tab="npx" role="tabpanel" aria-labelledby="installTabNpx">
+        <button class="install-line" type="button" data-copy="npx hivebot@latest" aria-label="Copy NPX install command">
+          <span class="install-prompt">$</span>
+          <span class="install-cmd">npx hivebot@latest</span>
+          <span class="install-copy">COPY</span>
+        </button>
+      </div>
+      <div class="install-block" id="installBlockBuild" data-tab="build" role="tabpanel" aria-labelledby="installTabBuild" hidden>
+        <button class="install-line" type="button" data-copy="git clone https://github.com/Northlatch-Labs-LLC/hivebot.git &amp;&amp; cd hivebot" aria-label="Copy clone command">
+          <span class="install-prompt">$</span>
+          <span class="install-cmd">git clone https://github.com/Northlatch-Labs-LLC/hivebot.git &amp;&amp; cd hivebot</span>
+          <span class="install-copy">COPY</span>
+        </button>
+        <button class="install-line" type="button" data-copy="go build -o hivebot ./cmd/hivebot &amp;&amp; ./hivebot" aria-label="Copy build and run command">
+          <span class="install-prompt">$</span>
+          <span class="install-cmd">go build -o hivebot ./cmd/hivebot &amp;&amp; ./hivebot</span>
+          <span class="install-copy">COPY</span>
+        </button>
+      </div>
+      <div class="visually-hidden" id="copyStatus" aria-live="polite" aria-atomic="true"></div>
+      <p class="install-note">Runs on your machine, with your keys. No account, no cloud, no per-seat pricing.</p>
+    </div>
+
+    <div class="hero-ctas">
+      <a href="/download.html" class="btn-primary">
+        <svg viewBox="0 0 16 16" width="12" height="12" fill="currentColor" aria-hidden="true"><path d="M7 1h2v6h3l-4 5-4-5h3V1zM2 13h12v2H2z"/></svg>
+        Download
+      </a>
+      <a href="https://github.com/Northlatch-Labs-LLC/hivebot" class="btn-ghost" target="_blank" rel="noopener">
+        <svg viewBox="0 0 16 16" width="12" height="12" fill="currentColor" style="margin-right:6px" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>
+        GitHub &nbsp;<span id="heroStars">&#9733;</span>
+      </a>
+    </div>
+
+    <div class="hero-badges">
+      <a href="https://news.ycombinator.com/item?id=47899844" target="_blank" rel="noopener noreferrer" class="hn-badge" aria-label="Hacker News Life of Product Week's number 1"><img src="hn-badge.svg" alt="Hacker News Life of Product Week's number 1" width="223" height="48"></a>
+    </div>
+
+  </div>
+</section>
+
+<!-- AMBIENT TICKER -->
+<div class="ambient-strip">
+  <div class="ambient-scroll" id="ticker"></div>
+</div>
+
+<!-- 2. THE ROSTER. Replaces the old computer, office, and teaching sections.
+     Same three jokes, one screen, and it is the only place the real bot
+     marks can carry the point: they are looking at you. -->
+<section id="roster">
+  <div class="section-eyebrow">THE BOTS</div>
+  <h2 class="section-title">They do the boring part.</h2>
+  <p class="section-sub">You find out afterwards, on a dashboard.</p>
+  <p class="section-body">
+    Every bot runs on your machine as its own worker, with a shell, a browser, and a working directory of its own. It uses the tools you allow it, nothing more, and then it does the thing you have been putting off since March.
+  </p>
+
+  <ul class="roster" role="list">
+    <li>
+      <svg class="roster-mark" viewBox="0 0 16 16" shape-rendering="crispEdges" aria-hidden="true" focusable="false"><path class="blob-open" fill="#8b6bb1" fill-rule="evenodd" d="M3 2H6V3H3ZM2 3H7V4H2ZM2 4H14V5H2ZM1 5H15V11H1ZM2 11H14V13H2ZM4 13H12V14H4ZM5 5H7V9H5ZM9 5H11V9H9Z"/><path class="blob-shut" fill="#8b6bb1" fill-rule="evenodd" d="M3 2H6V3H3ZM2 3H7V4H2ZM2 4H14V5H2ZM1 5H15V11H1ZM2 11H14V13H2ZM4 13H12V14H4ZM5 5H7V7H5ZM9 5H11V7H9Z"/></svg>
+      <span class="roster-name">filer</span>
+      <span class="roster-doing">Filed forty-one expense reports overnight. Left you a chart to look at.</span>
+    </li>
+    <li>
+      <svg class="roster-mark" viewBox="0 0 16 16" shape-rendering="crispEdges" aria-hidden="true" focusable="false"><path class="blob-open" fill="#3f9c8f" fill-rule="evenodd" d="M5 1H10V2H5ZM3 2H12V3H3ZM2 3H13V4H2ZM2 4H14V5H2ZM1 5H14V6H1ZM1 6H15V10H1ZM2 10H15V11H2ZM2 11H14V12H2ZM3 12H14V13H3ZM4 13H12V14H4ZM6 14H10V15H6ZM5 5H7V9H5ZM9 5H11V9H9Z"/><path class="blob-shut" fill="#3f9c8f" fill-rule="evenodd" d="M5 1H10V2H5ZM3 2H12V3H3ZM2 3H13V4H2ZM2 4H14V5H2ZM1 5H14V6H1ZM1 6H15V10H1ZM2 10H15V11H2ZM2 11H14V12H2ZM3 12H14V13H3ZM4 13H12V14H4ZM6 14H10V15H6ZM5 5H7V7H5ZM9 5H11V7H9Z"/></svg>
+      <span class="roster-name">reconciler</span>
+      <span class="roster-doing">Matched the invoices against the bank. Two did not agree. Both now do.</span>
+    </li>
+    <li>
+      <svg class="roster-mark" viewBox="0 0 16 16" shape-rendering="crispEdges" aria-hidden="true" focusable="false"><path class="blob-open" fill="#a8546b" fill-rule="evenodd" d="M6 1H10V2H6ZM4 2H12V3H4ZM3 3H13V4H3ZM2 4H14V6H2ZM1 6H15V15H1ZM5 5H7V9H5ZM9 5H11V9H9Z"/><path class="blob-shut" fill="#a8546b" fill-rule="evenodd" d="M6 1H10V2H6ZM4 2H12V3H4ZM3 3H13V4H3ZM2 4H14V6H2ZM1 6H15V15H1ZM5 5H7V7H5ZM9 5H11V7H9Z"/></svg>
+      <span class="roster-name">triager</span>
+      <span class="roster-doing">Triaged your inbox before you woke up. Ninety-three down to four.</span>
+    </li>
+    <li>
+      <svg class="roster-mark" viewBox="0 0 16 16" shape-rendering="crispEdges" aria-hidden="true" focusable="false"><path class="blob-open" fill="#8a7a2e" fill-rule="evenodd" d="M7 1H9V2H7ZM6 2H10V4H6ZM5 4H11V5H5ZM4 5H12V6H4ZM3 6H13V7H3ZM2 7H14V9H2ZM1 9H15V12H1ZM2 12H14V13H2ZM3 13H13V14H3ZM5 14H11V15H5ZM5 5H7V9H5ZM9 5H11V9H9Z"/><path class="blob-shut" fill="#8a7a2e" fill-rule="evenodd" d="M7 1H9V2H7ZM6 2H10V4H6ZM5 4H11V5H5ZM4 5H12V6H4ZM3 6H13V7H3ZM2 7H14V9H2ZM1 9H15V12H1ZM2 12H14V13H2ZM3 13H13V14H3ZM5 14H11V15H5ZM5 5H7V7H5ZM9 5H11V7H9Z"/></svg>
+      <span class="roster-name">scheduler</span>
+      <span class="roster-doing">Booked the six meetings you kept not booking. Invitations are out.</span>
+    </li>
+    <li>
+      <svg class="roster-mark" viewBox="0 0 16 16" shape-rendering="crispEdges" aria-hidden="true" focusable="false"><path class="blob-open" fill="#6b7fd7" fill-rule="evenodd" d="M3 3H13V4H3ZM1 4H15V5H1ZM0 5H16V11H0ZM1 11H15V12H1ZM2 12H14V13H2ZM5 5H7V9H5ZM9 5H11V9H9Z"/><path class="blob-shut" fill="#6b7fd7" fill-rule="evenodd" d="M3 3H13V4H3ZM1 4H15V5H1ZM0 5H16V11H0ZM1 11H15V12H1ZM2 12H14V13H2ZM5 5H7V7H5ZM9 5H11V7H9Z"/></svg>
+      <span class="roster-name">chaser</span>
+      <span class="roster-doing">Chased everyone who owed you a reply. Got four. Still working on Dave.</span>
+    </li>
+    <li>
+      <svg class="roster-mark" viewBox="0 0 16 16" shape-rendering="crispEdges" aria-hidden="true" focusable="false"><path class="blob-open" fill="#c08a3e" fill-rule="evenodd" d="M3 1H13V2H3ZM2 2H14V3H2ZM1 3H15V8H1ZM2 8H14V10H2ZM3 10H13V11H3ZM4 11H12V12H4ZM5 12H11V13H5ZM6 13H10V14H6ZM7 14H9V15H7ZM5 5H7V9H5ZM9 5H11V9H9Z"/><path class="blob-shut" fill="#c08a3e" fill-rule="evenodd" d="M3 1H13V2H3ZM2 2H14V3H2ZM1 3H15V8H1ZM2 8H14V10H2ZM3 10H13V11H3ZM4 11H12V12H4ZM5 12H11V13H5ZM6 13H10V14H6ZM7 14H9V15H7ZM5 5H7V7H5ZM9 5H11V7H9Z"/></svg>
+      <span class="roster-name">tidier</span>
+      <span class="roster-doing">Renamed nine hundred files to the convention you described once, badly.</span>
+    </li>
+  </ul>
+</section>
+
+<!-- 3. MESSAGE IT LIKE A TEAMMATE. One bot, one conversation. The others are
+     consulted off to the side and never walk in. -->
+<section id="message">
+  <div class="section-eyebrow">MICROAPPS</div>
+  <h2 class="section-title">It is already done. <br>Here is an app about it.</h2>
+  <p class="section-body">
+    You talk to one bot at a time. Mention another and yours goes off to consult it rather than dragging it into your conversation. Ask for something menial and it tends to be finished before you have described it properly. Then it builds you a microapp, so there is somewhere to click.
+  </p>
+
+  <div class="dm" role="img" aria-label="A direct message with one bot called filer. You ask it to do the expense reports. It has already filed all forty-one, having consulted two other bots off to the side, and it has built you a small app to review them. Three card charges still need your approval.">
+    <div class="dm-header">
+      <svg class="dm-avatar" viewBox="0 0 16 16" shape-rendering="crispEdges" aria-hidden="true" focusable="false"><path class="blob-open" fill="#8b6bb1" fill-rule="evenodd" d="M3 2H6V3H3ZM2 3H7V4H2ZM2 4H14V5H2ZM1 5H15V11H1ZM2 11H14V13H2ZM4 13H12V14H4ZM5 5H7V9H5ZM9 5H11V9H9Z"/><path class="blob-shut" fill="#8b6bb1" fill-rule="evenodd" d="M3 2H6V3H3ZM2 3H7V4H2ZM2 4H14V5H2ZM1 5H15V11H1ZM2 11H14V13H2ZM4 13H12V14H4ZM5 5H7V7H5ZM9 5H11V7H9Z"/></svg>
+      <span class="dm-header-name">filer</span>
+      <span class="dm-header-kind">direct message</span>
+    </div>
+
+    <div class="dm-log">
+      <div class="dm-row you">
+        <div class="dm-avatar you" aria-hidden="true"></div>
+        <div class="dm-bubble">Can someone do the expense reports?</div>
+      </div>
+
+      <div class="dm-row">
+        <svg class="dm-avatar" viewBox="0 0 16 16" shape-rendering="crispEdges" aria-hidden="true" focusable="false"><path class="blob-open" fill="#8b6bb1" fill-rule="evenodd" d="M3 2H6V3H3ZM2 3H7V4H2ZM2 4H14V5H2ZM1 5H15V11H1ZM2 11H14V13H2ZM4 13H12V14H4ZM5 5H7V9H5ZM9 5H11V9H9Z"/><path class="blob-shut" fill="#8b6bb1" fill-rule="evenodd" d="M3 2H6V3H3ZM2 3H7V4H2ZM2 4H14V5H2ZM1 5H15V11H1ZM2 11H14V13H2ZM4 13H12V14H4ZM5 5H7V7H5ZM9 5H11V7H9Z"/></svg>
+        <div class="dm-bubble">They were filed at 04:12. All forty-one of them.</div>
+      </div>
+
+      <div class="dm-consult">
+        <div class="dm-consult-label">FILER CONSULTED 2 BOTS</div>
+        <div class="dm-consult-row">
+          <svg class="dm-consult-mark" viewBox="0 0 16 16" shape-rendering="crispEdges" aria-hidden="true" focusable="false"><path class="blob-open" fill="#3f9c8f" fill-rule="evenodd" d="M5 1H10V2H5ZM3 2H12V3H3ZM2 3H13V4H2ZM2 4H14V5H2ZM1 5H14V6H1ZM1 6H15V10H1ZM2 10H15V11H2ZM2 11H14V12H2ZM3 12H14V13H3ZM4 13H12V14H4ZM6 14H10V15H6ZM5 5H7V9H5ZM9 5H11V9H9Z"/><path class="blob-shut" fill="#3f9c8f" fill-rule="evenodd" d="M5 1H10V2H5ZM3 2H12V3H3ZM2 3H13V4H2ZM2 4H14V5H2ZM1 5H14V6H1ZM1 6H15V10H1ZM2 10H15V11H2ZM2 11H14V12H2ZM3 12H14V13H3ZM4 13H12V14H4ZM6 14H10V15H6ZM5 5H7V7H5ZM9 5H11V7H9Z"/></svg>
+          <span class="dm-consult-name">reconciler</span>
+          <span class="dm-consult-text">Matched them against the bank. Two did not. Both fixed.</span>
+        </div>
+        <div class="dm-consult-row">
+          <svg class="dm-consult-mark" viewBox="0 0 16 16" shape-rendering="crispEdges" aria-hidden="true" focusable="false"><path class="blob-open" fill="#a8546b" fill-rule="evenodd" d="M6 1H10V2H6ZM4 2H12V3H4ZM3 3H13V4H3ZM2 4H14V6H2ZM1 6H15V15H1ZM5 5H7V9H5ZM9 5H11V9H9Z"/><path class="blob-shut" fill="#a8546b" fill-rule="evenodd" d="M6 1H10V2H6ZM4 2H12V3H4ZM3 3H13V4H3ZM2 4H14V6H2ZM1 6H15V15H1ZM5 5H7V7H5ZM9 5H11V7H9Z"/></svg>
+          <span class="dm-consult-name">triager</span>
+          <span class="dm-consult-text">Pulled the receipts out of your inbox.</span>
+        </div>
+      </div>
+
+      <div class="dm-row">
+        <svg class="dm-avatar" viewBox="0 0 16 16" shape-rendering="crispEdges" aria-hidden="true" focusable="false"><path class="blob-open" fill="#8b6bb1" fill-rule="evenodd" d="M3 2H6V3H3ZM2 3H7V4H2ZM2 4H14V5H2ZM1 5H15V11H1ZM2 11H14V13H2ZM4 13H12V14H4ZM5 5H7V9H5ZM9 5H11V9H9Z"/><path class="blob-shut" fill="#8b6bb1" fill-rule="evenodd" d="M3 2H6V3H3ZM2 3H7V4H2ZM2 4H14V5H2ZM1 5H15V11H1ZM2 11H14V13H2ZM4 13H12V14H4ZM5 5H7V7H5ZM9 5H11V7H9Z"/></svg>
+        <div class="dm-bubble">I built you an app to look through them.</div>
+      </div>
+
+      <!-- The payoff. Deliberately an ordinary little dashboard: the joke only
+           works if it looks like the thing you were hoping for. -->
+      <div class="microapp">
+        <div class="microapp-bar">
+          <span class="microapp-title">Expenses, August</span>
+          <span class="microapp-by">built by filer</span>
+        </div>
+        <div class="microapp-stats">
+          <div class="microapp-stat"><span class="microapp-stat-n">41</span><span class="microapp-stat-l">filed</span></div>
+          <div class="microapp-stat"><span class="microapp-stat-n">2</span><span class="microapp-stat-l">corrected</span></div>
+          <div class="microapp-stat need"><span class="microapp-stat-n">3</span><span class="microapp-stat-l">need you</span></div>
+        </div>
+        <div class="microapp-rows">
+          <div class="microapp-row"><span class="microapp-row-what">Flights, Lisbon</span><span class="microapp-row-state done">filed</span></div>
+          <div class="microapp-row"><span class="microapp-row-what">Hotel, three nights</span><span class="microapp-row-state done">filed</span></div>
+          <div class="microapp-row"><span class="microapp-row-what">Card charge, unrecognised</span><span class="microapp-row-state need">your call</span></div>
+        </div>
+        <div class="microapp-actions">
+          <span class="microapp-btn">APPROVE ALL</span>
+          <span class="microapp-btn ghost">Review 3</span>
+        </div>
+      </div>
+
+      <div class="dm-row you">
+        <div class="dm-avatar you" aria-hidden="true"></div>
+        <div class="dm-bubble">Did I need to approve any of that?</div>
+      </div>
+
+      <div class="dm-row">
+        <svg class="dm-avatar" viewBox="0 0 16 16" shape-rendering="crispEdges" aria-hidden="true" focusable="false"><path class="blob-open" fill="#8b6bb1" fill-rule="evenodd" d="M3 2H6V3H3ZM2 3H7V4H2ZM2 4H14V5H2ZM1 5H15V11H1ZM2 11H14V13H2ZM4 13H12V14H4ZM5 5H7V9H5ZM9 5H11V9H9Z"/><path class="blob-shut" fill="#8b6bb1" fill-rule="evenodd" d="M3 2H6V3H3ZM2 3H7V4H2ZM2 4H14V5H2ZM1 5H15V11H1ZM2 11H14V13H2ZM4 13H12V14H4ZM5 5H7V7H5ZM9 5H11V7H9Z"/></svg>
+        <div class="dm-bubble">The card charges, yes. They are in the app, waiting for you.</div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- 4. TRUST. The honest section. Not a joke, and it says so. -->
+<section id="trust">
+  <div class="section-eyebrow">PERMISSIONS</div>
+  <h2 class="section-title">Trust your bots with less over time.</h2>
+  <p class="section-body">
+    This is the part that is not a joke. A bot with your credentials and a browser is a real risk, and the honest posture is to grant it as little as possible for as long as possible. The defaults below are the actual defaults.
+  </p>
+
+  <div class="trust-card">
+    <div class="trust-label">WHAT IT ACTUALLY DOES</div>
+    <ul class="trust-list" role="list">
+      <li>Runs on your machine, with your keys. There is no hivebot cloud in the path, and no account to create. Point it at a local model and nothing leaves at all.</li>
+      <li>Every send, commit, purchase, and delete is gated behind an approval you have to click. Approval is per action, not a blanket grant, and it does not persist.</li>
+      <li>Each bot works in its own directory with its own tool allowlist, so what a bot can touch is per bot rather than per workspace. Your credentials never leave your machine.</li>
+      <li>Every tool call is written to a local log you can read. If a bot did something, there is a line for it.</li>
+      <li>Permissions shrink by default. A grant you stop using expires rather than accumulating quietly.</li>
+    </ul>
+  </div>
+</section>
+
+<!-- 5. THE OPEN SOURCE GROK BOT. Category anchor for search: one definition,
+     one honest table, one link to the full comparison page. -->
+<section id="grok-bot">
+  <div class="section-eyebrow">OPEN SOURCE GROK BOT</div>
+  <h2 class="section-title">The open source Grok Bot.</h2>
+  <p class="section-body">
+    hivebot is an open source Grok Bot: a team of always-on AI bots that runs on your own machine instead of a vendor's cloud. It is free, it uses the coding bot you already pay for (Claude Code, Codex, or a local model), every external action waits for your approval, and it builds you a microapp so you have something to look at.
+  </p>
+  <div class="compare-wrap">
+    <table class="compare">
+      <caption class="visually-hidden">hivebot compared with Grok Bot</caption>
+      <thead>
+        <tr><th scope="col"></th><th scope="col">GROK BOT (xAI)</th><th scope="col">GAWKBOT</th></tr>
+      </thead>
+      <tbody>
+        <tr><th scope="row">Price</th><td>Bundled with SuperGrok and Cursor paid plans</td><td>Free. No account, no seats, no usage fees</td></tr>
+        <tr><th scope="row">Source</th><td>Closed</td><td>Public, MIT License</td></tr>
+        <tr><th scope="row">Runs on</th><td>xAI's cloud</td><td>Your machine, with your keys</td></tr>
+        <tr><th scope="row">Models</th><td>Grok, chosen for you</td><td>Claude Code, Codex, Opencode, local models, Hermes, OpenClaw</td></tr>
+        <tr><th scope="row">Approvals</th><td>Bots act on your accounts around the clock</td><td>Every send, commit, purchase, and delete waits for your click</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <a class="compare-more" href="/open-source-grok-bot.html">READ THE FULL GAWKBOT VS GROK BOT COMPARISON &rarr;</a>
+  <p class="compare-updated">Last updated 1 September 2026. If a row is wrong, <a href="https://github.com/Northlatch-Labs-LLC/hivebot/issues">file an issue</a> and it gets fixed.</p>
+</section>
+
+<!-- 6. PRICE. The punchline. -->
+<section id="price">
+  <div class="section-eyebrow">PRICE</div>
+  <div class="price-block">
+    <p class="price-headline">Free.</p>
+    <p class="price-sub">The work has already started.</p>
+  </div>
+  <p class="price-terms">
+    Source-available under the MIT License. Free to run and free to self-host, for your own internal business purposes and for non-commercial use. You can read it, modify it, and distribute your changes. The licence does not let you sell hivebot itself as a hosted product. There are no seats, no usage fees, and no plan to add them.
+  </p>
+  <div class="price-cta">
+    <a class="btn-primary" href="https://github.com/Northlatch-Labs-LLC/hivebot" target="_blank" rel="noopener">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0 0 24 12c0-6.63-5.37-12-12-12z"/></svg>
+      Read the source
+    </a>
+    <a class="btn-ghost" href="/download.html">Download</a>
+  </div>
+</section>
+
+</main>
+
+<!-- 7. FOOTER -->
+<footer>
+  <div class="footer-top">
+    <div>
+      <div class="footer-logo">
+        <svg class="hivebot-mark footer-mark" viewBox="0 0 11 15" shape-rendering="crispEdges" aria-hidden="true"><g class="hivebot-eyes" fill="currentColor"><rect x="1" y="1" width="2" height="1"/><rect x="0" y="2" width="1" height="11"/><rect x="3" y="2" width="1" height="11"/><rect x="1" y="13" width="2" height="1"/><rect x="8" y="1" width="2" height="1"/><rect x="7" y="2" width="1" height="11"/><rect x="10" y="2" width="1" height="11"/><rect x="8" y="13" width="2" height="1"/></g></svg>
+        <span>hivebot</span>
+      </div>
+      <div class="footer-sub">The bots are working. You have the dashboard open.</div>
+    </div>
+    <div class="footer-links">
+      <a href="https://github.com/Northlatch-Labs-LLC/hivebot">GitHub</a>
+      <a href="https://github.com/Northlatch-Labs-LLC/hivebot#readme" target="_blank" rel="noopener">Docs</a>
+      <a href="/download.html">Download</a>
+      <a href="/open-source-grok-bot.html">Open source Grok Bot</a>
+      <a href="https://github.com/Northlatch-Labs-LLC/hivebot/blob/main/LICENSE" target="_blank" rel="noopener">Licence</a>
+    </div>
+  </div>
+  <p class="footer-legal">hivebot is an independent, source-available project. It is a parody. It is not affiliated with, endorsed by, or sponsored by xAI, SpaceXAI, X Corp, or Cursor. Grok and Grok Bot are trademarks of their respective owners.</p>
+</footer>
+
+<script>
+(function () {
+  'use strict';
+
+  // ── PAGE VISIBILITY. Marquee and eyes idle when the tab is hidden. ──
+  function updatePageMotionClass() {
+    document.body.classList.toggle('is-page-hidden', document.hidden);
+  }
+  updatePageMotionClass();
+  document.addEventListener('visibilitychange', updatePageMotionClass);
+
+  // ── TICKER ──────────────────────────────────────────────────────────
+  // Every line here is the same joke from a different angle: the work is
+  // finished and the human is looking at a screen about it. The bots are
+  // never the butt of it. They are competent; that is the premise.
+  var quotes = [
+    'Your expense reports were filed at 04:12. There is a chart about it.',
+    'The backlog was cleared overnight. You have a dashboard to look at.',
+    'Approval required. The work is finished. It is waiting for you to click.',
+    'Forty-one invoices reconciled. You get a green tick and a filter.',
+    'It renamed nine hundred files while you slept. The progress bar is already full.',
+    'The migration ran at three in the morning. You were sent a summary.',
+    'Your inbox was triaged before you woke up. Ninety-three down to four.',
+    'It finished the task, then built you somewhere to watch it be finished.',
+    'The models did the boring part. You get the pleasant feeling of being in charge.',
+    'Standup notes written, circulated, and filed. You have a toggle.',
+    'Nothing needs your attention. There is a screen for it anyway.',
+    'It built you an app to manage the thing it had already done.'
+  ];
+  var ticker = document.getElementById('ticker');
+  if (ticker) {
+    quotes.concat(quotes).forEach(function (q) {
+      var span = document.createElement('span');
+      span.className = 'ambient-item';
+      span.textContent = '▶ ' + q;
+      ticker.appendChild(span);
+    });
+  }
+
+  // ── GITHUB STARS ────────────────────────────────────────────────────
+  function renderStars(n) {
+    var text = '★ ' + (n >= 1000 ? (n / 1000).toFixed(1) + 'k' : String(n));
+    ['navStars', 'heroStars'].forEach(function (id) {
+      var el = document.getElementById(id);
+      if (el) el.textContent = text;
+    });
+  }
+  fetch('https://api.github.com/repos/Northlatch-Labs-LLC/hivebot')
+    .then(function (r) { return r.ok ? r.json() : null; })
+    .then(function (d) {
+      if (d && typeof d.stargazers_count === 'number') renderStars(d.stargazers_count);
+    })
+    .catch(function () { /* the badge already reads as a star on its own */ });
+
+  // ── INSTALL TABS ────────────────────────────────────────────────────
+  var tabs = [
+    { tab: document.getElementById('installTabNpx'), panel: document.getElementById('installBlock') },
+    { tab: document.getElementById('installTabBuild'), panel: document.getElementById('installBlockBuild') }
+  ];
+  function selectTab(index) {
+    tabs.forEach(function (t, i) {
+      var on = i === index;
+      if (!t.tab || !t.panel) return;
+      t.tab.classList.toggle('active', on);
+      t.tab.setAttribute('aria-selected', String(on));
+      t.tab.tabIndex = on ? 0 : -1;
+      t.panel.classList.toggle('active', on);
+      t.panel.hidden = !on;
+    });
+  }
+  tabs.forEach(function (t, i) {
+    if (!t.tab) return;
+    t.tab.addEventListener('click', function () { selectTab(i); });
+    t.tab.addEventListener('keydown', function (e) {
+      if (e.key !== 'ArrowRight' && e.key !== 'ArrowLeft') return;
+      e.preventDefault();
+      var next = (i + (e.key === 'ArrowRight' ? 1 : tabs.length - 1)) % tabs.length;
+      selectTab(next);
+      if (tabs[next].tab) tabs[next].tab.focus();
+    });
+  });
+
+  // ── COPY ────────────────────────────────────────────────────────────
+  var status = document.getElementById('copyStatus');
+  document.querySelectorAll('.install-line').forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      var text = btn.getAttribute('data-copy') || '';
+      var label = btn.querySelector('.install-copy');
+      function done(ok) {
+        if (label) {
+          label.textContent = ok ? 'COPIED' : 'PRESS CTRL C';
+          label.classList.toggle('copied', ok);
+          setTimeout(function () {
+            label.textContent = 'COPY';
+            label.classList.remove('copied');
+          }, 1600);
+        }
+        if (status) status.textContent = ok ? 'Copied ' + text : 'Copy failed. Select the command and copy it manually.';
+      }
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(function () { done(true); }, function () { done(false); });
+      } else {
+        done(false);
+      }
+    });
+  });
+})();
+</script>
+
+</body>
+</html>

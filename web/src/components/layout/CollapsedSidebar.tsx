@@ -1,0 +1,353 @@
+import {
+  type ComponentType,
+  type MouseEvent,
+  useEffect,
+  useRef,
+  useState,
+} from "react";
+import { createPortal } from "react-dom";
+import { useQuery } from "@tanstack/react-query";
+import {
+  Activity,
+  BookStack,
+  ChatBubble,
+  CheckCircle,
+  ClipboardCheck,
+  Flash,
+  Group,
+  Package,
+  Play,
+  Repeat,
+  Search,
+  Settings as SettingsIcon,
+  ShareAndroid,
+  Shield,
+  SidebarExpand,
+  TaskList,
+} from "iconoir-react";
+
+import { getUsage } from "../../api/platform";
+import { useOfficeStats } from "../../hooks/useOfficeStats";
+import { formatTokens, formatUSD } from "../../lib/format";
+import { navigateToSidebarApp } from "../../lib/sidebarNav";
+import {
+  SIDEBAR_TOOLS,
+  WIKI_SURFACE_APP_IDS,
+} from "../../routes/routeRegistry";
+import { useCurrentApp } from "../../routes/useCurrentRoute";
+import { useAppStore } from "../../stores/app";
+import { BotList } from "../sidebar/BotList";
+import { ChannelList } from "../sidebar/ChannelList";
+
+const WIKI_SURFACE_APPS = new Set<string>(WIKI_SURFACE_APP_IDS);
+
+const APP_ICONS: Record<string, ComponentType<{ className?: string }>> = {
+  studio: Play,
+  issues: ClipboardCheck,
+  wiki: BookStack,
+  tasks: CheckCircle,
+  requests: TaskList,
+  graph: ShareAndroid,
+  policies: Shield,
+  routines: Repeat,
+  skills: Flash,
+  activity: Package,
+  "health-check": Search,
+  settings: SettingsIcon,
+};
+
+type Popover = "team" | "channels" | "usage" | null;
+type HintState = { label: string; y: number } | null;
+
+// biome-ignore lint/complexity/noExcessiveCognitiveComplexity: Existing cognitive complexity is baselined for a focused follow-up refactor.
+export function CollapsedSidebar({ onExpand }: { onExpand?: () => void }) {
+  const toggleCollapsed = useAppStore((s) => s.toggleSidebarCollapsed);
+  const expand = onExpand ?? toggleCollapsed;
+  const currentApp = useCurrentApp();
+  // Tasks is the primary surface and carries the attention roll-up; the
+  // collapsed rail has no room for a number, so show a dot when > 0.
+  const { data: officeStats } = useOfficeStats();
+  const attentionCount = officeStats?.inbox_attention ?? 0;
+  const [popover, setPopover] = useState<Popover>(null);
+  const [hint, setHint] = useState<HintState>(null);
+  const popoverRef = useRef<HTMLDivElement>(null);
+  const closeTimer = useRef<number | null>(null);
+
+  function openPopover(p: Popover) {
+    if (closeTimer.current) {
+      window.clearTimeout(closeTimer.current);
+      closeTimer.current = null;
+    }
+    setHint(null);
+    setPopover(p);
+  }
+  function scheduleClose() {
+    if (closeTimer.current) window.clearTimeout(closeTimer.current);
+    closeTimer.current = window.setTimeout(() => setPopover(null), 120);
+  }
+  function showHint(e: MouseEvent<HTMLElement>, label: string) {
+    const r = e.currentTarget.getBoundingClientRect();
+    setHint({ label, y: r.top + r.height / 2 });
+  }
+  function hideHint() {
+    setHint(null);
+  }
+
+  useEffect(() => {
+    function onKey(e: KeyboardEvent) {
+      if (e.key === "Escape") {
+        setPopover(null);
+        setHint(null);
+      }
+    }
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (closeTimer.current) {
+        window.clearTimeout(closeTimer.current);
+        closeTimer.current = null;
+      }
+    };
+  }, []);
+
+  return (
+    <>
+      <div className="sidebar-rail-top">
+        <button
+          type="button"
+          className="sidebar-icon-btn"
+          aria-label="Expand sidebar"
+          onClick={expand}
+          onMouseEnter={(e) => showHint(e, "Expand sidebar")}
+          onMouseLeave={hideHint}
+        >
+          <SidebarExpand />
+        </button>
+        <button
+          type="button"
+          className={`sidebar-icon-btn${currentApp === "settings" ? " active" : ""}`}
+          aria-label="Settings"
+          onClick={() => navigateToSidebarApp("settings")}
+          onMouseEnter={(e) => showHint(e, "Settings")}
+          onMouseLeave={hideHint}
+        >
+          <SettingsIcon />
+        </button>
+      </div>
+
+      <div className="sidebar-rail-middle">
+        <button
+          type="button"
+          className={`sidebar-icon-btn${popover === "team" ? " is-open" : ""}`}
+          aria-label="Bots"
+          aria-haspopup="dialog"
+          aria-expanded={popover === "team"}
+          onMouseEnter={() => openPopover("team")}
+          onMouseLeave={scheduleClose}
+          onFocus={() => openPopover("team")}
+          onBlur={scheduleClose}
+        >
+          <Group />
+        </button>
+        <button
+          type="button"
+          className={`sidebar-icon-btn${popover === "channels" ? " is-open" : ""}`}
+          aria-label="Channels"
+          aria-haspopup="dialog"
+          aria-expanded={popover === "channels"}
+          onMouseEnter={() => openPopover("channels")}
+          onMouseLeave={scheduleClose}
+          onFocus={() => openPopover("channels")}
+          onBlur={scheduleClose}
+        >
+          <ChatBubble />
+        </button>
+      </div>
+
+      <div className="sidebar-rail-apps">
+        {SIDEBAR_TOOLS.filter((t) => t.id !== "settings").map((tool) => {
+          const Icon = APP_ICONS[tool.id];
+          // Wiki entry lights up for the wiki, notebooks, and reviews surfaces
+          // since those three share the Wiki app shell via tabs.
+          const isActive =
+            tool.id === "wiki"
+              ? WIKI_SURFACE_APPS.has(currentApp ?? "")
+              : currentApp === tool.id;
+          const showAttentionDot = tool.id === "tasks" && attentionCount > 0;
+          return (
+            <button
+              key={tool.id}
+              type="button"
+              className={`sidebar-icon-btn${isActive ? " active" : ""}`}
+              aria-label={
+                showAttentionDot
+                  ? `${tool.label} (${attentionCount} need attention)`
+                  : tool.label
+              }
+              onClick={() => navigateToSidebarApp(tool.id)}
+              onMouseEnter={(e) => showHint(e, tool.label)}
+              onMouseLeave={hideHint}
+            >
+              {Icon ? (
+                <Icon />
+              ) : (
+                <span className="sidebar-item-emoji">{tool.icon}</span>
+              )}
+              {showAttentionDot ? (
+                <span className="sidebar-rail-dot" aria-hidden="true" />
+              ) : null}
+            </button>
+          );
+        })}
+      </div>
+
+      <UsageRail
+        onEnter={() => openPopover("usage")}
+        onLeave={scheduleClose}
+        active={popover === "usage"}
+      />
+
+      {popover
+        ? createPortal(
+            <div
+              ref={popoverRef}
+              className={`sidebar-rail-popover sidebar-rail-popover-${popover}`}
+              role="dialog"
+              onMouseEnter={() => openPopover(popover)}
+              onMouseLeave={scheduleClose}
+            >
+              <div className="sidebar-rail-popover-title">
+                {popover === "team"
+                  ? "Bots"
+                  : popover === "channels"
+                    ? "Channels"
+                    : "Usage"}
+              </div>
+              <div className="sidebar-rail-popover-body">
+                {popover === "team" ? <BotList /> : null}
+                {popover === "channels" ? <ChannelList /> : null}
+                {popover === "usage" ? <UsageBody /> : null}
+              </div>
+            </div>,
+            document.body,
+          )
+        : null}
+
+      {hint
+        ? createPortal(
+            <div
+              className="sidebar-rail-hint"
+              style={{ top: hint.y }}
+              role="tooltip"
+            >
+              {hint.label}
+            </div>,
+            document.body,
+          )
+        : null}
+    </>
+  );
+}
+
+function formatCompactUSD(v: number): string {
+  if (v >= 1000) return `$${(v / 1000).toFixed(1)}k`;
+  if (v >= 100) return `$${v.toFixed(0)}`;
+  if (v >= 10) return `$${v.toFixed(1)}`;
+  return `$${v.toFixed(2)}`;
+}
+
+function UsageRail({
+  onEnter,
+  onLeave,
+  active,
+}: {
+  onEnter: () => void;
+  onLeave: () => void;
+  active: boolean;
+}) {
+  const { data: usage } = useQuery({
+    queryKey: ["usage"],
+    queryFn: () => getUsage(),
+    refetchInterval: 30_000,
+  });
+  const totalCost = usage?.total?.cost_usd ?? 0;
+  return (
+    <button
+      type="button"
+      className={`sidebar-rail-bottom${active ? " is-open" : ""}`}
+      aria-label={`Usage ${formatUSD(totalCost)}`}
+      aria-haspopup="dialog"
+      aria-expanded={active}
+      onMouseEnter={onEnter}
+      onMouseLeave={onLeave}
+      onFocus={onEnter}
+      onBlur={onLeave}
+      title={`Usage ${formatUSD(totalCost)}`}
+    >
+      <Activity className="sidebar-rail-usage-icon" />
+      <span className="sidebar-rail-usage-value">
+        {formatCompactUSD(totalCost)}
+      </span>
+    </button>
+  );
+}
+
+function UsageBody() {
+  const { data: usage } = useQuery({
+    queryKey: ["usage"],
+    queryFn: () => getUsage(),
+    refetchInterval: 5000,
+  });
+  const totalCost = usage?.total?.cost_usd ?? 0;
+  const agents = usage?.agents ?? {};
+  const slugs = Object.keys(agents).sort();
+  if (slugs.length === 0 && totalCost === 0) {
+    return (
+      <p
+        style={{
+          fontSize: 11,
+          color: "var(--text-tertiary)",
+          padding: "8px 14px",
+        }}
+      >
+        No usage recorded yet.
+      </p>
+    );
+  }
+  return (
+    <div className="sidebar-rail-usage-panel">
+      <table className="usage-table">
+        <thead>
+          <tr>
+            {["Bot", "In", "Out", "Cache", "Cost"].map((h) => (
+              <th key={h}>{h}</th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {slugs.map((slug) => {
+            const a = agents[slug];
+            return (
+              <tr key={slug}>
+                <td>{slug}</td>
+                <td>{formatTokens(a.input_tokens)}</td>
+                <td>{formatTokens(a.output_tokens)}</td>
+                <td>{formatTokens(a.cache_read_tokens)}</td>
+                <td>{formatUSD(a.cost_usd)}</td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+      <div className="usage-total">
+        <span>
+          Session: {formatTokens(usage?.session?.total_tokens ?? 0)} tokens
+        </span>
+        <span className="usage-total-cost">{formatUSD(totalCost)}</span>
+      </div>
+    </div>
+  );
+}

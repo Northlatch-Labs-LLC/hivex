@@ -1,0 +1,37 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+<title>Hivex — Agentic Orchestration Harness</title>
+<defs>
+  <linearGradient id="gHex" x1="0" y1="0" x2="1" y2="1">
+    <stop offset="0" stop-color="#FFD44F"/>
+    <stop offset="1" stop-color="#FF8A1E"/>
+  </linearGradient>
+  <linearGradient id="gX" x1="0" y1="0" x2="1" y2="1">
+    <stop offset="0" stop-color="#FFDF7E"/>
+    <stop offset="1" stop-color="#FF9330"/>
+  </linearGradient>
+  <radialGradient id="gHalo">
+    <stop offset="0" stop-color="#FFBE4D" stop-opacity="0.4"/>
+    <stop offset="1" stop-color="#FFBE4D" stop-opacity="0"/>
+  </radialGradient>
+</defs>
+  <path d="M461 256 L358.5 433.54 L153.5 433.54 L51 256 L153.5 78.46 L358.5 78.46 Z" fill="none" stroke="#FFB556" stroke-opacity="0.07" stroke-width="3"/>
+  <path d="M256 108 L384.17 182 L384.17 330 L256 404 L127.83 330 L127.83 182 Z" fill="none" stroke="#FF9E2E" stroke-opacity="0.1" stroke-width="30" stroke-linejoin="round"/>
+  <path d="M256 108 L384.17 182 L384.17 330 L256 404 L127.83 330 L127.83 182 Z" fill="none" stroke="url(#gHex)" stroke-width="14" stroke-linejoin="round"/>
+  <path d="M256 138 L256 374" stroke="#FFC168" stroke-opacity="0.5" stroke-width="9" stroke-linecap="round"/>
+  <path d="M153.81 197 L358.19 315 M358.19 197 L153.81 315" stroke="#FFAE3D" stroke-opacity="0.12" stroke-width="36" stroke-linecap="round" fill="none"/>
+  <path d="M153.81 197 L358.19 315 M358.19 197 L153.81 315" stroke="url(#gX)" stroke-width="18" stroke-linecap="round" fill="none"/>
+  <circle cx="358.19" cy="315" r="15" fill="url(#gHex)"/>
+  <circle cx="153.81" cy="315" r="15" fill="url(#gHex)"/>
+  <circle cx="153.81" cy="197" r="15" fill="url(#gHex)"/>
+  <circle cx="358.19" cy="197" r="15" fill="url(#gHex)"/>
+  <circle cx="256" cy="138" r="11" fill="none" stroke="#FFC168" stroke-width="5"/>
+  <circle cx="256" cy="374" r="11" fill="none" stroke="#FFC168" stroke-width="5"/>
+  <circle cx="312.21" cy="288.45" r="5" fill="#FFF0CB" stroke="none" opacity="0.95"/>
+  <circle cx="199.79" cy="288.45" r="5" fill="#FFF0CB" stroke="none" opacity="0.95"/>
+  <circle cx="199.79" cy="223.55" r="5" fill="#FFF0CB" stroke="none" opacity="0.95"/>
+  <circle cx="312.21" cy="223.55" r="5" fill="#FFF0CB" stroke="none" opacity="0.95"/>
+  <circle cx="256" cy="256" r="70" fill="url(#gHalo)"/>
+  <circle cx="256" cy="256" r="32" fill="none" stroke="#FFD98A" stroke-width="5"/>
+  <circle cx="256" cy="256" r="18" fill="url(#gX)"/>
+  <circle cx="256" cy="256" r="8.5" fill="#FFF3D8"/>
+</svg>

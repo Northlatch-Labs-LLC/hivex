@@ -1,0 +1,54 @@
+import "@testing-library/jest-dom/vitest";
+import { vi } from "vitest";
+
+// Node 25+ exposes a built-in `globalThis.localStorage` with no real Storage
+// API (empty object prototype). happy-dom's window.localStorage then gets
+// shadowed, breaking `setItem`/`getItem`/`clear`. Install a tiny in-memory
+// Storage polyfill for tests so draft-autosave logic can be exercised
+// deterministically.
+function createMemoryStorage(): Storage {
+  const data: Record<string, string | undefined> = Object.create(null);
+  const storage: Storage = {
+    get length() {
+      return Object.keys(data).length;
+    },
+    clear: () => {
+      for (const k of Object.keys(data)) delete data[k];
+    },
+    getItem: (key: string) => data[key] ?? null,
+    key: (index: number) => Object.keys(data)[index] ?? null,
+    removeItem: (key: string) => {
+      delete data[key];
+    },
+    setItem: (key: string, value: string) => {
+      data[key] = String(value);
+    },
+  };
+  return storage;
+}
+
+const memoryStorage = createMemoryStorage();
+// Override on window AND globalThis so both lookup paths see the same store.
+Object.defineProperty(window, "localStorage", {
+  configurable: true,
+  value: memoryStorage,
+});
+Object.defineProperty(globalThis, "localStorage", {
+  configurable: true,
+  value: memoryStorage,
+});
+
+vi.stubGlobal(
+  "fetch",
+  vi.fn(async () => {
+    throw new Error("Unexpected fetch in test environment");
+  }),
+);
+
+// Disable EventSource in tests. happy-dom ships an EventSource, but the
+// hot-loop reconnect logic keeps the vitest worker alive past test
+// teardown (no server is listening on the SSE URL), which manifested as
+// "Worker exited unexpectedly" after the suite ran the wall-clock to
+// minutes. Components that open SSE check for `EventSource` and bail
+// when it's undefined.
+vi.stubGlobal("EventSource", undefined);

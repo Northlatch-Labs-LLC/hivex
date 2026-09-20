@@ -1,0 +1,141 @@
+package team
+
+// broker_lifecycle_test.go covers build-time gate #3 (forward map) of the
+// Lane A success criteria: sweep all canonical LifecycleState values
+// and assert the derived (pipelineStage, reviewState, status, blocked)
+// tuple matches the lifecycleDerivedFields table for each one.
+//
+// This test guards against silent drift between the documented forward
+// map (in the design doc) and the implementation (in
+// broker_lifecycle_transition.go). If a contributor edits one but not
+// the other, this test fails loudly before the change can ship.
+
+import (
+	"testing"
+)
+
+func TestLifecycleForwardMapAllStates(t *testing.T) {
+	// Acceptance: every canonical LifecycleState produces a deterministic,
+	// documented (pipelineStage, reviewState, status, blocked) tuple when
+	// applied to a freshly created task. Anything not in the table is a
+	// failure surface; the migration shim is tested separately.
+	cases := []struct {
+		state         LifecycleState
+		pipelineStage string
+		reviewState   string
+		status        string
+		blocked       bool
+	}{
+		// Phase 3 — Drafting: pre-Intake mode where bots comment but cannot
+		// dispatch. PipelineStage="draft" matches the spec's draft phase name.
+		// Status="open" keeps it visible in the open-tasks view. Blocked=false.
+		{LifecycleStateDrafting, "draft", "pending_review", "open", false},
+		{LifecycleStateIntake, "triage", "pending_review", "open", false},
+		{LifecycleStateReady, "triage", "pending_review", "open", false},
+		{LifecycleStatePlanning, "plan", "pending_review", "in_progress", false},
+		{LifecycleStateRunning, "implement", "pending_review", "in_progress", false},
+		{LifecycleStateReview, "review", "ready_for_review", "in_progress", false},
+		{LifecycleStateDecision, "review", "ready_for_review", "in_progress", false},
+		// Documented deviation from the design doc: status="blocked"
+		// instead of "in_progress" to preserve the pre-Lane-A contract
+		// that ~10 broker code paths read. See lifecycleDerivedFields
+		// comment for full rationale.
+		{LifecycleStateBlocked, "review", "ready_for_review", "blocked", true},
+		{LifecycleStateQueuedBehindOwner, "triage", "pending_review", "open", true},
+		{LifecycleStateChangesRequested, "implement", "pending_review", "in_progress", false},
+		{LifecycleStateApproved, "ship", "approved", "done", false},
+		// Rejected: terminal, blocked=true so unblockDependentsLocked
+		// treats the upstream as unresolved; reviewState="rejected"
+		// is the durable filter signal in the inbox.
+		{LifecycleStateRejected, "review", "rejected", "rejected", true},
+		// Archived: terminal, off-board. Blocked=false (not waiting on
+		// anything), ReviewState="approved" (clean terminal).
+		{LifecycleStateArchived, "archived", "approved", "archived", false},
+	}
+
+	// The canonical state list and the forward-map must agree on which
+	// states exist; if the forward-map grows we want the test sweep to
+	// surface the new state immediately.
+	if got, want := len(CanonicalLifecycleStates()), len(cases); got != want {
+		t.Fatalf("canonical state count: got %d, want %d (test cases out of sync with implementation)", got, want)
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(string(tc.state), func(t *testing.T) {
+			b := newTestBroker(t)
+			b.mu.Lock()
+			b.tasks = []teamTask{{ID: "task-fwd", LifecycleState: LifecycleStateIntake}}
+			task, err := b.transitionLifecycleLocked("task-fwd", tc.state, "test forward map")
+			b.mu.Unlock()
+			if err != nil {
+				t.Fatalf("transitionLifecycleLocked(%s): %v", tc.state, err)
+			}
+			if task.LifecycleState != tc.state {
+				t.Fatalf("LifecycleState: got %q, want %q", task.LifecycleState, tc.state)
+			}
+			if task.pipelineStage != tc.pipelineStage {
+				t.Fatalf("pipelineStage: got %q, want %q", task.pipelineStage, tc.pipelineStage)
+			}
+			if task.reviewState != tc.reviewState {
+				t.Fatalf("reviewState: got %q, want %q", task.reviewState, tc.reviewState)
+			}
+			if task.status != tc.status {
+				t.Fatalf("status: got %q, want %q", task.status, tc.status)
+			}
+			if task.blocked != tc.blocked {
+				t.Fatalf("blocked: got %v, want %v", task.blocked, tc.blocked)
+			}
+		})
+	}
+}
+
+func TestLifecycleTransitionRejectsNonCanonicalState(t *testing.T) {
+	// Acceptance: passing a non-canonical state (e.g. "garbage" or the
+	// migration fallback "unknown") to the transition layer must error
+	// instead of silently writing junk into the inbox index. This is the
+	// build-time guarantee that no bot or future event handler can
+	// stamp a task into a state that has no forward-map row.
+	b := newTestBroker(t)
+	b.mu.Lock()
+	b.tasks = []teamTask{{ID: "task-bad", LifecycleState: LifecycleStateRunning}}
+	_, err := b.transitionLifecycleLocked("task-bad", LifecycleState("garbage"), "")
+	b.mu.Unlock()
+	if err == nil {
+		t.Fatal("expected error for non-canonical state, got nil")
+	}
+
+	b.mu.Lock()
+	_, err = b.transitionLifecycleLocked("task-bad", LifecycleStateUnknown, "")
+	b.mu.Unlock()
+	if err == nil {
+		t.Fatal("expected error for LifecycleStateUnknown (it is the migration fallback, not a valid target), got nil")
+	}
+}
+
+// ── Parked tasks raise no start-ceremony notice ──────────────────────────
+
+// The Approve & Start ceremony is retired: entering drafting (now the
+// explicit "parked" state) must raise NO Inbox notice — there is no
+// activation button to hint at, and a deliberate park needs no nag.
+// Regression guard for the removed awaiting-start notice flow.
+func TestParkedEntryRaisesNoInboxNotice(t *testing.T) {
+	b := newTestBroker(t)
+
+	b.mu.Lock()
+	b.tasks = []teamTask{{ID: "OFFICE-7", TaskType: "issue", Owner: "cos", Channel: "team"}}
+	_, err := b.transitionLifecycleLocked("OFFICE-7", LifecycleStateDrafting, "composer park")
+	b.mu.Unlock()
+	if err != nil {
+		t.Fatalf("transition to drafting: %v", err)
+	}
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for i := range b.requests {
+		if b.requests[i].IssueID == "OFFICE-7" {
+			t.Fatalf("parking must raise no inbox request, found kind=%q title=%q",
+				b.requests[i].Kind, b.requests[i].Title)
+		}
+	}
+}

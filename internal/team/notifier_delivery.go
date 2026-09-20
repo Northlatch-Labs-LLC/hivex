@@ -1,0 +1,452 @@
+package team
+
+// notifier_delivery.go owns the actual notification delivery path
+// (PLAN.md §C11): once notifier_targets.go has decided who should
+// be notified, the methods here build the work packet, route it
+// through the headless queue or pane dispatch, and post the
+// follow-up channel update. Also hosts the notification-context
+// builder thin-wrappers (buildNotificationContext et al.) that
+// delegate to notifyCtx() (PLAN.md §C3).
+
+import (
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/Northlatch-Labs-LLC/hivex/internal/onboarding"
+)
+
+// Notification debounce cooldowns. Prevents bot-to-bot feedback
+// loops where one bot's response triggers another bot which
+// triggers a third, ad infinitum. Human/CEO messages get the shorter
+// cooldown so the user-facing pace stays snappy; bot-originated
+// messages get the longer cooldown to break loops at their source.
+const (
+	botNotifyCooldown    = 1 * time.Second
+	botNotifyCooldownBot = 2 * time.Second
+)
+
+// notifyDedupKey is the composite key the dedup map uses. Struct-keyed
+// so a slug or sender containing the previous "\x00" separator can
+// never collide; Go's map runtime hashes structs as cheaply as
+// strings for this size.
+type notifyDedupKey struct {
+	slug    string
+	sender  string
+	channel string
+}
+
+func (l *Launcher) deliverMessageNotification(msg channelMessage) {
+	// Phase 2 onboarding is fully deterministic — the broker emits CEO
+	// cards from ceoDeterministicMessages and the user replies via the
+	// structured-card POST handlers. The CEO bot must NOT fire an LLM
+	// run in response, or the user sees a spurious "Chief of Staff is typing…"
+	// stream and the deterministic flow stalls behind a Claude turn that
+	// has nothing to add. (Spec: docs/specs/onboarding-into-office.md
+	// "zero LLM tokens in Phase 2".) Gate on (CEO DM channel + onboarding
+	// phase is deterministic) so other channels and the post-onboarding
+	// CEO DM keep their normal headless behaviour.
+	if isDeterministicPhase2CEODM(msg.Channel) {
+		return
+	}
+	immediate, delayed := l.notificationTargetsForMessage(msg)
+
+	// Debounce: use shorter cooldown for human/CEO messages, longer for bot-originated
+	// to prevent bot-to-bot feedback loops (devil's advocate finding #3).
+	//
+	// The dedup key is (recipient slug, sender, channel) — recipient-
+	// only would silently drop an unrelated message that arrives within
+	// the cooldown window from a different sender or in a different
+	// channel. Per-(recipient, sender, channel) keeps the loop-breaker
+	// behaviour while letting genuinely unrelated traffic through.
+	isHumanOrCEO := isHumanMessageSender(msg.From) || msg.From == "hive" || msg.From == l.targeter().LeadSlug()
+	cooldown := botNotifyCooldownBot
+	if isHumanOrCEO {
+		cooldown = botNotifyCooldown
+	}
+	now := time.Now()
+	filtered := make([]notificationTarget, 0, len(immediate))
+	channelKey := normalizeChannelSlug(msg.Channel)
+	l.notifyMu.Lock()
+	if l.notifyLastDelivered == nil {
+		l.notifyLastDelivered = make(map[notifyDedupKey]time.Time)
+	}
+	// Opportunistic purge: drop entries older than 2× the longer
+	// cooldown (still well past any legitimate dedup window) so the
+	// map can't grow unbounded over a long-running session. The
+	// (slug, sender, channel) key shape grows O(slugs × senders ×
+	// channels) which is bounded but not small.
+	purgeBefore := now.Add(-2 * botNotifyCooldownBot)
+	for k, t := range l.notifyLastDelivered {
+		if t.Before(purgeBefore) {
+			delete(l.notifyLastDelivered, k)
+		}
+	}
+	for _, t := range immediate {
+		key := notifyDedupKey{slug: t.Slug, sender: msg.From, channel: channelKey}
+		if last, ok := l.notifyLastDelivered[key]; ok && now.Sub(last) < cooldown {
+			continue
+		}
+		l.notifyLastDelivered[key] = now
+		filtered = append(filtered, t)
+	}
+	l.notifyMu.Unlock()
+	immediate = filtered
+
+	// Mark implicit public-channel routing targets as active so the UI can show
+	// the ephemeral "X is thinking..." indicator. DMs suppress this signal.
+	isDM, _ := l.isChannelDM(normalizeChannelSlug(msg.Channel))
+	if l.broker != nil && len(immediate) > 0 && isHumanMessageSender(msg.From) && !l.isOneOnOne() && !isDM && len(msg.Tagged) == 0 {
+		slugs := make([]string, 0, len(immediate))
+		for _, t := range immediate {
+			slugs = append(slugs, t.Slug)
+		}
+		l.broker.MarkRoutingTargets(slugs)
+	}
+
+	for _, target := range immediate {
+		l.sendChannelUpdate(target, msg)
+	}
+	// Note: delayed is always empty for message notifications — notificationTargetsForMessage
+	// only ever populates immediate. The delayed path is used only for task notifications
+	// via taskNotificationTargets/deliverTaskNotification.
+	_ = delayed
+}
+
+func (l *Launcher) deliverTaskNotification(action officeActionLog, task teamTask) {
+	immediate, delayed := l.taskNotificationTargets(action, task)
+	if len(immediate) == 0 && len(delayed) == 0 {
+		return
+	}
+	content := l.taskNotificationContent(action, task)
+	for _, target := range immediate {
+		l.sendTaskUpdate(target, action, task, content)
+	}
+	for _, target := range delayed {
+		go func(target notificationTarget, action officeActionLog, task teamTask) {
+			time.Sleep(ceoHeadStartDelay)
+			if !l.shouldDeliverDelayedTaskNotification(target.Slug, action, task) {
+				return
+			}
+			l.sendTaskUpdate(target, action, task, content)
+		}(target, action, task)
+	}
+}
+
+func (l *Launcher) taskForAction(action officeActionLog) (teamTask, bool) {
+	if l.broker == nil || strings.TrimSpace(action.RelatedID) == "" {
+		return teamTask{}, false
+	}
+	id := strings.TrimSpace(action.RelatedID)
+	for _, task := range l.broker.AllTasks() {
+		if task.ID == id {
+			return task, true
+		}
+	}
+	return teamTask{}, false
+}
+
+// taskNotificationContent delegates to the notificationContextBuilder
+// (PLAN.md §C3). See notification_context.go for the formatting body.
+func (l *Launcher) taskNotificationContent(action officeActionLog, task teamTask) string {
+	return l.notifyCtx().TaskNotificationContent(action, task)
+}
+
+func (l *Launcher) sendTaskUpdate(target notificationTarget, action officeActionLog, task teamTask, content string) {
+	// Approval gate (Phase 4): refuse to dispatch execution work to bots
+	// for tasks that are not in an executable lifecycle state. Only Running
+	// and Approved tasks may trigger bot execution turns. Drafting, Intake,
+	// Review, and ChangesRequested tasks are blocked here — bots may still
+	// post comments via the comment endpoint, which does not go through this
+	// path. ErrIssueNotApproved is the sentinel; log and drop (no retry).
+	// task_followup bypasses the gate by design: it targets DELIVERED
+	// (terminal) tasks — the human posted after delivery and the owner must
+	// wake to answer or reopen (done-integrity fix family).
+	if action.Kind != taskFollowUpActionKind &&
+		task.LifecycleState != "" && !isExecutableTeamTaskStatus(task.LifecycleState) {
+		return
+	}
+	// Scoped interview gate (v3 fix family #2): while THIS bot waits on
+	// its own human interview, its current turn is parked in the
+	// /interview/answer poll — enqueueing a new turn would duplicate work
+	// once the answer lands. Suppress only this bot; every other bot
+	// keeps working (the old office-wide drop wedged the whole office
+	// behind one buried card, [19:23:59]).
+	if l.turnParkedOnInterview(target) {
+		return
+	}
+	// The channel this bot is told to reply in. A task with no channel used
+	// to resolve to "general", so the packet literally instructed the bot to
+	// answer in a room that no longer exists. Its own DM is the conversation it
+	// is actually having with the human.
+	channel := normalizeChannelSlug(task.Channel)
+	if strings.TrimSpace(task.Channel) == "" {
+		channel = DMSlugFor(target.Slug)
+	}
+	notification, contextUsed := l.notifyCtx().BuildTaskExecutionPacketWithContext(target.Slug, action, task, content)
+	// Plan mode: a task in Planning gets a plan-only directive in front of the
+	// packet so the owner asks the human its open questions, writes a plan, and
+	// stops before executing or decomposing. The provider's native read-only
+	// mode (resolveTurnPosture) is the hard enforcement; this is the prompt half.
+	if task.LifecycleState == LifecycleStatePlanning {
+		notification = planModeDirective(task) + notification
+	}
+	if l.targeter().ShouldUseHeadlessForTarget(target) {
+		prompt := headlessSandboxNote() + notification
+		l.enqueueHeadlessCodexTurnRecord(target.Slug, headlessCodexTurn{
+			Prompt:      prompt,
+			Channel:     channel,
+			TaskID:      task.ID,
+			ContextUsed: contextUsed,
+			EnqueuedAt:  time.Now(),
+		})
+		return
+	}
+	l.paneDispatch().Enqueue(target.Slug, target.PaneTarget, notification)
+}
+
+// activeHeadlessSlugs returns the slugs that have non-empty headless
+// queues or active turns at the moment of the call. Locks headlessMu so
+// the snapshot is consistent. The except parameter is the slug being
+// notified — the lead must not list itself as "already active".
+func (l *Launcher) activeHeadlessSlugs(except string) map[string]struct{} {
+	if l == nil {
+		return nil
+	}
+	l.headless.mu.Lock()
+	defer l.headless.mu.Unlock()
+	out := map[string]struct{}{}
+	// A bot may now span several lanes; group by lane.slug so a slug counts
+	// as active when ANY of its lanes has queued or in-flight work.
+	for workerLane, queue := range l.headless.queues {
+		if workerLane.slug == except {
+			continue
+		}
+		if len(queue) > 0 {
+			out[workerLane.slug] = struct{}{}
+		}
+	}
+	for workerLane, active := range l.headless.active {
+		if workerLane.slug == except {
+			continue
+		}
+		if active != nil {
+			out[workerLane.slug] = struct{}{}
+		}
+	}
+	return out
+}
+
+func (l *Launcher) buildNotificationContext(recipientSlug, channelSlug, triggerMsgID, threadRootID string, limit int) string {
+	return l.notifyCtx().NotificationContext(recipientSlug, channelSlug, triggerMsgID, threadRootID, limit)
+}
+
+func (l *Launcher) ultimateThreadRoot(channelSlug, startID string) string {
+	return l.notifyCtx().UltimateThreadRoot(channelSlug, startID)
+}
+
+func (l *Launcher) threadMessageIDs(channelSlug, rootID string) map[string]struct{} {
+	return l.notifyCtx().ThreadMessageIDs(channelSlug, rootID)
+}
+
+func (l *Launcher) buildTaskNotificationContext(channelSlug, slug string, limit int) string {
+	return l.notifyCtx().TaskNotificationContext(channelSlug, slug, limit)
+}
+
+func (l *Launcher) relevantTaskForTarget(msg channelMessage, slug string) (teamTask, bool) {
+	return l.notifyCtx().RelevantTaskForTarget(msg, slug)
+}
+
+func (l *Launcher) responseInstructionForTarget(msg channelMessage, slug string) string {
+	return l.notifyCtx().ResponseInstructionForTarget(msg, slug)
+}
+
+func (l *Launcher) buildMessageWorkPacket(msg channelMessage, slug string) string {
+	return l.notifyCtx().BuildMessageWorkPacket(msg, slug)
+}
+
+func (l *Launcher) buildTaskExecutionPacket(slug string, action officeActionLog, task teamTask, content string) string {
+	return l.notifyCtx().BuildTaskExecutionPacket(slug, action, task, content)
+}
+
+func (l *Launcher) sendChannelUpdate(target notificationTarget, msg channelMessage) {
+	// Scoped interview gate — same contract as sendTaskUpdate: suppress
+	// new turns ONLY for the bot whose own interview is pending (its
+	// turn is parked in the answer poll); everyone else keeps working.
+	if l.turnParkedOnInterview(target) {
+		return
+	}
+	// Same as sendTaskUpdate: this value is interpolated straight into the
+	// prompt ("channel \"%s\"" below), so a laundered "general" told the bot
+	// to reply into the retired room.
+	channel := normalizeChannelSlug(msg.Channel)
+	if strings.TrimSpace(msg.Channel) == "" {
+		channel = DMSlugFor(target.Slug)
+	}
+	notification := ""
+	var contextUsed []string
+	humanPrefix := ""
+	fromHuman := isHumanMessageSender(msg.From)
+	if fromHuman {
+		// Front-load a directive so the model treats the human chat as a
+		// preemption signal: absorb the message before resuming any prior
+		// task, then decide whether to abandon, give a status update, or
+		// queue the request for later. The same priority semantics are
+		// enforced in the queue (FromHuman bypasses the hold/cap and forces
+		// preemption) so the model and the dispatcher stay in agreement.
+		humanPrefix = "[HUMAN-PRIORITY] A real person just messaged you. Stop, absorb this message before continuing any prior task, then decide which is appropriate: (a) abandon the prior task and address the human directly, (b) give a brief status update if they are asking what you're doing, or (c) acknowledge and queue their request for after the current task. Human messages take priority over bot-to-bot follow-ups.\n---\n"
+	}
+	if l.isOneOnOne() {
+		notification = fmt.Sprintf(
+			"%s[New from @%s]: %s\n%s Reply using team_broadcast with my_slug \"%s\" and channel \"%s\" reply_to_id \"%s\". Once you have posted the needed reply, STOP and wait for the next pushed notification.",
+			humanPrefix, msg.From, truncate(msg.Content, 1000), l.responseInstructionForTarget(msg, target.Slug), target.Slug, channel, msg.ID,
+		)
+	} else {
+		var packet string
+		packet, contextUsed = l.notifyCtx().BuildMessageWorkPacketWithContext(msg, target.Slug)
+		notification = fmt.Sprintf(
+			"%s%s\n---\n[New from @%s]: %s\n%s This packet is your complete context — do NOT call team_poll or team_tasks. Just do the work and reply via team_broadcast with my_slug \"%s\", channel \"%s\", reply_to_id \"%s\". Once you have posted the needed update, STOP and wait for the next pushed notification.",
+			humanPrefix, packet, msg.From, truncate(msg.Content, 1000), l.responseInstructionForTarget(msg, target.Slug), target.Slug, channel, msg.ID,
+		)
+	}
+	notification += l.slackChannelConventionNote(channel)
+
+	if l.targeter().ShouldUseHeadlessForTarget(target) {
+		prompt := headlessSandboxNote() + notification
+		l.enqueueHeadlessCodexTurnRecord(target.Slug, headlessCodexTurn{
+			Prompt:      prompt,
+			Channel:     channel,
+			TaskID:      headlessCodexTaskID(prompt),
+			FromHuman:   fromHuman,
+			ContextUsed: contextUsed,
+			EnqueuedAt:  time.Now(),
+		})
+		return
+	}
+	l.paneDispatch().Enqueue(target.Slug, target.PaneTarget, notification)
+}
+
+// isDeterministicPhase2CEODM reports whether a message landed in the
+// CEO DM during an onboarding phase where the broker drives the
+// conversation via deterministic templates and no LLM should fire.
+//
+// In production the CEO DM lands at the canonical pair-sorted slug
+// ("cos__human"), not the reserved CEOOnboardingDMSlug constant — that
+// constant is for the state record only. So we match on "DM whose
+// target bot is Chief of Staff" instead of a literal slug comparison.
+//
+// Phase 2 covers greet → bridge (everything before the user opts into
+// the first issue). draft/approve/kickoff and complete are NOT gated —
+// those are the LLM-backed phases where the CEO bot is supposed to
+// drive the chat.
+//
+// Errors loading the state file fall through to "not gated" so a
+// missing or corrupt onboarded.json never silences a real post-
+// onboarding CEO turn.
+func isDeterministicPhase2CEODM(channel string) bool {
+	// Raw emptiness before normalising: an empty channel became "general" and
+	// this refusal never fired, so a notification with no destination was
+	// delivered into the shared room.
+	if strings.TrimSpace(channel) == "" {
+		return false
+	}
+	ch := normalizeChannelSlug(channel)
+	target := DMTargetBot(ch)
+	if target != "cos" && ch != onboarding.CEOOnboardingDMSlug {
+		return false
+	}
+	s, err := onboarding.Load()
+	if err != nil || s == nil {
+		return false
+	}
+	// Already onboarded → CEO LLM is fully active again.
+	if s.Onboarded() {
+		return false
+	}
+	switch s.Phase {
+	case onboarding.PhaseGreet,
+		onboarding.PhaseIdentity,
+		onboarding.PhaseWebsite,
+		onboarding.PhaseScan,
+		onboarding.PhaseBlueprint,
+		onboarding.PhaseTeam,
+		onboarding.PhaseSeed,
+		onboarding.PhaseBridge:
+		return true
+	}
+	return false
+}
+
+// slackChannelConventionNote returns the authoring conventions appended to
+// every notification for a Slack-bridged channel, or "" elsewhere. The rules
+// exist because the channel contains REAL people and external bots:
+// @-tagging is a wire-level ping there, and hivebot presents as one
+// coordinating bot, not a cast of internal roles.
+func (l *Launcher) slackChannelConventionNote(channel string) string {
+	if l == nil || l.broker == nil || !l.broker.ChannelHasSurface(channel, "slack") {
+		return ""
+	}
+	return "\n---\nSLACK CHANNEL CONVENTIONS (this channel is bridged to a real Slack workspace with real people and external bots): " +
+		"(1) NEVER @-tag a bot or person unless you need them to act or respond — a tag pings them and they WILL respond; for FYI/status references use the plain name with no @. " +
+		"(2) To delegate to an external bot and get a response, START your message with @bot-slug. " +
+		"(3) You are part of ONE coordinating presence (the team bot). Never introduce yourself by an internal role name like Chief of Staff or planner; speak as the team. " +
+		"(4) If a message needs no action from you, post NOTHING. Never post acknowledgement-only replies (\"noted\", \"acknowledged\", \"no action needed\") — real people read this channel, and repeating the same status is spam. Summarize once when the situation changes, not once per incoming message. " +
+		"(5) Every task lives in its OWN Slack thread (the team opens one automatically, rooted on the task card). Do all of a task's work inside that thread — never start parallel top-level messages for the same task. To quote or reference another message, paste its Slack message link; Slack renders the link as a quoted reply."
+}
+
+// turnParkedOnInterview reports whether a wake for slug must be held
+// because the bot's CURRENT turn is parked in the /interview/answer poll.
+//
+// A pending interview row alone is not enough: after a broker restart the
+// row survives but the turn that was polling for the answer is gone, and
+// holding wakes on the row alone made the bot unreachable — every human
+// message was dropped until someone found and answered the stale card
+// (prod, 2026-09-07). The gate therefore also requires a live headless
+// turn for the bot. A target that would be delivered to a live tmux pane
+// cannot be inspected the same way and keeps the conservative row-only
+// rule; the routing question is asked exactly the way delivery asks it.
+func (l *Launcher) turnParkedOnInterview(target notificationTarget) bool {
+	slug := strings.TrimSpace(target.Slug)
+	if l == nil || l.broker == nil || slug == "" || !l.broker.BotAwaitingInterviewAnswer(slug) {
+		return false
+	}
+	if !l.targeter().ShouldUseHeadlessForTarget(target) {
+		return true
+	}
+	return l.headlessTurnParkedFor(slug, l.broker.PendingInterviewTaskIDs(slug))
+}
+
+// headlessTurnParkedFor reports whether slug has a live headless turn that
+// is the one waiting on an interview: a turn on the same task as a pending
+// interview, or — for an interview with no task — any live turn. A live
+// turn on an unrelated task is real work, not a parked poll, and must not
+// hold the bot's wakes.
+func (l *Launcher) headlessTurnParkedFor(slug string, interviewTaskIDs []string) bool {
+	slug = strings.TrimSpace(slug)
+	if l == nil || slug == "" {
+		return false
+	}
+	anyTask := false
+	want := make(map[string]struct{}, len(interviewTaskIDs))
+	for _, id := range interviewTaskIDs {
+		if id == "" {
+			anyTask = true
+			continue
+		}
+		want[id] = struct{}{}
+	}
+	l.headless.mu.Lock()
+	defer l.headless.mu.Unlock()
+	for lane, active := range l.headless.active {
+		if active == nil || lane.slug != slug {
+			continue
+		}
+		if anyTask {
+			return true
+		}
+		if _, ok := want[strings.TrimSpace(active.Turn.TaskID)]; ok {
+			return true
+		}
+	}
+	return false
+}

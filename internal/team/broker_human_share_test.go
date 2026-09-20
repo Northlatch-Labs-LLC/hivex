@@ -1,0 +1,565 @@
+package team
+
+import (
+	"bufio"
+	"bytes"
+	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+)
+
+func TestHumanInviteAcceptIsOneUseAndCreatesSession(t *testing.T) {
+	b := newTestBroker(t)
+	token, invite, err := b.createHumanInvite()
+	if err != nil {
+		t.Fatalf("create invite: %v", err)
+	}
+	if token == "" || invite.ID == "" {
+		t.Fatalf("invite missing token/id: token=%q invite=%+v", token, invite)
+	}
+
+	body := []byte(`{"token":"` + token + `","display_name":"Mira","device":"MacBook Pro"}`)
+	req := httptest.NewRequest(http.MethodPost, "/humans/invites/accept", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+	b.handleHumanInviteAccept(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("accept status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	var accepted struct {
+		Session humanSessionResponse `json:"session"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &accepted); err != nil {
+		t.Fatalf("decode accept: %v", err)
+	}
+	if accepted.Session.DisplayName != "Mira" || accepted.Session.HumanSlug != "mira" {
+		t.Fatalf("session identity = %+v", accepted.Session)
+	}
+	if bytes.Contains(rec.Body.Bytes(), []byte("remote_addr")) {
+		t.Fatalf("accept response exposed remote address: %s", rec.Body.String())
+	}
+	if len(rec.Result().Cookies()) == 0 {
+		t.Fatalf("accept did not set a session cookie")
+	}
+
+	req = httptest.NewRequest(http.MethodPost, "/humans/invites/accept", bytes.NewReader(body))
+	rec = httptest.NewRecorder()
+	b.handleHumanInviteAccept(rec, req)
+	if rec.Code != http.StatusGone {
+		t.Fatalf("second accept status = %d, want 410 body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHumanMeAcceptsSessionCookie(t *testing.T) {
+	b := newTestBroker(t)
+	token, _, err := b.createHumanInvite()
+	if err != nil {
+		t.Fatalf("create invite: %v", err)
+	}
+	sessionToken, _, err := b.acceptHumanInvite(token, "Mira", "browser")
+	if err != nil {
+		t.Fatalf("accept invite: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/humans/me", nil)
+	req.AddCookie(&http.Cookie{Name: humanSessionCookie, Value: sessionToken})
+	rec := httptest.NewRecorder()
+	b.handleHumanMe(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("me status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	if !bytes.Contains(rec.Body.Bytes(), []byte(`"display_name":"Mira"`)) {
+		t.Fatalf("me body missing Mira: %s", rec.Body.String())
+	}
+	// useSessionRole on the web client branches on human.role. Without this
+	// field the joiner welcome card and sidebar badge fall back to "unknown"
+	// and never render — the bug PR #661 shipped silently.
+	if !bytes.Contains(rec.Body.Bytes(), []byte(`"role":"member"`)) {
+		t.Fatalf("me body missing role:member, welcome card will not render: %s", rec.Body.String())
+	}
+}
+
+func TestHumanSessionsHostCanRevokeSession(t *testing.T) {
+	b := newTestBroker(t)
+	token, _, err := b.createHumanInvite()
+	if err != nil {
+		t.Fatalf("create invite: %v", err)
+	}
+	sessionToken, session, err := b.acceptHumanInvite(token, "Mira", "browser")
+	if err != nil {
+		t.Fatalf("accept invite: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodDelete, "/humans/sessions", strings.NewReader(`{"id":"`+session.ID+`"}`))
+	req.Header.Set("Authorization", "Bearer "+b.Token())
+	rec := httptest.NewRecorder()
+	b.requireAuth(b.handleHumanSessions)(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("revoke status = %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/humans/me", nil)
+	req.AddCookie(&http.Cookie{Name: humanSessionCookie, Value: sessionToken})
+	rec = httptest.NewRecorder()
+	b.handleHumanMe(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("revoked session me status = %d, want 401 body=%s", rec.Code, rec.Body.String())
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/humans/sessions", nil)
+	req.Header.Set("Authorization", "Bearer "+b.Token())
+	rec = httptest.NewRecorder()
+	b.requireAuth(b.handleHumanSessions)(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("sessions status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"revoked_at"`) {
+		t.Fatalf("sessions body missing revoked_at: %s", rec.Body.String())
+	}
+}
+
+func TestHumanSessionCannotRevokeTeamMemberSessions(t *testing.T) {
+	b := newTestBroker(t)
+	token, _, err := b.createHumanInvite()
+	if err != nil {
+		t.Fatalf("create invite: %v", err)
+	}
+	sessionToken, session, err := b.acceptHumanInvite(token, "Mira", "browser")
+	if err != nil {
+		t.Fatalf("accept invite: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodDelete, "/humans/sessions", strings.NewReader(`{"id":"`+session.ID+`"}`))
+	req.AddCookie(&http.Cookie{Name: humanSessionCookie, Value: sessionToken})
+	rec := httptest.NewRecorder()
+	b.requireAuth(b.handleHumanSessions)(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("member revoke status = %d, want 403 body=%s", rec.Code, rec.Body.String())
+	}
+
+	// Confirm no mutation: the session must still be active after the 403.
+	if !b.humanSessionIDActive(session.ID) {
+		t.Fatal("session was revoked despite 403 — authorization check ran after mutation")
+	}
+}
+
+func TestHumanMeRejectsExpiredSessionServerSide(t *testing.T) {
+	b := newTestBroker(t)
+	token, _, err := b.createHumanInvite()
+	if err != nil {
+		t.Fatalf("create invite: %v", err)
+	}
+	sessionToken, session, err := b.acceptHumanInvite(token, "Mira", "browser")
+	if err != nil {
+		t.Fatalf("accept invite: %v", err)
+	}
+
+	b.mu.Lock()
+	for i := range b.humanSessions {
+		if b.humanSessions[i].ID == session.ID {
+			b.humanSessions[i].ExpiresAt = time.Now().Add(-time.Hour).UTC().Format(time.RFC3339)
+		}
+	}
+	b.mu.Unlock()
+
+	req := httptest.NewRequest(http.MethodGet, "/humans/me", nil)
+	req.AddCookie(&http.Cookie{Name: humanSessionCookie, Value: sessionToken})
+	rec := httptest.NewRecorder()
+	b.handleHumanMe(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("me status = %d, want 401 body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHumanMeIncludesHostDisplayNameForMemberSessions(t *testing.T) {
+	dir := t.TempDir()
+	reg := NewHumanIdentityRegistryAt(dir)
+	id, _ := buildIdentity("Sam Sender", "sam@example.com")
+	reg.mu.Lock()
+	reg.localCache = &id
+	reg.mu.Unlock()
+	setHumanIdentityRegistry(reg)
+	t.Cleanup(func() { setHumanIdentityRegistry(NewHumanIdentityRegistry()) })
+
+	b := newTestBroker(t)
+	token, _, err := b.createHumanInvite()
+	if err != nil {
+		t.Fatalf("create invite: %v", err)
+	}
+	sessionToken, _, err := b.acceptHumanInvite(token, "Mira", "browser")
+	if err != nil {
+		t.Fatalf("accept invite: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/humans/me", nil)
+	req.AddCookie(&http.Cookie{Name: humanSessionCookie, Value: sessionToken})
+	rec := httptest.NewRecorder()
+	b.handleHumanMe(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("me status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	var got struct {
+		Human           humanSessionResponse `json:"human"`
+		HostDisplayName string               `json:"host_display_name"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode me: %v", err)
+	}
+	if got.HostDisplayName != "Sam Sender" {
+		t.Fatalf("host_display_name = %q, want %q (body=%s)", got.HostDisplayName, "Sam Sender", rec.Body.String())
+	}
+	if got.Human.DisplayName != "Mira" {
+		t.Fatalf("human.display_name = %q, want Mira", got.Human.DisplayName)
+	}
+}
+
+func TestHumanMeOmitsHostDisplayNameWhenIdentityIsFallback(t *testing.T) {
+	dir := t.TempDir()
+	reg := NewHumanIdentityRegistryAt(dir)
+	fallback := FallbackHumanIdentity
+	reg.mu.Lock()
+	reg.localCache = &fallback
+	reg.mu.Unlock()
+	setHumanIdentityRegistry(reg)
+	t.Cleanup(func() { setHumanIdentityRegistry(NewHumanIdentityRegistry()) })
+
+	b := newTestBroker(t)
+	token, _, err := b.createHumanInvite()
+	if err != nil {
+		t.Fatalf("create invite: %v", err)
+	}
+	sessionToken, _, err := b.acceptHumanInvite(token, "Mira", "browser")
+	if err != nil {
+		t.Fatalf("accept invite: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/humans/me", nil)
+	req.AddCookie(&http.Cookie{Name: humanSessionCookie, Value: sessionToken})
+	rec := httptest.NewRecorder()
+	b.handleHumanMe(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("me status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	if bytes.Contains(rec.Body.Bytes(), []byte(`"host_display_name"`)) {
+		t.Fatalf("expected host_display_name omitted on fallback identity, got: %s", rec.Body.String())
+	}
+}
+
+func TestResetClearsHumanShareState(t *testing.T) {
+	b := newTestBroker(t)
+	token, _, err := b.createHumanInvite()
+	if err != nil {
+		t.Fatalf("create invite: %v", err)
+	}
+	if _, _, err := b.acceptHumanInvite(token, "Mira", "browser"); err != nil {
+		t.Fatalf("accept invite: %v", err)
+	}
+
+	b.Reset()
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if len(b.humanInvites) != 0 || len(b.humanSessions) != 0 {
+		t.Fatalf("Reset left share state: invites=%d sessions=%d", len(b.humanInvites), len(b.humanSessions))
+	}
+}
+
+func TestHumanSessionAuthIsScopedToShareRoutes(t *testing.T) {
+	b := newTestBroker(t)
+	token, _, err := b.createHumanInvite()
+	if err != nil {
+		t.Fatalf("create invite: %v", err)
+	}
+	sessionToken, _, err := b.acceptHumanInvite(token, "Mira", "browser")
+	if err != nil {
+		t.Fatalf("accept invite: %v", err)
+	}
+	cookie := &http.Cookie{Name: humanSessionCookie, Value: sessionToken}
+
+	allowed := httptest.NewRequest(http.MethodPost, "/messages", bytes.NewReader([]byte(`{}`)))
+	allowed.AddCookie(cookie)
+	allowedRec := httptest.NewRecorder()
+	called := false
+	b.withAuth(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		actor, ok := requestActorFromContext(r.Context())
+		if !ok || actor.Kind != requestActorKindHuman || actor.Slug != "mira" {
+			t.Fatalf("actor = %+v ok=%v, want human mira", actor, ok)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})(allowedRec, allowed)
+	if !called || allowedRec.Code != http.StatusNoContent {
+		t.Fatalf("allowed human route called=%v status=%d body=%s", called, allowedRec.Code, allowedRec.Body.String())
+	}
+
+	for _, tc := range []struct {
+		method string
+		path   string
+	}{
+		{http.MethodPost, "/office-members"},
+		{http.MethodPost, "/channels"},
+		{http.MethodPost, "/wiki/write"},
+		{http.MethodGet, "/notebook/read"},
+	} {
+		t.Run(tc.method+" "+tc.path, func(t *testing.T) {
+			req := httptest.NewRequest(tc.method, tc.path, nil)
+			req.AddCookie(cookie)
+			rec := httptest.NewRecorder()
+			b.withAuth(func(http.ResponseWriter, *http.Request) {
+				t.Fatalf("handler should not be called for %s %s", tc.method, tc.path)
+			})(rec, req)
+			if rec.Code != http.StatusForbidden {
+				t.Fatalf("status = %d, want 403 body=%s", rec.Code, rec.Body.String())
+			}
+		})
+	}
+
+	brokerReq := httptest.NewRequest(http.MethodPost, "/office-members", nil)
+	brokerReq.Header.Set("Authorization", "Bearer "+b.Token())
+	brokerRec := httptest.NewRecorder()
+	b.withAuth(func(w http.ResponseWriter, r *http.Request) {
+		actor, ok := requestActorFromContext(r.Context())
+		if !ok || actor.Kind != requestActorKindBroker {
+			t.Fatalf("actor = %+v ok=%v, want broker", actor, ok)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})(brokerRec, brokerReq)
+	if brokerRec.Code != http.StatusNoContent {
+		t.Fatalf("broker route status = %d body=%s", brokerRec.Code, brokerRec.Body.String())
+	}
+}
+
+// The wiki file tree's structural authoring routes run as a HUMAN session,
+// exactly like /wiki/write-human. They must pass the routing-level human
+// allowlist (not 403) so the UI tree can create / move / rename / delete pages.
+func TestHumanSessionAuthAllowsWikiStructuralRoutes(t *testing.T) {
+	b := newTestBroker(t)
+	token, _, err := b.createHumanInvite()
+	if err != nil {
+		t.Fatalf("create invite: %v", err)
+	}
+	sessionToken, _, err := b.acceptHumanInvite(token, "Mira", "browser")
+	if err != nil {
+		t.Fatalf("accept invite: %v", err)
+	}
+	cookie := &http.Cookie{Name: humanSessionCookie, Value: sessionToken}
+
+	for _, tc := range []struct {
+		method string
+		path   string
+	}{
+		{http.MethodPost, "/wiki/page/create"},
+		{http.MethodPost, "/wiki/page/move"},
+		{http.MethodPost, "/wiki/page/rename"},
+		{http.MethodDelete, "/wiki/page"},
+		{http.MethodDelete, "/wiki/page?path=team/people/nazz.md"},
+	} {
+		t.Run(tc.method+" "+tc.path, func(t *testing.T) {
+			req := httptest.NewRequest(tc.method, tc.path, bytes.NewReader([]byte(`{}`)))
+			req.AddCookie(cookie)
+			rec := httptest.NewRecorder()
+			called := false
+			b.withAuth(func(w http.ResponseWriter, r *http.Request) {
+				called = true
+				actor, ok := requestActorFromContext(r.Context())
+				if !ok || actor.Kind != requestActorKindHuman || actor.Slug != "mira" {
+					t.Fatalf("actor = %+v ok=%v, want human mira", actor, ok)
+				}
+				w.WriteHeader(http.StatusNoContent)
+			})(rec, req)
+			if !called || rec.Code != http.StatusNoContent {
+				t.Fatalf("route called=%v status=%d body=%s", called, rec.Code, rec.Body.String())
+			}
+		})
+	}
+
+	// A non-allowlisted wiki write method/path still 403s for a human session,
+	// proving the allowlist is exact and not a blanket /wiki/* grant.
+	for _, tc := range []struct {
+		method string
+		path   string
+	}{
+		{http.MethodPost, "/wiki/page/destroy"},
+		{http.MethodPut, "/wiki/page"},
+		{http.MethodGet, "/wiki/page/move"},
+	} {
+		t.Run("forbidden "+tc.method+" "+tc.path, func(t *testing.T) {
+			req := httptest.NewRequest(tc.method, tc.path, bytes.NewReader([]byte(`{}`)))
+			req.AddCookie(cookie)
+			rec := httptest.NewRecorder()
+			b.withAuth(func(http.ResponseWriter, *http.Request) {
+				t.Fatalf("handler should not be called for %s %s", tc.method, tc.path)
+			})(rec, req)
+			if rec.Code != http.StatusForbidden {
+				t.Fatalf("status = %d, want 403 body=%s", rec.Code, rec.Body.String())
+			}
+		})
+	}
+}
+
+func TestHumanSessionAuthBlocksDMChannelList(t *testing.T) {
+	b := newTestBroker(t)
+	token, _, err := b.createHumanInvite()
+	if err != nil {
+		t.Fatalf("create invite: %v", err)
+	}
+	sessionToken, _, err := b.acceptHumanInvite(token, "Mira", "browser")
+	if err != nil {
+		t.Fatalf("accept invite: %v", err)
+	}
+	cookie := &http.Cookie{Name: humanSessionCookie, Value: sessionToken}
+
+	for _, tc := range []struct {
+		path string
+		want int
+	}{
+		{"/channels", http.StatusNoContent},
+		{"/channels?type=dm", http.StatusForbidden},
+		{"/channels?type=DM", http.StatusForbidden},
+		{"/channels?type=Dm", http.StatusForbidden},
+	} {
+		t.Run(tc.path, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, tc.path, nil)
+			req.AddCookie(cookie)
+			rec := httptest.NewRecorder()
+			b.withAuth(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusNoContent)
+			})(rec, req)
+			if rec.Code != tc.want {
+				t.Fatalf("status = %d, want %d body=%s", rec.Code, tc.want, rec.Body.String())
+			}
+		})
+	}
+}
+
+func TestHumanEventsReceiveSharedWikiEvents(t *testing.T) {
+	b := newTestBroker(t)
+	token, _, err := b.createHumanInvite()
+	if err != nil {
+		t.Fatalf("create invite: %v", err)
+	}
+	sessionToken, _, err := b.acceptHumanInvite(token, "Mira", "browser")
+	if err != nil {
+		t.Fatalf("accept invite: %v", err)
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(b.handleEvents))
+	t.Cleanup(srv.Close)
+
+	req, err := http.NewRequest(http.MethodGet, srv.URL, nil)
+	if err != nil {
+		t.Fatalf("build events request: %v", err)
+	}
+	req.AddCookie(&http.Cookie{Name: humanSessionCookie, Value: sessionToken})
+	resp, err := (&http.Client{Timeout: 2 * time.Second}).Do(req)
+	if err != nil {
+		t.Fatalf("events request: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Fatalf("events status = %d body=%s", resp.StatusCode, string(raw))
+	}
+
+	reader := bufio.NewReader(resp.Body)
+	b.PublishWikiEvent(wikiWriteEvent{
+		Path:       "team/shared.md",
+		CommitSHA:  "def456",
+		AuthorSlug: "pm",
+		Timestamp:  time.Now().UTC().Format(time.RFC3339),
+	})
+
+	var lines []string
+	for len(lines) < 20 {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			t.Fatalf("read event stream: %v lines=%q", err, strings.Join(lines, ""))
+		}
+		lines = append(lines, line)
+		if strings.Contains(line, "event: wiki:write") {
+			break
+		}
+	}
+	stream := strings.Join(lines, "")
+	if !strings.Contains(stream, "event: wiki:write") {
+		t.Fatalf("human SSE did not receive shared wiki event: %s", stream)
+	}
+}
+
+func TestHumanEventsCloseAfterSessionRevoked(t *testing.T) {
+	b := newTestBroker(t)
+	token, _, err := b.createHumanInvite()
+	if err != nil {
+		t.Fatalf("create invite: %v", err)
+	}
+	sessionToken, session, err := b.acceptHumanInvite(token, "Mira", "browser")
+	if err != nil {
+		t.Fatalf("accept invite: %v", err)
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(b.handleEvents))
+	t.Cleanup(srv.Close)
+
+	// No client-level timeout: we want to distinguish server-closed (EOF) from
+	// client-timed-out. A client timeout would make the test a false positive.
+	req, err := http.NewRequest(http.MethodGet, srv.URL, nil)
+	if err != nil {
+		t.Fatalf("build events request: %v", err)
+	}
+	req.AddCookie(&http.Cookie{Name: humanSessionCookie, Value: sessionToken})
+	resp, err := (&http.Client{}).Do(req)
+	if err != nil {
+		t.Fatalf("events request: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Fatalf("events status = %d body=%s", resp.StatusCode, string(raw))
+	}
+
+	reader := bufio.NewReader(resp.Body)
+	seenReady := false
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			t.Fatalf("read ready event: %v", err)
+		}
+		if strings.Contains(line, "event: ready") {
+			seenReady = true
+		}
+		if seenReady && strings.TrimSpace(line) == "" {
+			break
+		}
+	}
+
+	if err := b.revokeHumanSession(session.ID); err != nil {
+		t.Fatalf("revoke session: %v", err)
+	}
+	// Publish an event so the SSE loop wakes immediately and checks auth.
+	b.PublishWikiEvent(wikiWriteEvent{
+		Path:       "team/shared.md",
+		CommitSHA:  "def456",
+		AuthorSlug: "pm",
+		Timestamp:  time.Now().UTC().Format(time.RFC3339),
+	})
+
+	// Read on a goroutine with an explicit deadline so a broken server-keeps-open
+	// scenario fails the test rather than timing out the client connection.
+	done := make(chan error, 1)
+	go func() {
+		_, err := reader.ReadString('\n')
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("revoked session kept SSE stream open")
+		}
+		// any non-nil error (EOF, connection reset) means the server closed — pass
+	case <-time.After(2 * time.Second):
+		t.Fatal("revoked session SSE stream not closed within 2s")
+	}
+}

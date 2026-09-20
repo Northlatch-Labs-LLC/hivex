@@ -1,0 +1,253 @@
+package workspaces
+
+import (
+	"os"
+	"path/filepath"
+	"testing"
+)
+
+func withMigrationHome(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	// spacesDir uses real HOME because ~/.hivex-spaces is shared cross-workspace.
+	// Override HOME alongside HIVEX_RUNTIME_HOME so the migration writes inside
+	// the tempdir instead of leaking into the developer's real ~/.hivex-spaces.
+	t.Setenv("HOME", dir)
+	t.Setenv("HIVEX_RUNTIME_HOME", dir)
+	// Inject a no-op broker probe so tests don't fail when a real broker
+	// is running on port 7890 in the developer's environment.
+	orig := brokerRunningFn
+	brokerRunningFn = func(port int) bool { return false }
+	t.Cleanup(func() { brokerRunningFn = orig })
+	return dir
+}
+
+func TestMigrateToSymmetricHappyPath(t *testing.T) {
+	home := withMigrationHome(t)
+
+	// Create a legacy ~/.hivex directory with some content.
+	oldHivex := filepath.Join(home, ".hivex")
+	if err := os.MkdirAll(filepath.Join(oldHivex, "team"), 0o700); err != nil {
+		t.Fatalf("mkdir legacy: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(oldHivex, "config.json"), []byte("{}"), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	if err := MigrateToSymmetric(); err != nil {
+		t.Fatalf("MigrateToSymmetric: %v", err)
+	}
+
+	// New path should exist.
+	newPath := filepath.Join(home, ".hivex-spaces", "main", ".hivex")
+	if _, err := os.Stat(newPath); err != nil {
+		t.Errorf("new path %s: %v", newPath, err)
+	}
+
+	// Content should be present at new path.
+	if _, err := os.Stat(filepath.Join(newPath, "config.json")); err != nil {
+		t.Errorf("config.json missing at new path: %v", err)
+	}
+
+	// ~/.hivex must be a compatibility symlink.
+	oldPath := filepath.Join(home, ".hivex")
+	info, err := os.Lstat(oldPath)
+	if err != nil {
+		t.Fatalf("lstat symlink: %v", err)
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		t.Errorf("expected ~/.hivex to be a symlink, got mode %v", info.Mode())
+	}
+
+	// Registry should be initialized with one "main" workspace.
+	reg, err := Read()
+	if err != nil {
+		t.Fatalf("Read registry: %v", err)
+	}
+	if len(reg.Workspaces) != 1 || reg.Workspaces[0].Name != "main" {
+		t.Errorf("unexpected registry: %+v", reg)
+	}
+	if reg.Workspaces[0].BrokerPort != MainBrokerPort {
+		t.Errorf("main BrokerPort: want %d, got %d", MainBrokerPort, reg.Workspaces[0].BrokerPort)
+	}
+}
+
+func TestMigrateToSymmetricIsIdempotent(t *testing.T) {
+	home := withMigrationHome(t)
+
+	oldHivex := filepath.Join(home, ".hivex")
+	if err := os.MkdirAll(oldHivex, 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	if err := MigrateToSymmetric(); err != nil {
+		t.Fatalf("first MigrateToSymmetric: %v", err)
+	}
+	if err := MigrateToSymmetric(); err != nil {
+		t.Fatalf("second MigrateToSymmetric: %v", err)
+	}
+
+	reg, err := Read()
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if len(reg.Workspaces) != 1 {
+		t.Errorf("expected 1 workspace, got %d", len(reg.Workspaces))
+	}
+}
+
+func TestMigrateToSymmetricFreshInstall(t *testing.T) {
+	home := withMigrationHome(t)
+
+	// No legacy ~/.hivex directory.
+	oldHivex := filepath.Join(home, ".hivex")
+	if _, err := os.Stat(oldHivex); !os.IsNotExist(err) {
+		t.Fatalf("expected no legacy dir, got err=%v", err)
+	}
+
+	if err := MigrateToSymmetric(); err != nil {
+		t.Fatalf("MigrateToSymmetric on fresh install: %v", err)
+	}
+
+	newPath := filepath.Join(home, ".hivex-spaces", "main", ".hivex")
+	if _, err := os.Stat(newPath); err != nil {
+		t.Errorf("new path %s: %v", newPath, err)
+	}
+
+	reg, err := Read()
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if reg.CLICurrent != "main" {
+		t.Errorf("CLICurrent: want main, got %q", reg.CLICurrent)
+	}
+}
+
+func TestMigrateToSymmetricAbortsWhenBrokerRunning(t *testing.T) {
+	home := withMigrationHome(t)
+
+	// Override the probe to simulate a running broker.
+	orig := brokerRunningFn
+	brokerRunningFn = func(port int) bool { return true }
+	defer func() { brokerRunningFn = orig }()
+
+	oldHivex := filepath.Join(home, ".hivex")
+	_ = os.MkdirAll(oldHivex, 0o700)
+
+	err := MigrateToSymmetric()
+	if err == nil {
+		t.Fatal("expected error when broker is running")
+	}
+}
+
+// TestMigrateRespectsConfiguredBrokerPort guards against regressing Northlatch-Labs-LLC/hivex#947
+// — when HIVEX_BROKER_PORT points at a non-default port and nothing is
+// listening on either that port or the legacy default, the probe must not
+// fire a false positive.
+func TestMigrateRespectsConfiguredBrokerPort(t *testing.T) {
+	home := withMigrationHome(t)
+	t.Setenv("HIVEX_BROKER_PORT", "7901")
+
+	// Track which ports the probe was asked about so we can assert it read
+	// from the configured-port source instead of a hard-coded 7890.
+	var probed []int
+	orig := brokerRunningFn
+	brokerRunningFn = func(port int) bool {
+		probed = append(probed, port)
+		return false
+	}
+	t.Cleanup(func() { brokerRunningFn = orig })
+
+	oldHivex := filepath.Join(home, ".hivex")
+	if err := os.MkdirAll(oldHivex, 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	if err := MigrateToSymmetric(); err != nil {
+		t.Fatalf("MigrateToSymmetric with free configured port: %v", err)
+	}
+
+	if len(probed) == 0 {
+		t.Fatal("expected probe to be invoked at least once")
+	}
+	if probed[0] != 7901 {
+		t.Errorf("probe[0] = %d; want 7901 (configured port via HIVEX_BROKER_PORT)", probed[0])
+	}
+
+	// New path should exist — migration must have run, not aborted with the
+	// false-positive "broker is running" warning.
+	newPath := filepath.Join(home, ".hivex-spaces", "main", ".hivex")
+	if _, err := os.Stat(newPath); err != nil {
+		t.Errorf("new path %s missing after migration: %v", newPath, err)
+	}
+}
+
+// TestMigrateProbesLegacyPortAsSafetyNet ensures that when the launching
+// binary uses a non-default port but a legacy broker is still squatting on
+// 7890 against the same ~/.hivex tree, the migration still aborts. Otherwise
+// the rename would corrupt the legacy broker's state.
+func TestMigrateProbesLegacyPortAsSafetyNet(t *testing.T) {
+	withMigrationHome(t)
+	t.Setenv("HIVEX_BROKER_PORT", "7901")
+
+	orig := brokerRunningFn
+	brokerRunningFn = func(port int) bool {
+		return port == legacyBrokerPort
+	}
+	t.Cleanup(func() { brokerRunningFn = orig })
+
+	err := MigrateToSymmetric()
+	if err == nil {
+		t.Fatal("expected error when legacy-port broker is running, even with non-default configured port")
+	}
+}
+
+func TestMigrateDoesNotRenameSymlink(t *testing.T) {
+	home := withMigrationHome(t)
+
+	oldHivex := filepath.Join(home, ".hivex")
+	if err := os.MkdirAll(oldHivex, 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	if err := MigrateToSymmetric(); err != nil {
+		t.Fatalf("first migration: %v", err)
+	}
+
+	info, err := os.Lstat(filepath.Join(home, ".hivex"))
+	if err != nil {
+		t.Fatalf("lstat after first migration: %v", err)
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		t.Error("expected symlink after first migration")
+	}
+
+	// Second migration must be a no-op (registry exists).
+	if err := MigrateToSymmetric(); err != nil {
+		t.Fatalf("second migration: %v", err)
+	}
+
+	// Symlink should still be a symlink.
+	info2, err := os.Lstat(filepath.Join(home, ".hivex"))
+	if err != nil {
+		t.Fatalf("lstat after second migration: %v", err)
+	}
+	if info2.Mode()&os.ModeSymlink == 0 {
+		t.Error("expected symlink still present after second migration")
+	}
+}
+
+func TestIsBrokerRunning(t *testing.T) {
+	// Start a real HTTP server to test the positive path.
+	port, shutdown := startFakeServer(t)
+	defer shutdown()
+
+	if !isBrokerRunning(port) {
+		t.Errorf("isBrokerRunning(%d) = false; want true", port)
+	}
+
+	// Port 0 should always be unreachable in this form.
+	if isBrokerRunning(19997) {
+		t.Error("isBrokerRunning(19997) = true on an unbound port; want false")
+	}
+}

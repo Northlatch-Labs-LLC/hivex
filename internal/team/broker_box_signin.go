@@ -1,0 +1,745 @@
+package team
+
+// broker_box_signin.go: "Sign in to ascii.dev" without copying a key.
+//
+// The Box CLI is machine-friendly: `box login --json` prints a login_url
+// event and waits for the browser to finish, `box status --json` says whether
+// this machine is signed in, and `box api-key create <name> --json` mints a
+// key whose secret is printed exactly once. So the broker installs the CLI
+// (a single static binary from ascii.dev, no shell script executed), starts
+// the login, hands the URL to the web UI, waits for the session, mints a key
+// named hivebot, verifies it with the provider, and stores it through the
+// same config path a pasted key uses. Mirrors broker_composio_signin.go.
+
+import (
+	"bufio"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/Northlatch-Labs-LLC/hivex/internal/computer/box"
+	"github.com/Northlatch-Labs-LLC/hivex/internal/config"
+)
+
+const (
+	boxSigninStatusIdle          = "idle"
+	boxSigninStatusInstalling    = "installing"
+	boxSigninStatusCLIMissing    = "cli_missing"
+	boxSigninStatusAwaitingLogin = "awaiting_login"
+	boxSigninStatusProvisioning  = "provisioning"
+	boxSigninStatusDone          = "done"
+	boxSigninStatusError         = "error"
+
+	boxCLIDownloadBase = "https://ascii.dev/api/box/cli/download"
+	boxCLIChannel      = "ascii-prod"
+	boxInstallCommand  = "curl -fsSL https://ascii.dev/api/box/install | sh"
+	boxKeyName         = "hivebot"
+)
+
+var (
+	boxInstallTimeout = 3 * time.Minute
+	boxLoginWindow    = 15 * time.Minute
+	boxProbeTimeout   = 20 * time.Second
+	boxMintTimeout    = 60 * time.Second
+	// boxInstaller downloads the CLI; a package var so tests substitute a fake.
+	boxInstaller = defaultBoxInstaller
+)
+
+type boxSigninState struct {
+	Status         string `json:"status"`
+	AuthURL        string `json:"auth_url,omitempty"`
+	InstallCommand string `json:"install_command,omitempty"`
+	Reason         string `json:"reason,omitempty"`
+}
+
+type boxSigninFlow struct {
+	mu       sync.Mutex
+	state    boxSigninState
+	deadline time.Time
+	// lastComplete throttles `box onboard` attempts from the status poll.
+	lastComplete time.Time
+	// generation increments on cancel so a stale login goroutine cannot
+	// advance a flow the person has since restarted.
+	generation int
+}
+
+// boxCompleteEvery bounds how often the status poll re-runs the CLI's
+// completion step while a browser login is pending.
+var boxCompleteEvery = 3 * time.Second
+
+func boxInstallDir() string {
+	if dir := strings.TrimSpace(os.Getenv("HIVEX_BOX_CLI_DIR")); dir != "" {
+		return dir
+	}
+	// PHASE0 carve-out: the Box CLI's installer and session live under the
+	// real user HOME (~/.ascii), never under the hivebot runtime home.
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(home, ".ascii", "bin")
+}
+
+// boxCLIBinary resolves the `box` CLI: an explicit override, PATH, then the
+// installer's ~/.ascii/bin, which the running broker's PATH never learns
+// about because the installer only edits shell profiles.
+func boxCLIBinary() (string, bool) {
+	if p := strings.TrimSpace(os.Getenv("HIVEX_BOX_CLI")); p != "" {
+		if info, err := os.Stat(p); err == nil && !info.IsDir() {
+			return p, true
+		}
+		return "", false
+	}
+	if p, err := exec.LookPath("box"); err == nil {
+		return p, true
+	}
+	dir := boxInstallDir()
+	if dir == "" {
+		return "", false
+	}
+	candidate := filepath.Join(dir, "box")
+	if info, err := os.Stat(candidate); err == nil && !info.IsDir() && info.Mode()&0o111 != 0 {
+		return candidate, true
+	}
+	return "", false
+}
+
+func boxCommand(ctx context.Context, args ...string) (*exec.Cmd, error) {
+	bin, ok := boxCLIBinary()
+	if !ok {
+		return nil, errors.New("the Box CLI is not installed")
+	}
+	full := append([]string{}, args...)
+	full = append(full, "--json", "--no-update")
+	cmd := exec.CommandContext(ctx, bin, full...)
+	cmd.Env = composioCommandEnv(filepath.Dir(bin))
+	if api := strings.TrimSpace(os.Getenv("HIVEX_BOX_API_URL")); api != "" {
+		cmd.Env = append(cmd.Env, "BOX_API_URL="+api)
+	}
+	return cmd, nil
+}
+
+// defaultBoxInstaller downloads the static CLI binary for this platform into
+// ~/.ascii/bin. It deliberately does not pipe the vendor's install script
+// into a shell: the script's only other job is an interactive onboard, which
+// the broker runs itself, and running remote shell is not a thing hivebot
+// does on a person's machine.
+func defaultBoxInstaller(ctx context.Context) error {
+	var platform string
+	switch runtime.GOOS {
+	case "darwin", "linux":
+		platform = runtime.GOOS
+	default:
+		return fmt.Errorf("the Box CLI has no build for %s", runtime.GOOS)
+	}
+	switch runtime.GOARCH {
+	case "amd64":
+		platform += "-x64"
+	case "arm64":
+		platform += "-arm64"
+	default:
+		return fmt.Errorf("the Box CLI has no build for %s", runtime.GOARCH)
+	}
+	dir := boxInstallDir()
+	if dir == "" {
+		return errors.New("no home directory to install into")
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, boxCLIDownloadBase+"?platform="+platform+"&channel="+boxCLIChannel, nil)
+	if err != nil {
+		return err
+	}
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		return fmt.Errorf("ascii.dev answered %d for the CLI download", res.StatusCode)
+	}
+	tmp, err := os.CreateTemp(dir, "box.*.tmp")
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(tmp, io.LimitReader(res.Body, 512<<20)); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmp.Name())
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmp.Name())
+		return err
+	}
+	if err := os.Chmod(tmp.Name(), 0o755); err != nil {
+		_ = os.Remove(tmp.Name())
+		return err
+	}
+	return os.Rename(tmp.Name(), filepath.Join(dir, "box"))
+}
+
+// boxCLILoggedIn asks the CLI whether this machine holds a session.
+func boxCLILoggedIn(ctx context.Context) bool {
+	ctx, cancel := context.WithTimeout(ctx, boxProbeTimeout)
+	defer cancel()
+	cmd, err := boxCommand(ctx, "status")
+	if err != nil {
+		return false
+	}
+	out, err := cmd.Output()
+	if err != nil {
+		return false
+	}
+	var status struct {
+		Account struct {
+			LoginState string `json:"loginState"`
+			Status     string `json:"status"`
+		} `json:"account"`
+	}
+	if json.Unmarshal(out, &status) != nil {
+		return false
+	}
+	state := strings.ToLower(strings.TrimSpace(firstNonEmpty(status.Account.LoginState, status.Account.Status)))
+	return state != "" && state != "signed out"
+}
+
+// ── routes ──────────────────────────────────────────────────────────────
+
+func (b *Broker) handleBoxSigninStart(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	flow := &b.boxSignin
+	flow.mu.Lock()
+	switch flow.state.Status {
+	case boxSigninStatusInstalling, boxSigninStatusAwaitingLogin, boxSigninStatusProvisioning:
+		state := flow.state
+		flow.mu.Unlock()
+		writeJSON(w, http.StatusOK, state)
+		return
+	}
+	if config.ResolveBoxAPIKey() != "" {
+		flow.state = boxSigninState{Status: boxSigninStatusDone}
+		state := flow.state
+		flow.mu.Unlock()
+		writeJSON(w, http.StatusOK, state)
+		return
+	}
+	if _, ok := boxCLIBinary(); !ok {
+		flow.state = boxSigninState{Status: boxSigninStatusInstalling, InstallCommand: boxInstallCommand}
+		flow.deadline = time.Now().Add(boxInstallTimeout + 30*time.Second)
+		state := flow.state
+		flow.mu.Unlock()
+		go b.boxSigninAutoInstall()
+		writeJSON(w, http.StatusOK, state)
+		return
+	}
+	flow.state = boxSigninState{Status: boxSigninStatusInstalling}
+	state := flow.state
+	flow.mu.Unlock()
+	go b.boxSigninBeginLogin()
+	writeJSON(w, http.StatusOK, state)
+}
+
+func (b *Broker) handleBoxSigninStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	flow := &b.boxSignin
+	flow.mu.Lock()
+	state := flow.state
+	deadline := flow.deadline
+	flow.mu.Unlock()
+	if state.Status == "" {
+		state.Status = boxSigninStatusIdle
+		if config.ResolveBoxAPIKey() != "" {
+			state.Status = boxSigninStatusDone
+		}
+	}
+	if state.Status == boxSigninStatusInstalling && !deadline.IsZero() && time.Now().After(deadline) {
+		flow.mu.Lock()
+		if flow.state.Status == boxSigninStatusInstalling {
+			flow.state = boxSigninState{Status: boxSigninStatusCLIMissing, InstallCommand: boxInstallCommand,
+				Reason: "the Box CLI install is taking too long — run the install command shown, then try again"}
+		}
+		state = flow.state
+		flow.mu.Unlock()
+	}
+	if state.Status == boxSigninStatusAwaitingLogin {
+		// `box onboard` completes a finished browser session and returns at
+		// once when it is not finished, so the poll drives completion.
+		flow.mu.Lock()
+		due := time.Since(flow.lastComplete) >= boxCompleteEvery
+		if due {
+			flow.lastComplete = time.Now()
+		}
+		flow.mu.Unlock()
+		if due {
+			boxTryCompleteLogin(r.Context())
+		}
+		if b.boxSigninAdvanceIfLoggedIn(r.Context()) {
+			flow.mu.Lock()
+			state = flow.state
+			flow.mu.Unlock()
+		} else if !deadline.IsZero() && time.Now().After(deadline) {
+			flow.mu.Lock()
+			if flow.state.Status == boxSigninStatusAwaitingLogin {
+				flow.state = boxSigninState{Status: boxSigninStatusError, Reason: "sign-in timed out — try again, or paste a key from ascii.dev"}
+			}
+			state = flow.state
+			flow.mu.Unlock()
+		}
+	}
+	writeJSON(w, http.StatusOK, state)
+}
+
+// handleBoxSigninCancel abandons a pending sign-in so the person can start
+// over. POST /computer/box/signin/cancel
+func (b *Broker) handleBoxSigninCancel(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	if !requireJSONBody(w, r) {
+		return
+	}
+	flow := &b.boxSignin
+	flow.mu.Lock()
+	flow.generation++
+	flow.state = boxSigninState{Status: boxSigninStatusIdle}
+	flow.deadline = time.Time{}
+	flow.mu.Unlock()
+	writeJSON(w, http.StatusOK, map[string]string{"status": boxSigninStatusIdle})
+}
+
+// boxTryCompleteLogin runs the CLI's completion step once. Output is
+// discarded: it carries the session token.
+func boxTryCompleteLogin(ctx context.Context) {
+	ctx, cancel := context.WithTimeout(ctx, boxProbeTimeout)
+	defer cancel()
+	cmd, err := boxCommand(ctx, "onboard")
+	if err != nil {
+		return
+	}
+	cmd.Stdin = nil
+	cmd.Stdout, cmd.Stderr = io.Discard, io.Discard
+	_ = cmd.Run()
+}
+
+// ── flow ────────────────────────────────────────────────────────────────
+
+func (b *Broker) boxSigninAutoInstall() {
+	ctx, cancel := context.WithTimeout(context.Background(), boxInstallTimeout)
+	defer cancel()
+	runErr := boxInstaller(ctx)
+	if _, ok := boxCLIBinary(); !ok {
+		flow := &b.boxSignin
+		flow.mu.Lock()
+		if flow.state.Status == boxSigninStatusInstalling {
+			reason := "could not install the Box CLI automatically — run the install command shown, then try again"
+			if runErr != nil {
+				reason = "could not install the Box CLI: " + runErr.Error()
+			}
+			flow.state = boxSigninState{Status: boxSigninStatusCLIMissing, InstallCommand: boxInstallCommand, Reason: reason}
+		}
+		flow.mu.Unlock()
+		return
+	}
+	b.boxSigninBeginLogin()
+}
+
+// boxSigninBeginLogin runs `box login --json`, surfaces the login URL, then
+// waits for the CLI to report the finished session and provisions a key.
+func (b *Broker) boxSigninBeginLogin() {
+	flow := &b.boxSignin
+	flow.mu.Lock()
+	if flow.state.Status != boxSigninStatusInstalling {
+		flow.mu.Unlock()
+		return
+	}
+	if boxCLILoggedIn(context.Background()) {
+		flow.state = boxSigninState{Status: boxSigninStatusProvisioning}
+		flow.mu.Unlock()
+		go b.boxSigninProvision()
+		return
+	}
+	flow.state = boxSigninState{Status: boxSigninStatusAwaitingLogin}
+	flow.deadline = time.Now().Add(boxLoginWindow)
+	generation := flow.generation
+	flow.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), boxLoginWindow)
+	defer cancel()
+	cmd, err := boxCommand(ctx, "login")
+	if err != nil {
+		b.boxSigninFail("the Box CLI could not start: " + err.Error())
+		return
+	}
+	cmd.Stdin = nil
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		b.boxSigninFail("the Box CLI could not start: " + err.Error())
+		return
+	}
+	if err := cmd.Start(); err != nil {
+		b.boxSigninFail("the Box CLI could not start: " + err.Error())
+		return
+	}
+	scanner := bufio.NewScanner(stdout)
+	scanner.Buffer(make([]byte, 0, 64<<10), 1<<20)
+	for scanner.Scan() {
+		var evt struct {
+			Event string `json:"event"`
+			URL   string `json:"url"`
+		}
+		if json.Unmarshal(scanner.Bytes(), &evt) != nil {
+			continue
+		}
+		if evt.Event == "login_url" && evt.URL != "" {
+			flow.mu.Lock()
+			if flow.state.Status == boxSigninStatusAwaitingLogin && flow.generation == generation {
+				flow.state.AuthURL = evt.URL
+			}
+			flow.mu.Unlock()
+		}
+	}
+	// `box login` exits as soon as it has printed the URL. The CLI's own
+	// completion step is `box onboard --json`, which polls the pending
+	// browser session until it finishes (the event it names as nextCommand).
+	// Output deliberately not logged: it carries the session token.
+	_ = cmd.Wait()
+	flow.mu.Lock()
+	stale := flow.generation != generation
+	flow.mu.Unlock()
+	if stale {
+		return
+	}
+	boxTryCompleteLogin(ctx)
+	b.boxSigninAdvanceIfLoggedIn(context.Background())
+}
+
+func (b *Broker) boxSigninAdvanceIfLoggedIn(ctx context.Context) bool {
+	if !boxCLILoggedIn(ctx) {
+		return false
+	}
+	flow := &b.boxSignin
+	flow.mu.Lock()
+	if flow.state.Status != boxSigninStatusAwaitingLogin {
+		flow.mu.Unlock()
+		return false
+	}
+	flow.state = boxSigninState{Status: boxSigninStatusProvisioning}
+	flow.mu.Unlock()
+	go b.boxSigninProvision()
+	return true
+}
+
+func (b *Broker) boxSigninFail(reason string) {
+	flow := &b.boxSignin
+	flow.mu.Lock()
+	flow.state = boxSigninState{Status: boxSigninStatusError, Reason: reason}
+	flow.mu.Unlock()
+}
+
+// boxSigninProvision mints a key named hivebot, verifies it, and stores it.
+func (b *Broker) boxSigninProvision() {
+	ctx, cancel := context.WithTimeout(context.Background(), boxMintTimeout)
+	defer cancel()
+	secret, err := boxMintAPIKey(ctx)
+	if err == nil {
+		err = box.VerifyToken(ctx, boxAPIBase(), secret)
+	}
+	if err == nil {
+		err = b.storeBoxAPIKey(secret)
+		if err != nil {
+			log.Printf("box signin: %v", err)
+			err = errors.New("could not save the Box key to config — check the broker logs")
+		}
+	}
+	flow := &b.boxSignin
+	flow.mu.Lock()
+	defer flow.mu.Unlock()
+	if err != nil {
+		flow.state = boxSigninState{Status: boxSigninStatusError, Reason: err.Error()}
+		return
+	}
+	flow.state = boxSigninState{Status: boxSigninStatusDone}
+}
+
+func boxMintAPIKey(ctx context.Context) (string, error) {
+	cmd, err := boxCommand(ctx, "api-key", "create", boxKeyName)
+	if err != nil {
+		return "", err
+	}
+	out, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("box api-key create failed: %w", err)
+	}
+	// The CLI may emit JSONL; the secret is on whichever object carries it.
+	for _, line := range strings.Split(string(out), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		var obj map[string]any
+		if json.Unmarshal([]byte(line), &obj) != nil {
+			continue
+		}
+		for _, field := range []string{"secret", "key", "token", "apiKey", "api_key"} {
+			if v, ok := obj[field].(string); ok && strings.TrimSpace(v) != "" {
+				return strings.TrimSpace(v), nil
+			}
+		}
+		if nested, ok := obj["apiKey"].(map[string]any); ok {
+			if v, ok := nested["secret"].(string); ok && v != "" {
+				return v, nil
+			}
+		}
+	}
+	return "", errors.New("the Box CLI did not print a key secret")
+}
+
+func (b *Broker) storeBoxAPIKey(key string) error {
+	b.configMu.Lock()
+	defer b.configMu.Unlock()
+	cfg, err := config.Load()
+	if err != nil {
+		return fmt.Errorf("config load failed: %w", err)
+	}
+	cfg.BoxAPIKey = strings.TrimSpace(key)
+	if err := config.Save(cfg); err != nil {
+		return fmt.Errorf("config save failed: %w", err)
+	}
+	return nil
+}
+
+// ── account and sign-out ────────────────────────────────────────────────
+
+type boxAccountView struct {
+	KeySet     bool   `json:"key_set"`
+	SignedIn   bool   `json:"signed_in"`
+	Identifier string `json:"identifier,omitempty"`
+	CLI        bool   `json:"cli_installed"`
+	// Plan gate, from `box limits`. CanStart is nil when unknown (not signed
+	// in, CLI missing); false with a BlockedReason such as
+	// subscription_required means no box will start until the person acts.
+	CanStart      *bool  `json:"can_start"`
+	BlockedReason string `json:"blocked_reason,omitempty"`
+	Plan          string `json:"plan,omitempty"`
+	TrialLine     string `json:"trial_line,omitempty"`
+	BillingURL    string `json:"billing_url"`
+}
+
+// boxBillingURL is where a plan or the 7-day trial is started. Deliberately
+// the plain dashboard link: the CLI's own billing link embeds the session
+// token, which must never reach the browser.
+const boxBillingURL = box.BillingURL
+
+// boxReadLimits fills the plan gate from `box limits --json`.
+func boxReadLimits(ctx context.Context, view *boxAccountView) {
+	probe, cancel := context.WithTimeout(ctx, boxProbeTimeout)
+	defer cancel()
+	cmd, err := boxCommand(probe, "limits")
+	if err != nil {
+		return
+	}
+	out, err := cmd.Output()
+	if err != nil {
+		return
+	}
+	var raw map[string]json.RawMessage
+	if json.Unmarshal(out, &raw) != nil {
+		return
+	}
+	payload := out
+	if nested, ok := raw["limits"]; ok {
+		payload = nested
+	}
+	var limits struct {
+		CanStart      *bool   `json:"canStart"`
+		BlockedReason *string `json:"blockedReason"`
+		PlanName      *string `json:"planName"`
+		AccessTier    *string `json:"accessTier"`
+		TrialLine     *string `json:"trialLine"`
+	}
+	if json.Unmarshal(payload, &limits) != nil || limits.CanStart == nil {
+		return
+	}
+	view.CanStart = limits.CanStart
+	if limits.BlockedReason != nil {
+		view.BlockedReason = *limits.BlockedReason
+	}
+	if limits.PlanName != nil && *limits.PlanName != "" {
+		view.Plan = *limits.PlanName
+	} else if limits.AccessTier != nil {
+		view.Plan = *limits.AccessTier
+	}
+	if limits.TrialLine != nil {
+		view.TrialLine = *limits.TrialLine
+	}
+}
+
+var (
+	boxAccountCacheTTL = 30 * time.Second
+	boxAccountMu       sync.Mutex
+	boxAccountCached   boxAccountView
+	boxAccountAt       time.Time
+)
+
+// boxAccount reads the CLI session (cached) and the key flag.
+func boxAccount(ctx context.Context, fresh bool) boxAccountView {
+	boxAccountMu.Lock()
+	cached, at := boxAccountCached, boxAccountAt
+	boxAccountMu.Unlock()
+	if !fresh && time.Since(at) < boxAccountCacheTTL {
+		cached.KeySet = config.ResolveBoxAPIKey() != ""
+		return cached
+	}
+	view := boxAccountView{KeySet: config.ResolveBoxAPIKey() != "", BillingURL: boxBillingURL}
+	// The key alone answers the two questions that matter, through REST:
+	// who the account is, and whether ascii.dev will start a box. This
+	// covers pasted keys and machines with no CLI session.
+	if view.KeySet {
+		c := box.NewClient(config.ResolveBoxAPIKey())
+		c.API = boxAPIBase()
+		probe, cancel := context.WithTimeout(ctx, boxProbeTimeout)
+		if login, email, err := c.Me(probe); err == nil {
+			view.SignedIn = true
+			view.Identifier = firstNonEmpty(email, login)
+		}
+		if limits, err := c.Limits(probe); err == nil {
+			view.CanStart = limits.CanStart
+			view.BlockedReason = limits.BlockedReason
+			view.Plan = firstNonEmpty(limits.PlanName, limits.AccessTier)
+			view.TrialLine = limits.TrialLine
+		}
+		cancel()
+	}
+	if _, ok := boxCLIBinary(); ok {
+		view.CLI = true
+		probe, cancel := context.WithTimeout(ctx, boxProbeTimeout)
+		if cmd, err := boxCommand(probe, "status"); err == nil {
+			if out, err := cmd.Output(); err == nil {
+				var status struct {
+					Account struct {
+						Identifier string `json:"identifier"`
+						LoginState string `json:"loginState"`
+					} `json:"account"`
+				}
+				if json.Unmarshal(out, &status) == nil {
+					state := strings.ToLower(strings.TrimSpace(status.Account.LoginState))
+					cliSignedIn := state != "" && state != "signed out"
+					if cliSignedIn {
+						view.SignedIn = true
+						if view.Identifier == "" {
+							view.Identifier = strings.TrimSpace(status.Account.Identifier)
+						}
+					}
+					if cliSignedIn && view.CanStart == nil {
+						boxReadLimits(ctx, &view)
+					}
+				}
+			}
+		}
+		cancel()
+	}
+	boxAccountMu.Lock()
+	boxAccountCached, boxAccountAt = view, time.Now()
+	boxAccountMu.Unlock()
+	return view
+}
+
+func (b *Broker) handleBoxAccount(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	writeJSON(w, http.StatusOK, boxAccount(r.Context(), r.URL.Query().Get("fresh") == "1"))
+}
+
+// handleBoxSignout revokes the hivebot key on the account (best effort),
+// ends the CLI session, and forgets the stored key, so the next sign-in
+// starts clean. POST /computer/box/signout
+func (b *Broker) handleBoxSignout(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	if !requireJSONBody(w, r) {
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 90*time.Second)
+	defer cancel()
+	revoked := boxRevokeGawkbotKeys(ctx)
+	loggedOut := false
+	if cmd, err := boxCommand(ctx, "logout"); err == nil {
+		cmd.Stdout, cmd.Stderr = io.Discard, io.Discard
+		loggedOut = cmd.Run() == nil
+	}
+	if err := b.storeBoxAPIKey(""); err != nil {
+		log.Printf("box signout: %v", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not clear the stored key — check the broker logs"})
+		return
+	}
+	flow := &b.boxSignin
+	flow.mu.Lock()
+	flow.state = boxSigninState{Status: boxSigninStatusIdle}
+	flow.deadline = time.Time{}
+	flow.mu.Unlock()
+	view := boxAccount(ctx, true)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":       boxSigninStatusIdle,
+		"revoked_keys": revoked,
+		"logged_out":   loggedOut,
+		"account":      view,
+	})
+}
+
+// boxRevokeGawkbotKeys revokes every key the CLI lists under the hivebot
+// name. Best effort: a missing session or an old CLI just yields zero.
+func boxRevokeGawkbotKeys(ctx context.Context) int {
+	cmd, err := boxCommand(ctx, "api-key", "list")
+	if err != nil {
+		return 0
+	}
+	out, err := cmd.Output()
+	if err != nil {
+		return 0
+	}
+	var listing struct {
+		APIKeys []struct {
+			ID   string `json:"id"`
+			Name string `json:"name"`
+		} `json:"apiKeys"`
+	}
+	if json.Unmarshal(out, &listing) != nil {
+		return 0
+	}
+	revoked := 0
+	for _, key := range listing.APIKeys {
+		if key.Name != boxKeyName || key.ID == "" {
+			continue
+		}
+		if revoke, err := boxCommand(ctx, "api-key", "revoke", key.ID); err == nil {
+			revoke.Stdout, revoke.Stderr = io.Discard, io.Discard
+			if revoke.Run() == nil {
+				revoked++
+			}
+		}
+	}
+	return revoked
+}

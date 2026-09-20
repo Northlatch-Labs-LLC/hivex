@@ -1,0 +1,933 @@
+import { type ReactNode, useMemo, useState } from "react";
+
+import type { StreamLine } from "../../hooks/useBotStream";
+import { keyedByOccurrence } from "../../lib/reactKeys";
+import { useAppStore } from "../../stores/app";
+
+interface StreamLineViewProps {
+  line: StreamLine;
+  /** Compact mode collapses arrays and objects beyond the first level. */
+  compact?: boolean;
+  /**
+   * Whose stream this is. Computer tool cards show that bot's live frame as
+   * a thumbnail; the HeadlessEvent `bot` field wins when present.
+   */
+  agentSlug?: string;
+}
+
+const COMPUTER_TOOL_PREFIX = "mcp__computer__";
+
+/**
+ * Renders one SSE line from the bot stream. Understands the broker's
+ * OpenAI-Responses-style events — bot messages render as dim thinking
+ * lines, tool calls render as collapsible cards. Everything else falls
+ * back to pretty-printed JSON.
+ */
+// biome-ignore lint/complexity/noExcessiveCognitiveComplexity: Existing cognitive complexity is baselined for a focused follow-up refactor.
+export function StreamLineView({
+  line,
+  compact = false,
+  agentSlug,
+}: StreamLineViewProps) {
+  const { data, parsed } = line;
+  if (!parsed) {
+    // Raw chunks from botStream.Push (local-LLM streaming text). The
+    // useBotStream hook coalesces consecutive raw events into a
+    // single StreamLine, so this branch renders the running model
+    // output as a continuous text block \u2014 not one chunk per row.
+    // Trailing ellipsis keeps the live-output panel visually capped.
+    const text = data.length > 1200 ? `${data.slice(0, 1200)}\u2026` : data;
+    return <div className="stream-line stream-line-raw">{text}</div>;
+  }
+
+  // HeadlessEvent envelope: provider-agnostic, runner-emitted typed
+  // event. Wire shape mirrors internal/team/headless_event.go's struct.
+  // Branch first so the discriminator wins over provider-native `type`
+  // routes below (e.g. `assistant`, `mcp_tool_event`).
+  if (parsed.kind === "headless_event") {
+    return (
+      <HeadlessEventView
+        parsed={parsed}
+        compact={compact}
+        agentSlug={agentSlug}
+      />
+    );
+  }
+
+  // Settled frame appended at turn end when the turn touched the screen.
+  // Wire: docs/specs/hivebot-bot-computers.md, "Bot stream lines".
+  if (parsed.kind === "computer_frame") {
+    return <ComputerFrameCard parsed={parsed} />;
+  }
+
+  const evtType = typeof parsed.type === "string" ? parsed.type : "";
+
+  // Skip noise events entirely
+  if (
+    evtType === "thread.started" ||
+    evtType === "turn.started" ||
+    evtType === "item.started"
+  ) {
+    return null;
+  }
+
+  // Suppress per-turn completion frames — they used to render a token total.
+  if (evtType === "turn.completed" || evtType === "response.completed") {
+    return null;
+  }
+
+  if (evtType === "mcp_tool_event") {
+    const phase = stringish(parsed.phase);
+    const tool = stringish(parsed.tool) || "tool";
+    return (
+      <ToolCallCard
+        item={{
+          type: "tool_call",
+          name: phase ? `${phase}: ${tool}` : tool,
+          arguments: parsed.arguments ?? parsed.args,
+          result: parsed.result,
+          error: parsed.error,
+        }}
+        compact={compact}
+      />
+    );
+  }
+
+  if (evtType === "assistant") {
+    return <ClaudeAssistantEvent parsed={parsed} compact={compact} />;
+  }
+
+  if (evtType === "user") {
+    return <ClaudeUserEvent parsed={parsed} compact={compact} />;
+  }
+
+  if (evtType === "result") {
+    const text = stringish(parsed.result).trim();
+    if (text) return <div className="cc-thinking">{text}</div>;
+  }
+
+  if (evtType === "response.output_text.delta") {
+    const text = stringish(parsed.delta ?? parsed.text).trim();
+    if (text) return <div className="cc-thinking">{text}</div>;
+  }
+
+  // item.completed → agent_message / tool call
+  if (
+    evtType === "item.completed" &&
+    parsed.item &&
+    typeof parsed.item === "object"
+  ) {
+    const item = parsed.item as Record<string, unknown>;
+    const itemType = typeof item.type === "string" ? item.type : "";
+
+    if (
+      itemType === "agent_message" ||
+      itemType === "message" ||
+      itemType === "assistant"
+    ) {
+      const text = codexItemText(item);
+      if (!text) return null;
+      const truncated =
+        text.length > 500 ? `${text.slice(0, 500)}\u2026` : text;
+      return <div className="cc-thinking">{truncated}</div>;
+    }
+
+    if (
+      itemType === "mcp_tool_call" ||
+      itemType === "tool_call" ||
+      itemType === "function_call"
+    ) {
+      return <ToolCallCard item={item} compact={compact} />;
+    }
+
+    // Other completed items are bookkeeping; drop.
+    return null;
+  }
+
+  // Fallback: structured event with type/phase/bot + detail + extras
+  return <GenericEventCard parsed={parsed} compact={compact} />;
+}
+
+// HeadlessEventView renders the typed HeadlessEvent envelope emitted by
+// each runner. The wire shape comes from internal/team/headless_event.go
+// (HeadlessEvent struct). A4 adds the "manifest" type — a per-turn
+// completion summary with tool-call counts and text byte stats.
+function HeadlessEventView({
+  parsed,
+  compact,
+  agentSlug,
+}: {
+  parsed: Record<string, unknown>;
+  compact: boolean;
+  agentSlug?: string;
+}) {
+  const eventType = stringish(parsed.type);
+  const provider = stringish(parsed.provider);
+  const text = stringish(parsed.text);
+  const detail = stringish(parsed.detail);
+  const summary = (text || detail).trim();
+  const metrics =
+    parsed.metrics && typeof parsed.metrics === "object"
+      ? (parsed.metrics as Record<string, unknown>)
+      : null;
+
+  if (eventType === "idle") {
+    return (
+      <div className="stream-card stream-card-idle">
+        <div className="stream-card-header">
+          <span className="stream-card-phase stream-phase-idle">idle</span>
+          {provider && <span className="stream-card-agent">{provider}</span>}
+        </div>
+        {summary && <div className="stream-card-detail">{summary}</div>}
+        {metrics && (
+          <div className="stream-line-json">
+            <Value value={metrics} depth={0} compact={true} />
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  if (eventType === "error") {
+    return (
+      <div className="stream-card stream-card-error">
+        <div className="stream-card-header">
+          <span className="stream-card-phase stream-phase-error">error</span>
+          {provider && <span className="stream-card-agent">{provider}</span>}
+        </div>
+        {summary && <div className="cc-tool-error-text">{summary}</div>}
+      </div>
+    );
+  }
+
+  if (eventType === "text") {
+    // Text events render as the same dim "thinking" block the
+    // provider-native paths use, so a stream containing both raw
+    // provider chunks (today's wire) and HeadlessEvent text (A3+)
+    // looks visually consistent. Empty text is dropped at the runner
+    // boundary; we still guard here because old captures may exist.
+    if (!text.trim()) return null;
+    return <div className="cc-thinking">{text}</div>;
+  }
+
+  if (eventType === "tool_use" || eventType === "tool_result") {
+    // Reuse the existing ToolCallCard so HeadlessEvent tool entries
+    // get the same collapsible chrome as the provider-native paths.
+    // Wire mapping: HeadlessEvent.tool_name -> name, .detail -> args
+    // for tool_use, .text -> result for tool_result.
+    const toolName = stringish(parsed.tool_name) || "tool";
+    const item = {
+      type: "tool_call",
+      name: toolName,
+      arguments: eventType === "tool_use" ? parsed.detail : undefined,
+      result: eventType === "tool_result" ? parsed.text : undefined,
+    };
+    if (toolName.startsWith(COMPUTER_TOOL_PREFIX)) {
+      return (
+        <ComputerToolCallCard
+          item={item}
+          compact={compact}
+          slug={stringish(parsed.agent) || agentSlug || ""}
+        />
+      );
+    }
+    return <ToolCallCard item={item} compact={compact} />;
+  }
+
+  if (eventType === "manifest") {
+    // manifest is a per-turn completion record emitted after idle/error.
+    // Render as a compact summary row: tool badges + text bytes + tokens.
+    const toolCalls = Array.isArray(parsed.tool_calls)
+      ? (parsed.tool_calls as Array<Record<string, unknown>>)
+      : [];
+    const textLen =
+      typeof parsed.text_len === "number" ? parsed.text_len : null;
+    const inputTokens =
+      metrics && typeof metrics.input_tokens === "number"
+        ? metrics.input_tokens
+        : null;
+    const outputTokens =
+      metrics && typeof metrics.output_tokens === "number"
+        ? metrics.output_tokens
+        : null;
+    const hasStats =
+      toolCalls.length > 0 ||
+      (textLen !== null && textLen > 0) ||
+      (inputTokens !== null && outputTokens !== null);
+    if (!hasStats) return null;
+    return (
+      <div className="stream-card stream-card-manifest">
+        <div className="stream-card-header">
+          <span className="stream-card-phase stream-phase-manifest">turn</span>
+          {provider && <span className="stream-card-agent">{provider}</span>}
+        </div>
+        <div className="stream-manifest-stats">
+          {toolCalls.map((tc) => {
+            const name = stringish(tc.tool_name) || "tool";
+            const count = typeof tc.count === "number" ? tc.count : 1;
+            return (
+              <span key={name} className="stream-manifest-tool-badge">
+                {count > 1 ? `${name} ×${count}` : name}
+              </span>
+            );
+          })}
+          {textLen !== null && textLen > 0 && (
+            <span className="stream-manifest-stat">
+              {textLen.toLocaleString("en-US")} bytes
+            </span>
+          )}
+          {inputTokens !== null && outputTokens !== null && (
+            <span className="stream-manifest-stat">
+              {(inputTokens + outputTokens).toLocaleString("en-US")} tok
+            </span>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  // Unknown HeadlessEvent type — fall back to the generic card so future
+  // variants render something useful before they earn a dedicated branch.
+  return <GenericEventCard parsed={parsed} compact={compact} />;
+}
+
+function ClaudeAssistantEvent({
+  parsed,
+  compact,
+}: {
+  parsed: Record<string, unknown>;
+  compact: boolean;
+}) {
+  const blocks = messageContentBlocks(parsed);
+  const rendered = keyedStreamValues(blocks)
+    .map(({ key, value: block }) => {
+      const blockType = stringish(block.type);
+      if (blockType === "text") {
+        const text = stringish(block.text).trim();
+        return text ? (
+          <div key={key} className="cc-thinking">
+            {text}
+          </div>
+        ) : null;
+      }
+      if (blockType === "thinking") {
+        const text = stringish(block.thinking).trim();
+        return text ? (
+          <div key={key} className="stream-card-detail">
+            {text}
+          </div>
+        ) : null;
+      }
+      if (blockType === "tool_use") {
+        return (
+          <ToolCallCard
+            key={key}
+            item={{
+              type: "tool_call",
+              name: block.name,
+              arguments: block.input,
+            }}
+            compact={compact}
+          />
+        );
+      }
+      return null;
+    })
+    .filter(Boolean);
+
+  if (rendered.length === 0) return null;
+  if (rendered.length === 1) return <>{rendered[0]}</>;
+  return <div className="stream-event-stack">{rendered}</div>;
+}
+
+function ClaudeUserEvent({
+  parsed,
+  compact,
+}: {
+  parsed: Record<string, unknown>;
+  compact: boolean;
+}) {
+  const blocks = messageContentBlocks(parsed);
+  const rendered = keyedStreamValues(blocks)
+    .map(({ key, value: block }) => {
+      if (stringish(block.type) !== "tool_result") return null;
+      const { content } = block;
+      return (
+        <div key={key} className="cc-tool-call">
+          <div className="cc-tool-section-label">Tool result</div>
+          <ToolResultContent
+            text={stringFromToolContent(content)}
+            compact={compact}
+          />
+        </div>
+      );
+    })
+    .filter(Boolean);
+
+  const toolUseResult = parsed.tool_use_result;
+  if (toolUseResult && typeof toolUseResult === "object") {
+    const result = toolUseResult as Record<string, unknown>;
+    const text = [stringish(result.stdout), stringish(result.stderr)]
+      .filter(Boolean)
+      .join("\n");
+    if (text) {
+      rendered.push(
+        <div key="tool-use-result" className="cc-tool-call">
+          <div className="cc-tool-section-label">Tool result</div>
+          <ToolResultContent text={text} compact={compact} />
+        </div>,
+      );
+    }
+  }
+
+  if (rendered.length === 0) return null;
+  if (rendered.length === 1) return <>{rendered[0]}</>;
+  return <div className="stream-event-stack">{rendered}</div>;
+}
+
+function messageContentBlocks(
+  parsed: Record<string, unknown>,
+): Record<string, unknown>[] {
+  const { message } = parsed;
+  if (!message || typeof message !== "object") return [];
+  const { content } = message as Record<string, unknown>;
+  if (!Array.isArray(content)) return [];
+  return content.filter(
+    (block): block is Record<string, unknown> =>
+      !!block && typeof block === "object",
+  );
+}
+
+function codexItemText(item: Record<string, unknown>): string {
+  const direct = stringish(item.text).trim();
+  if (direct) return direct;
+  const { content } = item;
+  if (!Array.isArray(content)) return "";
+  return content
+    .map((part) => {
+      if (!part || typeof part !== "object") return "";
+      const p = part as Record<string, unknown>;
+      const typ = stringish(p.type);
+      if (typ && typ !== "output_text" && typ !== "text") return "";
+      return stringish(p.text).trim();
+    })
+    .filter(Boolean)
+    .join("\n");
+}
+
+function stringFromToolContent(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content
+      .map((item) => {
+        if (typeof item === "string") return item;
+        if (item && typeof item === "object") {
+          const obj = item as Record<string, unknown>;
+          return stringish(obj.text ?? obj.content);
+        }
+        return "";
+      })
+      .filter(Boolean)
+      .join("\n");
+  }
+  if (content && typeof content === "object") {
+    return JSON.stringify(content);
+  }
+  return "";
+}
+
+const ARG_SKIP = new Set(["my_slug", "new_topic", "viewer_slug", "tagged"]);
+
+/**
+ * Settled end-of-turn screen frame: an image card sized like an artifact.
+ * Honest by construction: it only renders when the broker sent bytes.
+ */
+function ComputerFrameCard({ parsed }: { parsed: Record<string, unknown> }) {
+  const dataUrl = stringish(parsed.data_url);
+  if (!dataUrl.startsWith("data:image/")) return null;
+  const slug = stringish(parsed.slug) || "bot";
+  return (
+    <div className="stream-computer-frame" data-testid="stream-computer-frame">
+      <img src={dataUrl} alt={`${slug}'s screen`} />
+      <div className="stream-computer-frame-caption">{`${slug}'s screen`}</div>
+    </div>
+  );
+}
+
+/**
+ * Computer tool calls carry the bot's latest live frame as a thumbnail so
+ * a reader can see what the click landed on without opening the tab. The
+ * store is the only source: no frame, no thumbnail.
+ */
+function ComputerToolCallCard({
+  item,
+  compact,
+  slug,
+}: {
+  item: Record<string, unknown>;
+  compact: boolean;
+  slug: string;
+}) {
+  const frame = useAppStore((s) =>
+    slug ? (s.computerStates[slug]?.frameDataUrl ?? null) : null,
+  );
+  return (
+    <ToolCallCard
+      item={item}
+      compact={compact}
+      thumbSrc={frame}
+      thumbAlt={`${slug}'s screen`}
+    />
+  );
+}
+
+function ToolCallCard({
+  item,
+  compact,
+  thumbSrc,
+  thumbAlt,
+}: {
+  item: Record<string, unknown>;
+  compact: boolean;
+  /** Optional live-screen thumbnail rendered at the header's right edge. */
+  thumbSrc?: string | null;
+  thumbAlt?: string;
+}) {
+  const [open, setOpen] = useState(false);
+  const toolName =
+    (item.tool as string | undefined) ||
+    (item.name as string | undefined) ||
+    "tool";
+  const args = objectFromToolField(item.arguments ?? item.args);
+  const result = normalizeToolResult(item.result);
+  // The tool-event payload omits `error` for successful calls, so the
+  // field arrives as undefined (not null). The previous `!== null`
+  // gate let undefined through and rendered an "× ERROR / undefined"
+  // chip for every successful tool call. Treat null AND undefined AND
+  // the empty string as "no error".
+  const hasError =
+    item.error !== null && item.error !== undefined && item.error !== "";
+  const errorField = hasError ? item.error : null;
+
+  // biome-ignore lint/complexity/noExcessiveCognitiveComplexity: Existing cognitive complexity is baselined for a focused follow-up refactor.
+  const { summaryArg, summaryResult, summaryError } = useMemo(() => {
+    const pick = [
+      args.content,
+      args.command,
+      args.text,
+      args.query,
+      args.channel,
+    ].find((v) => typeof v === "string" && v.length > 0);
+    const sumArg =
+      typeof pick === "string"
+        ? pick.length > 80
+          ? `${pick.slice(0, 80)}\u2026`
+          : pick
+        : "";
+
+    let sumResult = "";
+    if (result && Array.isArray(result.content)) {
+      for (const c of result.content) {
+        if (c.text) {
+          let short = c.text;
+          try {
+            const rp = JSON.parse(c.text);
+            if (rp && typeof rp === "object") {
+              short =
+                rp.message ||
+                rp.status ||
+                rp.result ||
+                rp.text ||
+                `${Object.keys(rp).length} fields`;
+            }
+          } catch {
+            // keep plain text
+          }
+          sumResult = short.length > 60 ? `${short.slice(0, 60)}\u2026` : short;
+          break;
+        }
+      }
+    }
+
+    let sumError = "";
+    if (hasError) {
+      sumError =
+        typeof errorField === "string" ? errorField.slice(0, 60) : "Error";
+    }
+
+    return {
+      summaryArg: sumArg,
+      summaryResult: sumResult,
+      summaryError: sumError,
+    };
+  }, [args, result, errorField, hasError]);
+
+  const cleanArgs = useMemo<Record<string, unknown>>(() => {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(args)) {
+      if (!ARG_SKIP.has(k) && v !== null && v !== "") out[k] = v;
+    }
+    return out;
+  }, [args]);
+  return (
+    <div className="cc-tool-call">
+      <button
+        type="button"
+        className="cc-tool-header"
+        onClick={() => setOpen((o) => !o)}
+      >
+        <span className={`cc-tool-chevron${open ? " open" : ""}`}>▸</span>
+        <span className="cc-tool-name">{toolName}</span>
+        {summaryArg ? (
+          <span className="cc-tool-summary">{summaryArg}</span>
+        ) : null}
+        {thumbSrc ? (
+          <img
+            src={thumbSrc}
+            alt={thumbAlt ?? "screen"}
+            className="cc-tool-thumb"
+            data-testid="cc-tool-thumb"
+          />
+        ) : null}
+      </button>
+      {summaryResult && !open && (
+        <div className="cc-tool-result-summary">
+          {"\u2713 "}
+          {summaryResult}
+        </div>
+      )}
+      {summaryError && !open && (
+        <div className="cc-tool-error">
+          {"\u2717 "}
+          {summaryError}
+        </div>
+      )}
+      {open ? (
+        <div className="cc-tool-body">
+          {Object.keys(cleanArgs).length > 0 && (
+            <>
+              <div className="cc-tool-section-label">Args</div>
+              <Value value={cleanArgs} depth={1} compact={compact} />
+            </>
+          )}
+          {result &&
+            Array.isArray(result.content) &&
+            result.content.length > 0 && (
+              <>
+                <div className="cc-tool-section-label cc-tool-result-label">
+                  {"\u2713 Response"}
+                </div>
+                {keyedStreamValues(result.content).map(({ key, value: c }) => (
+                  <ToolResultContent
+                    key={key}
+                    text={c.text}
+                    compact={compact}
+                  />
+                ))}
+              </>
+            )}
+          {hasError ? (
+            <>
+              <div className="cc-tool-section-label cc-tool-error">
+                {"\u2717 Error"}
+              </div>
+              <ToolErrorContent error={errorField} compact={compact} />
+            </>
+          ) : null}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function objectFromToolField(value: unknown): Record<string, unknown> {
+  if (!value) return {};
+  if (typeof value === "string") {
+    try {
+      const parsed = JSON.parse(value);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        return parsed as Record<string, unknown>;
+      }
+    } catch {
+      // keep as scalar below
+    }
+    return { value };
+  }
+  if (typeof value === "object" && !Array.isArray(value)) {
+    return value as Record<string, unknown>;
+  }
+  return { value };
+}
+
+function normalizeToolResult(
+  value: unknown,
+): { content?: Array<{ text?: string }> } | undefined {
+  if (value === null || value === "") return undefined;
+  if (typeof value === "object" && !Array.isArray(value)) {
+    const obj = value as { content?: Array<{ text?: string }> };
+    if (Array.isArray(obj.content)) return obj;
+    return { content: [{ text: JSON.stringify(value) }] };
+  }
+  return {
+    content: [
+      { text: typeof value === "string" ? value : JSON.stringify(value) },
+    ],
+  };
+}
+
+function ToolResultContent({
+  text,
+  compact,
+}: {
+  text?: string;
+  compact: boolean;
+}) {
+  if (!text) return null;
+  try {
+    const parsed = JSON.parse(text);
+    if (parsed && typeof parsed === "object") {
+      return <Value value={parsed} depth={1} compact={compact} />;
+    }
+  } catch {
+    // fall through
+  }
+  return <div className="cc-tool-result-inline">{text}</div>;
+}
+
+function ToolErrorContent({
+  error,
+  compact,
+}: {
+  error: unknown;
+  compact: boolean;
+}) {
+  if (typeof error === "string") {
+    try {
+      const parsed = JSON.parse(error);
+      if (parsed && typeof parsed === "object") {
+        return <Value value={parsed} depth={1} compact={compact} />;
+      }
+    } catch {
+      // fall through
+    }
+    return <div className="cc-tool-error-text">{error}</div>;
+  }
+  return <Value value={error} depth={1} compact={compact} />;
+}
+
+const NOISE_KEYS = new Set([
+  "type",
+  "activity",
+  "phase",
+  "status",
+  "event",
+  "agent",
+  "from",
+  "slug",
+  "timestamp",
+  "ts",
+  "time",
+  "detail",
+  "content",
+  "message",
+  "text",
+  "summary",
+  "thread_id",
+  "item",
+  "id",
+  "error",
+  "result",
+  "structured_content",
+]);
+
+function GenericEventCard({
+  parsed,
+  compact,
+}: {
+  parsed: Record<string, unknown>;
+  compact: boolean;
+}) {
+  const phase = stringish(
+    parsed.activity ?? parsed.phase ?? parsed.status ?? parsed.type,
+  );
+  const agent = stringish(parsed.agent ?? parsed.from ?? parsed.slug);
+  const detail = stringish(
+    parsed.detail ??
+      parsed.content ??
+      parsed.message ??
+      parsed.text ??
+      parsed.summary,
+  );
+  const displayDetail =
+    detail.length > 300 ? `${detail.slice(0, 300)}\u2026` : detail;
+
+  const extras = useMemo<Record<string, unknown>>(() => {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(parsed)) {
+      if (NOISE_KEYS.has(k)) continue;
+      if (v === null || v === "" || v === false) continue;
+      out[k] = v;
+    }
+    return out;
+  }, [parsed]);
+
+  return (
+    <div className="stream-card">
+      {phase || agent ? (
+        <div className="stream-card-header">
+          {phase && (
+            <span
+              className={`stream-card-phase stream-phase-${phase.replace(/[^a-z]/gi, "").toLowerCase()}`}
+            >
+              {phase}
+            </span>
+          )}
+          {agent && <span className="stream-card-agent">{agent}</span>}
+        </div>
+      ) : null}
+      {detail ? (
+        <div className="stream-card-detail">{displayDetail}</div>
+      ) : null}
+      {Object.keys(extras).length > 0 && Object.keys(extras).length <= 8 && (
+        <div className="stream-line-json">
+          <Value value={extras} depth={0} compact={compact} />
+        </div>
+      )}
+    </div>
+  );
+}
+
+function stringish(v: unknown): string {
+  return typeof v === "string" ? v : "";
+}
+
+function streamBlockKey(value: unknown): string {
+  if (value === null) return "null";
+  if (typeof value !== "object") return String(value);
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return Object.prototype.toString.call(value);
+  }
+}
+
+function keyedStreamValues<T>(values: readonly T[]) {
+  return keyedByOccurrence(values, streamBlockKey);
+}
+
+/* ───── JSON tree primitive (shared by both card and fallback paths) ───── */
+
+// biome-ignore lint/complexity/noExcessiveCognitiveComplexity: Existing cognitive complexity is baselined for a focused follow-up refactor.
+function Value({
+  value,
+  depth,
+  compact,
+}: {
+  value: unknown;
+  depth: number;
+  compact: boolean;
+}): ReactNode {
+  if (value === null) return <span className="sv-null">null</span>;
+  if (typeof value === "boolean")
+    return <span className="sv-bool">{String(value)}</span>;
+  if (typeof value === "number")
+    return <span className="sv-num">{String(value)}</span>;
+  if (typeof value === "string") {
+    if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(value)) {
+      let display = value;
+      try {
+        display = new Date(value).toLocaleString([], {
+          hour: "numeric",
+          minute: "2-digit",
+          second: "2-digit",
+        });
+      } catch {
+        // keep raw
+      }
+      return (
+        <span className="sv-ts" title={value}>
+          {display}
+        </span>
+      );
+    }
+    const truncated =
+      depth > 0 && value.length > 200 ? `${value.slice(0, 200)}\u2026` : value;
+    return <span className="sv-str">{truncated}</span>;
+  }
+  if (Array.isArray(value)) {
+    if (value.length === 0) return <span className="sv-null">[]</span>;
+    if ((compact && depth >= 1) || depth > 3)
+      return <span className="sv-str">[{value.length} items]</span>;
+    return (
+      <Collapsible label={`[${value.length}]`} startOpen={depth === 0}>
+        <div className="sv-array">
+          {keyedStreamValues(value).map(({ key, value: item }) => (
+            <div key={key} className="sv-array-item">
+              <Value value={item} depth={depth + 1} compact={compact} />
+            </div>
+          ))}
+        </div>
+      </Collapsible>
+    );
+  }
+  if (typeof value === "object") {
+    const keys = Object.keys(value as Record<string, unknown>);
+    if (keys.length === 0) return <span className="sv-null">{"{}"}</span>;
+    if ((compact && depth >= 1) || depth > 3)
+      return <span className="sv-str">{`{${keys.length} fields}`}</span>;
+    return (
+      <Collapsible label={`{${keys.length}}`} startOpen={depth === 0}>
+        <div className="sv-obj">
+          {keys.map((k) => (
+            <div key={k} className="sv-obj-row">
+              <span className="sv-key">{k}</span>
+              <Value
+                value={(value as Record<string, unknown>)[k]}
+                depth={depth + 1}
+                compact={compact}
+              />
+            </div>
+          ))}
+        </div>
+      </Collapsible>
+    );
+  }
+  return <span className="sv-str">{String(value)}</span>;
+}
+
+function Collapsible({
+  label,
+  startOpen,
+  children,
+}: {
+  label: string;
+  startOpen: boolean;
+  children: ReactNode;
+}) {
+  const [open, setOpen] = useState(startOpen);
+  if (open) {
+    return (
+      <span className="sv-collapsible">
+        <button
+          type="button"
+          className="sv-toggle"
+          onClick={() => setOpen(false)}
+          title="Collapse"
+        >
+          ▾ {label}
+        </button>
+        {children}
+      </span>
+    );
+  }
+  return (
+    <button
+      type="button"
+      className="sv-toggle"
+      onClick={() => setOpen(true)}
+      title="Expand"
+    >
+      ▸ {label}
+    </button>
+  );
+}

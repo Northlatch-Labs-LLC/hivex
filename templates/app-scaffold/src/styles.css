@@ -1,0 +1,40 @@
+/*
+ * App-level styles. Mantine ships its own component CSS (imported in main.tsx as
+ * "@mantine/core/styles.css", inlined into the single-file build) — so this file
+ * is only for page-level layout and any custom, non-Mantine bits. No @import, no
+ * Google Fonts, no external assets — the sandbox blocks them. The app renders on
+ * the operator's muted-dark surface inside hivebot (we pin MantineProvider to the
+ * dark scheme) so a built app BLENDS into the shell instead of being a white
+ * card on a dark surface.
+ */
+
+:root {
+  color-scheme: dark;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  /* Mantine sets its own font; this is the fallback before its CSS applies. */
+  font-family:
+    system-ui,
+    -apple-system,
+    "Segoe UI",
+    Roboto,
+    Helvetica,
+    Arial,
+    sans-serif;
+  /* Muted near-black to match the operator shell's terminal surface — not pure
+     black. Mantine's dark components sit slightly elevated above this. */
+  background: #15171b;
+}
+
+/* The app root container. Mantine's <Stack className="app"> uses this for the
+ * outer max width; component styling otherwise comes from Mantine. */
+.app {
+  max-width: 880px;
+  margin: 0 auto;
+}

@@ -1,0 +1,417 @@
+package team
+
+import (
+	"fmt"
+	"strings"
+	"testing"
+
+	"github.com/Northlatch-Labs-LLC/hivex/internal/bot"
+)
+
+func TestPostEscalation_WritesToLeadDM(t *testing.T) {
+	b := newTestBroker(t)
+	l := &Launcher{broker: b}
+
+	l.postEscalation("eng", "eng-42", bot.EscalationStuck, "stuck in build_context for 20 ticks")
+
+	msgs := b.ChannelMessages("cos__human")
+	for _, m := range msgs {
+		if strings.Contains(m.Content, "stuck") || strings.Contains(m.Content, "Heads up") {
+			return
+		}
+	}
+	t.Fatalf("expected escalation message in the lead DM, found none; got %d messages", len(msgs))
+}
+
+func TestPostEscalation_MaxRetries_WritesToLeadDM(t *testing.T) {
+	b := newTestBroker(t)
+	l := &Launcher{broker: b}
+
+	l.postEscalation("pm", "pm-7", bot.EscalationMaxRetries, "tool_call failed: timeout")
+
+	msgs := b.ChannelMessages("cos__human")
+	for _, m := range msgs {
+		if strings.Contains(m.Content, "Heads up") && strings.Contains(m.Content, "erroring") {
+			return
+		}
+	}
+	t.Fatalf("expected max-retries escalation message in the lead DM, found none; got %d messages", len(msgs))
+}
+
+func TestPostEscalation_CreatesSelfHealingTask(t *testing.T) {
+	b := newTestBroker(t)
+	l := &Launcher{broker: b}
+
+	l.postEscalation("eng", "eng-42", bot.EscalationStuck, "stuck in build_context for 20 ticks")
+
+	wantTitle := selfHealingTaskTitle("eng", "eng-42", "", bot.EscalationStuck)
+	var found teamTask
+	for _, task := range b.AllTasks() {
+		if task.Title == wantTitle {
+			found = task
+			break
+		}
+	}
+	if found.ID == "" {
+		t.Fatalf("expected self-healing task (title=%q), got %+v", wantTitle, b.AllTasks())
+	}
+	if found.Owner != "cos" {
+		t.Fatalf("expected self-healing task owned by cos, got %+v", found)
+	}
+	// Self-heal records render as Issues in the FE; PipelineID stays "incident"
+	// so the recognition primitive (isSelfHealingTask) still matches.
+	if found.TaskType != "issue" || found.PipelineID != "incident" || found.ExecutionMode != "office" {
+		t.Fatalf("expected issue/incident office task, got %+v", found)
+	}
+	if !isSelfHealingTask(&found) {
+		t.Fatalf("expected isSelfHealingTask to recognise %+v", found)
+	}
+	// New details shape: human-readable "What happened" / "What needs to happen"
+	// halves above a bot-facing "Repair loop" half.
+	if !strings.Contains(found.Details, "## What happened") ||
+		!strings.Contains(found.Details, "## What needs to happen") ||
+		!strings.Contains(found.Details, "**Repair loop:**") {
+		t.Fatalf("expected new self-heal details shape, got %q", found.Details)
+	}
+}
+
+func TestPostEscalation_ReusesSelfHealingTask(t *testing.T) {
+	b := newTestBroker(t)
+	l := &Launcher{broker: b}
+
+	// Same (bot, taskID, reason) on both events → identical title →
+	// exact-reuse path appends the second incident to the first task.
+	// (Different reasons now produce different titles by design, so the
+	// reuse behaviour is keyed on the full title match.)
+	l.postEscalation("eng", "eng-42", bot.EscalationStuck, "first stuck event")
+	l.postEscalation("eng", "eng-42", bot.EscalationStuck, "second stuck event")
+
+	wantTitle := selfHealingTaskTitle("eng", "eng-42", "", bot.EscalationStuck)
+	var count int
+	var found teamTask
+	for _, task := range b.AllTasks() {
+		if task.Title == wantTitle {
+			count++
+			found = task
+		}
+	}
+	if count != 1 {
+		t.Fatalf("expected one reusable self-healing task (title=%q), got %d tasks: %+v", wantTitle, count, b.AllTasks())
+	}
+	if !strings.Contains(found.Details, "first stuck event") || !strings.Contains(found.Details, "second stuck event") {
+		t.Fatalf("expected reused self-healing task to retain both incident details, got %q", found.Details)
+	}
+	if got := strings.Count(found.Details, "Latest incident:"); got != 1 {
+		t.Fatalf("expected one appended latest incident block, got %d in %q", got, found.Details)
+	}
+}
+
+func TestPostEscalation_DoesNotReuseCanceledSelfHealingTask(t *testing.T) {
+	b := newTestBroker(t)
+	l := &Launcher{broker: b}
+
+	l.postEscalation("eng", "eng-42", bot.EscalationStuck, "first stuck event")
+
+	wantTitle := selfHealingTaskTitle("eng", "eng-42", "", bot.EscalationStuck)
+	var canceledID string
+	for _, task := range b.AllTasks() {
+		if task.Title == wantTitle {
+			canceledID = task.ID
+			break
+		}
+	}
+	if canceledID == "" {
+		t.Fatalf("expected initial self-healing task (title=%q), got %+v", wantTitle, b.AllTasks())
+	}
+
+	b.mu.Lock()
+	for i := range b.tasks {
+		if b.tasks[i].ID == canceledID {
+			b.tasks[i].status = "canceled"
+			break
+		}
+	}
+	b.mu.Unlock()
+
+	// Same reason on both replacement events so they share a title and the
+	// second event merges into the first (the replacement) instead of opening
+	// yet another task.
+	l.postEscalation("eng", "eng-42", bot.EscalationStuck, "second stuck event")
+	l.postEscalation("eng", "eng-42", bot.EscalationStuck, "third stuck event")
+
+	var selfHealingTasks []teamTask
+	for _, task := range b.AllTasks() {
+		if task.Title == wantTitle {
+			selfHealingTasks = append(selfHealingTasks, task)
+		}
+	}
+	if len(selfHealingTasks) != 2 {
+		t.Fatalf("expected canceled task plus one active replacement, got %d tasks: %+v", len(selfHealingTasks), b.AllTasks())
+	}
+
+	var replacement teamTask
+	for _, task := range selfHealingTasks {
+		if task.ID == canceledID {
+			if task.status != "canceled" {
+				t.Fatalf("expected original self-healing task to stay canceled, got %+v", task)
+			}
+			continue
+		}
+		replacement = task
+	}
+	if replacement.ID == "" {
+		t.Fatalf("expected replacement self-healing task, got %+v", selfHealingTasks)
+	}
+	if replacement.Status() != "in_progress" {
+		t.Fatalf("expected replacement self-healing task to be actionable, got %+v", replacement)
+	}
+	if !strings.Contains(replacement.Details, "second stuck event") || !strings.Contains(replacement.Details, "third stuck event") {
+		t.Fatalf("expected replacement to collect new incident details, got %q", replacement.Details)
+	}
+}
+
+func TestPostEscalation_DoesNotNestSelfHealingTasks(t *testing.T) {
+	b := newTestBroker(t)
+	l := &Launcher{broker: b}
+
+	task, _, err := l.requestSelfHealing("eng", "eng-42", bot.EscalationStuck, "initial incident")
+	if err != nil {
+		t.Fatalf("request self-healing: %v", err)
+	}
+	l.postEscalation("cos", task.ID, bot.EscalationStuck, "self-healing lane stuck")
+
+	var count int
+	for _, candidate := range b.AllTasks() {
+		if isSelfHealingTaskTitle(candidate.Title) {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatalf("expected no nested self-healing task, got %d tasks: %+v", count, b.AllTasks())
+	}
+}
+
+// TestPostEscalation_CapsActiveSelfHealingPerAgent guards the per-bot
+// active-self-heal cap. Without the cap, a bot that fails on N distinct
+// task IDs (one per stuck escalation) accumulates N self-heal tasks because
+// the dedupe in requestSelfHealingLocked is keyed on (bot, taskID) and
+// each new taskID lands a new entry. In practice this produced hundreds of
+// stale incidents per bot on long-running installs; the cap collapses
+// overflow into the most recent active self-heal so the bot still has a
+// single, well-trafficked repair lane to fix.
+func TestPostEscalation_CapsActiveSelfHealingPerAgent(t *testing.T) {
+	b := newTestBroker(t)
+	l := &Launcher{broker: b}
+	const burst = 25
+
+	for i := 0; i < burst; i++ {
+		l.postEscalation("eng", fmt.Sprintf("eng-%d", i), bot.EscalationStuck, fmt.Sprintf("stuck event %d", i))
+	}
+
+	var active int
+	var mostRecent teamTask
+	for _, candidate := range b.AllTasks() {
+		if !isSelfHealingTaskTitle(candidate.Title) {
+			continue
+		}
+		if isTerminalTeamTaskStatus(candidate.Status()) {
+			continue
+		}
+		if !strings.Contains(candidate.Title, "@eng") {
+			continue
+		}
+		active++
+		if mostRecent.ID == "" || candidate.UpdatedAt > mostRecent.UpdatedAt {
+			mostRecent = candidate
+		}
+	}
+	if active > maxActiveSelfHealsPerBot {
+		t.Fatalf("expected at most %d active self-heal tasks for @eng, got %d", maxActiveSelfHealsPerBot, active)
+	}
+	if mostRecent.ID == "" {
+		t.Fatal("expected at least one active self-heal task to absorb the burst")
+	}
+	if !strings.Contains(mostRecent.Details, fmt.Sprintf("stuck event %d", burst-1)) {
+		t.Fatalf("expected most recent self-heal to absorb the latest incident, details=%q", mostRecent.Details)
+	}
+}
+
+// countActiveSelfHealsForBot mirrors the prod overflow lookup
+// (findOverflowSelfHealForBotLocked): anchored matches so prefix-
+// overlapping slugs (eng vs engineering) do not blur the count.
+//
+// Two title formats are recognised:
+//   - legacy "Self-heal @<slug> on <id>" — matches "@<slug> "
+//   - new    "[@<slug>] <verb>: <parent>" — matches "[@<slug>] "
+func countActiveSelfHealsForBot(b *Broker, botSlug string) int {
+	legacyNeedle := "@" + botSlug + " "
+	newNeedle := "[@" + botSlug + "] "
+	n := 0
+	for _, task := range b.AllTasks() {
+		if !isSelfHealingTaskTitle(task.Title) || isTerminalTeamTaskStatus(task.status) {
+			continue
+		}
+		if strings.Contains(task.Title, legacyNeedle) || strings.Contains(task.Title, newNeedle) {
+			n++
+		}
+	}
+	return n
+}
+
+// TestRequestSelfHealing_RejectsAgentSlugSubstringCollision guards the
+// title-needle anchoring in findOverflowSelfHealForBotLocked. With a naive
+// substring match, an @eng request would steal a merge slot from an
+// @engineering self-heal whose slug @eng is a prefix of. The anchored
+// "@<slug> " needle keeps each bot's repair lane isolated.
+func TestRequestSelfHealing_RejectsAgentSlugSubstringCollision(t *testing.T) {
+	b := newTestBroker(t)
+	l := &Launcher{broker: b}
+
+	for i := 0; i < maxActiveSelfHealsPerBot; i++ {
+		l.postEscalation("engineering", fmt.Sprintf("eng-%d", i), bot.EscalationStuck, "engineering blocker")
+	}
+	if got := countActiveSelfHealsForBot(b, "engineering"); got != maxActiveSelfHealsPerBot {
+		t.Fatalf("setup: expected @engineering at cap (%d), got %d", maxActiveSelfHealsPerBot, got)
+	}
+
+	l.postEscalation("eng", "task-99", bot.EscalationStuck, "eng first incident")
+
+	if got := countActiveSelfHealsForBot(b, "engineering"); got != maxActiveSelfHealsPerBot {
+		t.Fatalf("@engineering active count must not change, got %d", got)
+	}
+	if got := countActiveSelfHealsForBot(b, "eng"); got != 1 {
+		t.Fatalf("expected one fresh @eng self-heal, got %d", got)
+	}
+}
+
+// TestRequestSelfHealing_PerAgentIndependent guards that one bot at the
+// cap does not consume another bot's first self-heal slot via overflow
+// merging. Each bot has its own repair lane.
+func TestRequestSelfHealing_PerAgentIndependent(t *testing.T) {
+	b := newTestBroker(t)
+	l := &Launcher{broker: b}
+
+	for i := 0; i < maxActiveSelfHealsPerBot+5; i++ {
+		l.postEscalation("eng", fmt.Sprintf("eng-%d", i), bot.EscalationStuck, "eng burst")
+	}
+	engBefore := countActiveSelfHealsForBot(b, "eng")
+	if engBefore != maxActiveSelfHealsPerBot {
+		t.Fatalf("setup: expected @eng pinned at cap (%d), got %d", maxActiveSelfHealsPerBot, engBefore)
+	}
+
+	l.postEscalation("pm", "pm-1", bot.EscalationStuck, "pm first incident")
+
+	if got := countActiveSelfHealsForBot(b, "eng"); got != engBefore {
+		t.Fatalf("@eng active count must not change after @pm request, got %d (was %d)", got, engBefore)
+	}
+	if got := countActiveSelfHealsForBot(b, "pm"); got != 1 {
+		t.Fatalf("expected one fresh @pm self-heal, got %d", got)
+	}
+}
+
+// TestRequestSelfHealing_ExactReuseWinsOverOverflow guards the priority of
+// the exact (bot, taskID) reuse path over the overflow-merge path. When
+// a bot is at the cap and a new request matches an existing self-heal's
+// title exactly, that existing task is updated in place — not merged into
+// the most-recently-updated unrelated overflow target.
+func TestRequestSelfHealing_ExactReuseWinsOverOverflow(t *testing.T) {
+	b := newTestBroker(t)
+	l := &Launcher{broker: b}
+
+	taskIDs := make([]string, maxActiveSelfHealsPerBot)
+	for i := 0; i < maxActiveSelfHealsPerBot; i++ {
+		taskIDs[i] = fmt.Sprintf("eng-%d", i)
+		l.postEscalation("eng", taskIDs[i], bot.EscalationStuck, "first")
+	}
+
+	// The OLDEST is what we re-fire on; the NEWEST is the overflow target
+	// (most-recently updated active self-heal for @eng). If the exact-match
+	// path wins, the new incident lands on OLDEST. If overflow wins, it
+	// lands on NEWEST. The two body assertions disambiguate.
+	oldestTitle := selfHealingTaskTitle("eng", taskIDs[0], "", bot.EscalationStuck)
+	newestTitle := selfHealingTaskTitle("eng", taskIDs[len(taskIDs)-1], "", bot.EscalationStuck)
+	var oldestID, newestID string
+	for _, task := range b.AllTasks() {
+		switch task.Title {
+		case oldestTitle:
+			oldestID = task.ID
+		case newestTitle:
+			newestID = task.ID
+		}
+	}
+	if oldestID == "" || newestID == "" {
+		t.Fatalf("setup: missing self-heal tasks (oldest=%q newest=%q)", oldestID, newestID)
+	}
+
+	// Re-fire with the SAME reason as the original so the exact-title
+	// match path is exercised (different reasons now produce different
+	// titles by design, so cross-reason events go through the new-task or
+	// overflow paths instead of exact reuse).
+	l.postEscalation("eng", taskIDs[0], bot.EscalationStuck, "second incident")
+
+	if got := countActiveSelfHealsForBot(b, "eng"); got != maxActiveSelfHealsPerBot {
+		t.Fatalf("active count must stay at cap (%d), got %d", maxActiveSelfHealsPerBot, got)
+	}
+	var oldestAfter, newestAfter teamTask
+	for _, task := range b.AllTasks() {
+		switch task.ID {
+		case oldestID:
+			oldestAfter = task
+		case newestID:
+			newestAfter = task
+		}
+	}
+	if !strings.Contains(oldestAfter.Details, "second incident") {
+		t.Fatalf("exact-match path should append the new incident to OLDEST, details=%q", oldestAfter.Details)
+	}
+	if strings.Contains(newestAfter.Details, "second incident") {
+		t.Fatalf("overflow target NEWEST must not absorb the incident, details=%q", newestAfter.Details)
+	}
+	if strings.Contains(oldestAfter.Details, "merged from per-bot self-heal overflow") {
+		t.Fatalf("exact-match path must not use the overflow body marker, details=%q", oldestAfter.Details)
+	}
+}
+
+// TestClampSelfHealCap guards that an env override of 0 or below falls back
+// to the default cap. Accepting non-positive values would silently disable
+// the cap and reintroduce the per-bot task explosion this fix prevents.
+func TestClampSelfHealCap(t *testing.T) {
+	cases := []struct {
+		in   int
+		want int
+	}{
+		{in: -5, want: defaultMaxActiveSelfHealsPerBot},
+		{in: -1, want: defaultMaxActiveSelfHealsPerBot},
+		{in: 0, want: defaultMaxActiveSelfHealsPerBot},
+		{in: 1, want: 1},
+		{in: defaultMaxActiveSelfHealsPerBot, want: defaultMaxActiveSelfHealsPerBot},
+		{in: 25, want: 25},
+	}
+	for _, tc := range cases {
+		if got := clampSelfHealCap(tc.in); got != tc.want {
+			t.Errorf("clampSelfHealCap(%d) = %d, want %d", tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestPostEscalation_NilBroker_DoesNotPanic(t *testing.T) {
+	l := &Launcher{broker: nil}
+	// Should be a no-op, not a panic.
+	l.postEscalation("eng", "eng-1", bot.EscalationStuck, "detail")
+}
+
+func TestPostEscalation_PostedBySystem(t *testing.T) {
+	b := newTestBroker(t)
+	l := &Launcher{broker: b}
+
+	l.postEscalation("eng", "eng-99", bot.EscalationStuck, "some detail")
+
+	msgs := b.ChannelMessages("cos__human")
+	if len(msgs) == 0 {
+		t.Fatal("expected at least one message in #team")
+	}
+	last := msgs[len(msgs)-1]
+	if last.From != "system" {
+		t.Fatalf("expected message from 'system', got %q", last.From)
+	}
+}

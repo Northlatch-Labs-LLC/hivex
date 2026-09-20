@@ -1,0 +1,1837 @@
+/* ═══════════════════════════════════════════════════════════════
+   Hive Web — Global Styles (React)
+   Ported from index.legacy.html design system CSS.
+   Theme-specific tokens live in public/themes/*.css
+   ═══════════════════════════════════════════════════════════════ */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+:root {
+  /* Hive.System Figma ramps — mirrored here so first paint matches theme */
+  --neutral-950: #1e1f1f;
+  --neutral-900: #28292a;
+  --neutral-800: #323334;
+  --neutral-700: #434647;
+  --neutral-600: #575a5c;
+  --neutral-500: #686c6e;
+  --neutral-400: #85898b;
+  --neutral-300: #aeb1b2;
+  --neutral-200: #cfd1d2;
+  --neutral-100: #e9eaeb;
+  --neutral-50: #f2f2f3;
+  --neutral-10: #f8f8f9;
+
+  --tertiary-500: #612a92;
+  --tertiary-400: #9f4dbf;
+  --tertiary-300: #cf72d9;
+  --tertiary-200: #ffb3e6;
+  --tertiary-100: #ffebfc;
+
+  --olive-500: #3f4224;
+  --olive-400: #969640;
+  --olive-300: #d4db18;
+  --olive-200: #eef679;
+  --olive-100: #f8ffdb;
+
+  --cyan-500: #069de4;
+  --cyan-400: #00ccff;
+  --cyan-300: #46f7fd;
+  --cyan-200: #a3fcff;
+  --cyan-100: #e5feff;
+
+  --success-500: #0d5935;
+  --success-400: #03a04c;
+  --success-300: #35da79;
+  --success-200: #a3ebbb;
+  --success-100: #e9fbef;
+
+  --error-500: #8c1727;
+  --error-400: #d1261a;
+  --error-300: #ff9a8f;
+  --error-200: #ffe4e0;
+  --error-100: #ffeeeb;
+
+  --warning-500: #994200;
+  --warning-400: #ce6b09;
+  --warning-300: #ffb647;
+  --warning-200: #f7deab;
+  --warning-100: #fbf5dc;
+
+  /* Overlays */
+  --overlay-soft: rgba(0, 0, 0, 0.04);
+  --overlay: rgba(0, 0, 0, 0.08);
+  --overlay-strong: rgba(0, 0, 0, 0.16);
+  --scrim: rgba(0, 0, 0, 0.5);
+  --overlay-white-soft: rgba(255, 255, 255, 0.08);
+  --overlay-white: rgba(255, 255, 255, 0.16);
+  --overlay-white-strong: rgba(255, 255, 255, 0.45);
+
+  /* Semantic aliases */
+  --bg: #ffffff;
+  --bg-warm: var(--neutral-50);
+  --bg-subtle: var(--neutral-10);
+  --bg-card: #ffffff;
+  --text: var(--neutral-900);
+  --text-secondary: var(--neutral-500);
+  /* Not --neutral-400 (#85898b) directly: that is 3.53:1 on a white card,
+     below AA, and it is what agent-card roles, wiki bylines, composer chip
+     labels and — the reason this moved — the agent-detail TAB LABELS are
+     painted with. Navigation should not be sub-AA. Mixed off the ramp
+     rather than hardcoded so it still tracks a palette retune. Clears
+     4.6:1 on --bg-card; ~4.1:1 on --bg-warm, see the note below. */
+  --text-tertiary: color-mix(
+    in srgb,
+    var(--neutral-500) 70%,
+    var(--neutral-400)
+  );
+  --text-disabled: var(--neutral-300);
+  --accent: var(--tertiary-400);
+  --accent-warm: var(--tertiary-500);
+  --accent-bg: var(--tertiary-100);
+  --accent-bg-strong: rgba(159, 77, 191, 0.35);
+  /* Ink for text/icons sitting ON a solid --accent fill. Not a background:
+     the purple accent shared by hive and hive-dark carries white at 4.4:1,
+     but noir-gold's gold accent needs dark ink and overrides this. */
+  --accent-fg: #ffffff;
+  /* Entity-graph node palette — Tailwind-ish pastels for the default
+     light theme. Themes can override these in their token block. */
+  --graph-people-fill: #ede9fe;
+  --graph-people-stroke: #7c3aed;
+  --graph-companies-fill: #dbeafe;
+  --graph-companies-stroke: #2563eb;
+  --graph-customers-fill: #dcfce7;
+  --graph-customers-stroke: #059669;
+  --graph-other-fill: #f3f4f6;
+  --graph-other-stroke: #6b7280;
+  --border: var(--neutral-100);
+  --border-light: var(--neutral-50);
+  --border-dark: var(--neutral-200);
+  --border-strong: var(--neutral-300);
+  --green: var(--success-400);
+  --green-dark: var(--success-500);
+  --green-bg: var(--success-100);
+  --red: var(--error-400);
+  --red-dark: var(--error-500);
+  --red-bg: var(--error-100);
+  --yellow: var(--warning-400);
+  --yellow-dark: var(--warning-500);
+  --yellow-bg: var(--warning-100);
+  --blue: var(--cyan-500);
+  --blue-bg: var(--cyan-100);
+  --font-sans:
+    "Geist Sans", "-apple-system", "BlinkMacSystemFont", "Segoe UI", sans-serif;
+  --font-serif: "Newsreader", "Georgia", "Times New Roman", serif;
+  --font-logo: "Newsreader", "Georgia", "Times New Roman", serif;
+  --font-mono:
+    "Geist Mono", "SFMono-Regular", "Menlo", "Monaco", "Consolas", monospace;
+  --font-pixel: "Geist Pixel", "Geist Mono", monospace;
+  --radius-sm: 8px;
+  --radius-md: 12px;
+  --radius-lg: 16px;
+  --radius-xl: 20px;
+  --radius-full: 9999px;
+
+  /* Agent event bubble — state colors. Used by .sidebar-bot-pill states. */
+  --bubble-shipping: #2a8f4c; /* shipping events — green */
+  --bubble-plotting: #5a6bc8; /* plotting/thinking events — slate blue */
+  --bubble-talking: #ecb22e; /* talking/responding events — Hive yellow */
+  --bubble-stuck: #c8542a; /* stuck/blocked events — warm orange */
+  --bubble-idle: var(--text-tertiary); /* idle bar fallback */
+
+  /* Agent event bubble — dynamics. */
+  --bubble-halo-radius: 4px;
+  --bubble-halo-duration: 600ms;
+  --bubble-pulse-fade-in: 150ms;
+  --bubble-text-crossfade: 180ms;
+  --bubble-idle-dim-duration: 600ms;
+
+  /* Popover shadow — used by the Tier 2 hover peek card. */
+  --shadow-popover: 0 8px 24px -8px rgba(0, 0, 0, 0.32);
+  --shadow-modal: 0 12px 40px rgba(0, 0, 0, 0.12);
+  --shadow-overlay: 0 20px 60px rgba(0, 0, 0, 0.15);
+
+  /* Button geometry tokens — let themes restyle without redefining classes.
+     `--btn-radius` swaps pill (base) vs rectangle (hive). `--btn-font-weight`
+     bumps from 500 → 600 in branded themes. The shadow tokens carry the
+     brand-tinted drop that hive.css used to hardcode. */
+  --btn-radius: var(--radius-full);
+  --btn-font-weight: 500;
+  --btn-primary-shadow: 0 1px 3px rgba(159, 77, 191, 0.18);
+  --btn-danger-shadow: 0 1px 3px rgba(226, 52, 40, 0.18);
+
+  /* Input tokens — same pattern as buttons. Themes restyle by setting these,
+     not by redefining .input. Disabled bg is its own token so themes can
+     pick a contrasting shade independently of --bg-warm. */
+  --input-bg: var(--bg-card);
+  --input-bg-disabled: var(--bg-warm);
+  --input-border: var(--border);
+
+  /* ─── Phase 2 onboarding preview-state tokens ─── */
+  /* Visual language: dashed border + lavender bg = "this thing is staged,
+     not committed yet." Used by the sidebar preview overlay that shows
+     channels/agents forming as the user answers CEO questions.
+     Spec: docs/specs/onboarding-into-office.md "Design system / token bindings" */
+  --preview-row-bg: var(--accent-bg);
+  --preview-row-border: dashed 1px var(--accent-bg-strong);
+  --preview-row-text: var(--text-secondary);
+
+  /* ─── Focus ring ─── */
+  /* Single source-of-truth: all interactive elements use this token so
+     keyboard navigation is always visible and consistent across themes.
+     Offset keeps the ring outside the element border, not overlapping it. */
+  --focus-ring-color: var(--accent);
+  --focus-ring-offset: 2px;
+  --focus-ring-width: 2px;
+
+  /* ─── Spacing scale ─── */
+  /* Consistent spacing prevents scattered hardcoded values.
+     Half-steps (1-5, 2-5, 3-5) are the off-grid sizes the codebase
+     reaches for most often — icon-button padding, dense rail gaps,
+     mid-density form fields. They live in the system rather than
+     bleeding into inline px. */
+  --space-1: 4px;
+  --space-1-5: 6px;
+  --space-2: 8px;
+  --space-2-5: 10px;
+  --space-3: 12px;
+  --space-3-5: 14px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-7: 32px;
+  --space-8: 40px;
+
+  /* ─── Border widths ─── */
+  --border-width-sm: 1px;
+  --border-width-md: 2px;
+
+  /* ─── Elevation (shadows) — single token surface for the whole app.
+     Replace inline `box-shadow: 0 8px 40px ...` etc. with these. */
+  --shadow-card-soft:
+    0 1px 3px rgba(59, 47, 47, 0.04), 0 8px 30px rgba(59, 47, 47, 0.04);
+  --shadow-sm: 0 2px 8px rgba(0, 0, 0, 0.08);
+
+  /* ─── z-index scale — keep modal/overlay stacking explicit so adding
+     a new layer never overlaps the wrong thing. Higher = closer. */
+  --z-dropdown: 100;
+  --z-popover: 120;
+  --z-overlay: 150;
+  --z-modal: 160;
+  --z-modal-critical: 200;
+  --z-toast: 300;
+
+  /* ─── Typography scale ─── */
+  /* `--text-2xs` is the small-caps eyebrow/section-header size — used in
+     agents.css, command.css, lifecycle.css for the all-caps tracking
+     labels. Anything below this is decorative-only territory. */
+  --text-2xs: 10px;
+  --text-xs: 11px;
+  --text-sm: 12px;
+  --text-base: 13px;
+  --text-md: 14px;
+  --text-lg: 15px;
+  --text-xl: 17px;
+  --text-2xl: 20px;
+
+  /* ─── Transition durations ─── */
+  --duration-fast: 0.12s;
+  --duration-base: 0.15s;
+  --duration-slow: 0.2s;
+
+  /* ─── Empty / loading state ─── */
+  --empty-state-color: var(--text-tertiary);
+  --empty-state-size: var(--text-base);
+}
+
+html {
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+}
+body {
+  background: var(--bg);
+  color: var(--text);
+  min-height: 100vh;
+}
+
+/* ─── Global focus-visible baseline ─── */
+/* Keyboard-only focus ring that doesn't fire on mouse clicks.
+   All focusable elements get a consistent ring; component stylesheets may
+   narrow the offset for elements that need inside-border positioning. */
+:focus-visible {
+  outline: var(--focus-ring-width) solid var(--focus-ring-color);
+  outline-offset: var(--focus-ring-offset);
+}
+
+/* Suppress the native ring for elements whose :hover state already provides
+   a strong enough signal (e.g. icon buttons that show a filled background).
+   Each of those components adds its own :focus-visible override below. */
+:focus:not(:focus-visible) {
+  outline: none;
+}
+
+/* ─── Empty / loading state utilities ─── */
+.empty-state {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--empty-state-color);
+  font-size: var(--empty-state-size);
+}
+.empty-state--padded {
+  padding: calc(var(--space-6) + var(--space-2)) var(--space-5);
+}
+
+/* ─── Animations ─── */
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes fade-out {
+  from {
+    opacity: 1;
+    transform: translateY(0);
+  }
+  to {
+    opacity: 0;
+    transform: translateY(-8px);
+  }
+}
+@keyframes pulse-dot {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.4;
+  }
+}
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+/* ThinkingLoader — wave dots, traveling sheen, and shimmer text.
+   Used by the inline TypingIndicator bubble and the feed loading state. */
+@keyframes thinking-wave {
+  0%,
+  60%,
+  100% {
+    transform: translateY(0) scale(1);
+    opacity: 0.35;
+  }
+  30% {
+    transform: translateY(-4px) scale(1.18);
+    opacity: 1;
+  }
+}
+@keyframes thinking-sheen {
+  0% {
+    transform: translateX(-100%);
+  }
+  60%,
+  100% {
+    transform: translateX(100%);
+  }
+}
+@keyframes thinking-text-shimmer {
+  0% {
+    background-position: 150% 0;
+  }
+  100% {
+    background-position: -50% 0;
+  }
+}
+@keyframes thinking-ellipsis-pulse {
+  0%,
+  100% {
+    opacity: 0.35;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+.animate-fade {
+  animation: fadeIn 0.3s ease-out;
+}
+
+/* ─── Buttons ─── */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-2);
+  font-family: var(--font-sans);
+  font-weight: var(--btn-font-weight);
+  border: none;
+  cursor: pointer;
+  /* Scope to compositor-safe properties — `transform` for the lift and
+     `background/color/filter` for state; avoids layout recalcs on hover. */
+  transition:
+    background var(--duration-slow),
+    color var(--duration-slow),
+    filter var(--duration-slow),
+    transform var(--duration-slow),
+    box-shadow var(--duration-slow);
+  text-decoration: none;
+  min-height: 44px;
+}
+.btn:not(.btn-sm):not(:disabled):hover {
+  transform: translateY(-1px);
+}
+.btn:focus-visible {
+  outline: var(--focus-ring-width) solid var(--focus-ring-color);
+  outline-offset: var(--focus-ring-offset);
+}
+.btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+.btn-primary {
+  background: var(--accent);
+  color: #ffffff;
+  padding: var(--space-3) var(--space-6);
+  border-radius: var(--btn-radius);
+  font-size: var(--text-md);
+  box-shadow: var(--btn-primary-shadow);
+}
+.btn-primary:has(.btn-label) {
+  padding: 0;
+  gap: 0;
+}
+.btn-primary:hover {
+  background: var(--accent-warm);
+}
+.btn-ghost,
+/* DEPRECATED — .btn-secondary is an alias for .btn-ghost so existing call
+   sites (HealthCheckApp, SettingsApp, PoliciesApp, etc.) keep working.
+   New code should use .btn-ghost. Audit and migrate, then drop this selector. */
+.btn-secondary {
+  background: var(--bg-card);
+  color: var(--text);
+  border: 1px solid var(--border-dark);
+  padding: var(--space-3) var(--space-6);
+  border-radius: var(--btn-radius);
+  font-size: var(--text-md);
+}
+.btn-ghost:hover,
+.btn-secondary:hover {
+  background: var(--bg-warm);
+  border-color: var(--border-strong);
+}
+.btn-danger {
+  background: var(--red);
+  color: #ffffff;
+  padding: var(--space-3) var(--space-6);
+  border-radius: var(--btn-radius);
+  font-size: var(--text-md);
+  box-shadow: var(--btn-danger-shadow);
+}
+.btn-danger:hover {
+  filter: brightness(0.95);
+}
+.btn-lg {
+  padding: var(--space-4) calc(var(--space-6) + var(--space-4));
+  font-size: var(--text-xl);
+}
+.btn-text {
+  background: transparent;
+  border: none;
+  color: var(--text-secondary);
+  padding: var(--space-1) var(--space-1);
+  font-size: var(--text-base);
+  font-weight: 500;
+  cursor: pointer;
+  font-family: inherit;
+  border-radius: var(--radius-sm);
+  transition: color var(--duration-fast);
+}
+.btn-text:hover:not(:disabled) {
+  text-decoration: underline;
+  color: var(--text);
+}
+.btn-text:focus-visible {
+  outline: var(--focus-ring-width) solid var(--focus-ring-color);
+  outline-offset: var(--focus-ring-offset);
+}
+.btn-text:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.btn-text--danger {
+  color: var(--text-secondary);
+}
+.btn-text--danger:hover:not(:disabled) {
+  color: var(--red);
+}
+.btn-sm {
+  padding: var(--space-1) var(--space-3);
+  font-size: var(--text-sm);
+  min-height: 32px;
+}
+
+/* ─── Cards ─── */
+.card {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-card-soft);
+}
+
+/* ─── Modal shell + backdrop — shared by every dialog (ConfirmDialog,
+   WipeModal, SidePanel, HelpModal, VersionModal, command palette).
+   Pair them: `<div class="modal-backdrop"><div class="modal-shell" /></div>`.
+   Backdrop owns the scrim + z-index; shell owns the card. */
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: var(--scrim);
+  z-index: var(--z-overlay);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.modal-shell {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-modal);
+  max-width: min(560px, calc(100vw - 40px));
+  width: 100%;
+}
+
+/* ─── Section header — the small caps + tracking label that sits above
+   sidebar groups, settings sections, panel rails. Replaces ~6 ad-hoc
+   `font-size: 10px; text-transform: uppercase; letter-spacing: 0.06em;`
+   declarations across agents.css / lifecycle.css. */
+.section-header {
+  font-size: var(--text-xs);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-tertiary);
+  line-height: 1;
+}
+
+/* ─── Chip — passive inline label with rounded geometry. Differs from
+   `.badge` (smaller, square) in that it carries identity / ownership
+   (agent, skill, channel) rather than status. `.chip--interactive` adds
+   hover/focus chrome for clickable variants. */
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  padding: var(--space-1) var(--space-2);
+  border-radius: var(--radius-full);
+  font-size: var(--text-xs);
+  font-weight: 500;
+  background: var(--bg-warm);
+  color: var(--text-secondary);
+  border: 1px solid var(--border);
+  white-space: nowrap;
+}
+.chip--accent {
+  background: var(--accent-bg);
+  color: var(--accent-warm);
+  border-color: var(--accent-bg-strong);
+}
+.chip--interactive {
+  cursor: pointer;
+  transition:
+    background var(--duration-base),
+    border-color var(--duration-base);
+}
+.chip--interactive:hover {
+  background: var(--bg-subtle);
+  border-color: var(--border-dark);
+}
+.chip--interactive:focus-visible {
+  outline: var(--focus-ring-width) solid var(--focus-ring-color);
+  outline-offset: var(--focus-ring-offset);
+}
+
+/* ─── Icon button — square-ish hit area for icon-only controls.
+   Size variants mirror .btn-sm / default / .btn-lg in height. Already
+   used implicitly in 8+ places (.sidebar-icon-btn, .bot-panel-close);
+   this is the single source of truth. */
+.icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 36px;
+  height: 36px;
+  background: transparent;
+  border: none;
+  border-radius: var(--radius-sm);
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition:
+    background var(--duration-base),
+    color var(--duration-base);
+}
+.icon-btn:hover:not(:disabled) {
+  background: var(--bg-warm);
+  color: var(--text);
+}
+.icon-btn:focus-visible {
+  outline: var(--focus-ring-width) solid var(--focus-ring-color);
+  outline-offset: var(--focus-ring-offset);
+}
+.icon-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+.icon-btn--sm {
+  width: 28px;
+  height: 28px;
+}
+.icon-btn--lg {
+  width: 44px;
+  height: 44px;
+}
+
+/* ─── Inputs ─── */
+.input {
+  background: var(--input-bg);
+  border: 1px solid var(--input-border);
+  color: var(--text);
+  border-radius: var(--radius-md);
+  height: 44px;
+  font-size: var(--text-lg);
+  padding: 0 var(--space-3);
+  width: 100%;
+  font-family: var(--font-sans);
+  transition:
+    border-color var(--duration-slow),
+    box-shadow var(--duration-slow);
+}
+.input:hover:not(:disabled):not(:focus-visible) {
+  border-color: var(--border-dark);
+}
+.input:focus-visible {
+  outline: var(--focus-ring-width) solid var(--focus-ring-color);
+  outline-offset: var(--focus-ring-offset);
+  border-color: var(--accent);
+}
+.input:disabled {
+  background: var(--input-bg-disabled);
+  color: var(--text-tertiary);
+  cursor: not-allowed;
+}
+.input::placeholder {
+  color: var(--text-tertiary);
+}
+.input.has-error {
+  border-color: var(--red);
+}
+.input.has-error:focus-visible {
+  outline-color: var(--red);
+}
+
+/* ─── Badges ─── */
+.badge {
+  display: inline-flex;
+  align-items: center;
+  height: 18px;
+  padding: 0 var(--space-1);
+  border-radius: var(--radius-sm);
+  font-size: var(--text-xs);
+  font-weight: 500;
+  font-family: var(--font-sans);
+  letter-spacing: 0;
+  line-height: 1;
+}
+.badge-green {
+  background: var(--green-bg);
+  color: var(--green);
+}
+.badge-accent {
+  background: var(--olive-200);
+  color: var(--olive-500);
+}
+.badge-neutral {
+  background: var(--neutral-100);
+  color: var(--neutral-600);
+}
+.badge-yellow {
+  background: var(--yellow-bg);
+  color: var(--yellow);
+}
+.badge-orange {
+  background: var(--warning-200);
+  color: var(--warning-500);
+}
+.badge-red {
+  background: var(--red-bg);
+  color: var(--red);
+}
+
+/* ─── Routines (scheduled-work surface) ─── */
+/* Tokenised local rules for the Routines app. Keeps the surface coherent
+   across themes without each component owning its own border/hover state. */
+.routines-shell {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  min-height: 0;
+}
+.routines-header {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-3);
+  padding-bottom: var(--space-3);
+  border-bottom: 1px solid var(--border);
+  flex-wrap: wrap;
+}
+.routines-eyebrow {
+  font-family: var(--font-mono);
+  font-size: var(--text-2xs);
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--text-tertiary);
+}
+.routines-title {
+  font-size: var(--text-xl);
+  font-weight: 600;
+  margin: 0;
+  letter-spacing: -0.01em;
+  color: var(--text);
+}
+.routines-count {
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  color: var(--text-tertiary);
+  margin-left: var(--space-2);
+}
+.routines-view-toggle {
+  display: inline-flex;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-card);
+  padding: 2px;
+  gap: 2px;
+}
+.routines-view-tab {
+  padding: var(--space-1) var(--space-3);
+  font-size: var(--text-sm);
+  font-weight: 500;
+  border: none;
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  border-radius: 6px;
+  transition:
+    background 120ms ease,
+    color 120ms ease;
+}
+.routines-view-tab[aria-selected="true"] {
+  background: var(--accent);
+  color: white;
+}
+.routines-view-tab:focus-visible {
+  outline: var(--focus-ring-width) solid var(--focus-ring-color);
+  outline-offset: 2px;
+}
+.routines-view-tab:not([aria-selected="true"]):hover {
+  color: var(--text);
+}
+
+.routine-row {
+  display: grid;
+  grid-template-columns:
+    minmax(200px, 2.2fr) minmax(140px, 1fr) minmax(120px, 1fr)
+    minmax(100px, 0.8fr) minmax(150px, 1fr) auto;
+  gap: var(--space-3);
+  align-items: center;
+  padding: var(--space-2) var(--space-3) var(--space-2) var(--space-4);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--routine-color, var(--border));
+  border-radius: var(--radius-sm);
+  background: var(--bg-card);
+  cursor: pointer;
+  position: relative;
+  transition:
+    border-color 120ms ease,
+    transform 120ms ease,
+    box-shadow 120ms ease;
+}
+.routine-row:hover {
+  border-color: var(--border-strong);
+  transform: translateY(-1px);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.06);
+}
+.routine-row:focus-visible {
+  outline: var(--focus-ring-width) solid var(--focus-ring-color);
+  outline-offset: 2px;
+}
+.routine-row[data-enabled="false"] {
+  opacity: 0.65;
+}
+.routine-row-label {
+  font-size: var(--text-base);
+  font-weight: 500;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.routine-row-slug {
+  font-size: var(--text-xs);
+  font-family: var(--font-mono);
+  color: var(--text-tertiary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.routine-row-meta {
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+}
+
+.routine-header-row {
+  display: grid;
+  grid-template-columns:
+    minmax(200px, 2.2fr) minmax(140px, 1fr) minmax(120px, 1fr)
+    minmax(100px, 0.8fr) minmax(150px, 1fr) auto;
+  gap: var(--space-3);
+  padding: 0 var(--space-3) var(--space-2) var(--space-4);
+  font-size: var(--text-2xs);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-tertiary);
+}
+
+.routine-month-grid {
+  display: grid;
+  grid-template-columns: repeat(7, minmax(0, 1fr));
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+  background: var(--bg-card);
+}
+.routine-month-weekday {
+  padding: var(--space-2) var(--space-3);
+  font-size: var(--text-2xs);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-tertiary);
+  border-bottom: 1px solid var(--border);
+  border-right: 1px solid var(--border-light);
+  background: var(--bg-subtle, var(--bg-card));
+}
+.routine-month-weekday:nth-child(7n) {
+  border-right: none;
+}
+.routine-day {
+  min-height: 104px;
+  padding: var(--space-1);
+  border-bottom: 1px solid var(--border-light);
+  border-right: 1px solid var(--border-light);
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  transition: background 120ms ease;
+}
+.routine-day:nth-child(7n + 7) {
+  border-right: none;
+}
+.routine-day[data-out-of-month="true"] {
+  opacity: 0.5;
+  background: var(--bg-subtle, transparent);
+}
+.routine-day[data-today="true"] {
+  background: var(--accent-bg);
+}
+.routine-day:hover {
+  background: var(--bg-warm);
+}
+.routine-day-number {
+  font-size: var(--text-xs);
+  font-weight: 500;
+  color: var(--text-secondary);
+  padding: 2px 4px 0;
+}
+.routine-day[data-today="true"] .routine-day-number {
+  color: var(--accent);
+  font-weight: 700;
+}
+.routine-chip {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 4px 2px 5px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--routine-color, var(--accent));
+  border-radius: 3px;
+  font-size: var(--text-2xs);
+  color: var(--text);
+  cursor: pointer;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  text-align: left;
+  width: 100%;
+  transition:
+    transform 120ms ease,
+    border-color 120ms ease;
+  animation: routine-chip-in 180ms ease both;
+}
+.routine-chip:hover {
+  border-color: var(--border-strong);
+  transform: translateX(1px);
+}
+.routine-chip[data-enabled="false"] {
+  opacity: 0.55;
+}
+.routine-chip-time {
+  color: var(--text-tertiary);
+  font-family: var(--font-mono);
+  flex-shrink: 0;
+}
+.routine-chip-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+@keyframes routine-chip-in {
+  from {
+    opacity: 0;
+    transform: translateY(-2px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* The detail surface used to be a fixed-position drawer; it was promoted
+   to a full-page route at /routines/$routineSlug so its CSS rules
+   (.routine-drawer, .routine-drawer-backdrop, the matching keyframes,
+   and their z-index hardcodes) were removed. Reduced-motion guard for
+   the surviving routine surfaces only. */
+@media (prefers-reduced-motion: reduce) {
+  .routine-row,
+  .routine-chip,
+  .routines-view-tab,
+  .routine-day {
+    animation: none !important;
+    transition: none !important;
+  }
+}
+
+/* ─── Approval context (Variant B layout, shared between InterviewBar and HumanInterviewOverlay) ─── */
+/* The approval card has three semantically distinct content blocks and visual
+   weight must follow that order: Why (prose, primary text), Details (inset
+   panel, the decision-relevant payload — labels muted, values prominent),
+   Footer (operational metadata at secondary text weight, AA contrast). */
+.approval-context {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin: 0 0 4px;
+}
+.approval-why {
+  margin: 0;
+  font-size: 14px;
+  line-height: 1.5;
+  color: var(--text);
+}
+.approval-details {
+  margin: 0;
+  padding: 12px 14px;
+  /* overlay-soft is theme-aware: rgba(0,0,0,0.04) in light, rgba(255,255,255,0.04)
+     in dark. Gives the inset panel a perceptible recess on both themes without
+     hardcoding two backgrounds. --bg-warm collapses against --bg-card at dark
+     theme contrast 1.04:1, so the panel would otherwise vanish. */
+  background: var(--overlay-soft);
+  border: 1px solid var(--border-dark, var(--border));
+  border-radius: var(--radius-md);
+  display: grid;
+  gap: 6px;
+}
+.approval-details-row {
+  display: grid;
+  grid-template-columns: 64px 1fr;
+  gap: 10px;
+  align-items: baseline;
+  font-size: 14px;
+  line-height: 1.45;
+  margin: 0;
+}
+.approval-details-label {
+  /* text-secondary, not text-tertiary, so the label clears WCAG AA on the
+     inset surface in dark mode. Hierarchy still reads via font-weight + the
+     narrow column. */
+  color: var(--text-secondary);
+  font-weight: 500;
+  margin: 0;
+}
+.approval-details-value {
+  color: var(--text);
+  margin: 0;
+  word-break: break-word;
+}
+.approval-details-value .mono {
+  font-family: var(--font-mono);
+  font-size: 0.92em;
+}
+.approval-truncated {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 1px 5px;
+  border-radius: 3px;
+  background: var(--warning-100, var(--bg-warm));
+  color: var(--warning-500);
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.02em;
+  vertical-align: 1px;
+}
+.approval-empty {
+  margin: 0;
+  font-size: 13px;
+  color: var(--text-secondary);
+  font-style: italic;
+}
+.approval-footer {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-secondary);
+}
+.approval-footer-row {
+  white-space: nowrap;
+}
+.approval-footer-row .mono {
+  font-family: var(--font-mono);
+  font-size: 0.95em;
+}
+@media (max-width: 480px) {
+  .approval-details-row {
+    grid-template-columns: 56px 1fr;
+    gap: 8px;
+  }
+  .approval-footer-row {
+    white-space: normal;
+  }
+}
+
+/* ─── External-action approval card (deterministic-integrations slice 4) ───
+   The dedicated approval surface for a mutating integration action. Built on
+   the same tokens as .approval-* so it reads as one family, with a stronger
+   identity header (logo + verb) because this card is a trust decision: the
+   human is authorizing a real, external side-effect. Tokens only — verified
+   against Hive Light, Hive Dark, and Noir Gold. */
+.eac {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  margin: 2px 0 4px;
+}
+.eac-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+}
+.eac-logo {
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 44px;
+  height: 44px;
+  border-radius: var(--radius-md);
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  box-shadow: 0 1px 2px var(--overlay-soft);
+}
+
+/* Catalog brand logo inside the connect card's logo tile. */
+.eac-logo-img {
+  width: 28px;
+  height: 28px;
+  object-fit: contain;
+  display: block;
+}
+.eac-headings {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  flex: 1 1 auto;
+}
+.eac-eyebrow {
+  font-size: var(--text-xs);
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-secondary);
+}
+.eac-headline {
+  margin: 0;
+  font-size: var(--text-lg, 17px);
+  line-height: 1.25;
+  font-weight: 600;
+  color: var(--text);
+}
+.eac-action-id {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text-tertiary, var(--text-secondary));
+  word-break: break-all;
+}
+.eac-why {
+  display: block;
+  margin: 0;
+  padding: 8px 0 8px 12px;
+  border-left: 2px solid var(--accent, var(--border-dark, var(--border)));
+  font-size: 14px;
+  line-height: 1.5;
+  color: var(--text);
+}
+.eac-why-label {
+  display: inline-block;
+  margin-right: 8px;
+  font-size: var(--text-2xs, 10px);
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-secondary);
+  vertical-align: 1px;
+}
+.eac-unverified {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin: 0;
+  padding: 8px 12px;
+  border-radius: var(--radius-md);
+  background: var(--warning-100, var(--overlay-soft));
+  border: 1px solid var(--warning-200, var(--border));
+  font-size: 13px;
+  line-height: 1.45;
+  color: var(--warning-500, var(--text));
+}
+.eac-unverified-dot {
+  flex: none;
+  margin-top: 5px;
+  width: 7px;
+  height: 7px;
+  border-radius: var(--radius-full, 999px);
+  background: var(--warning-500);
+}
+.eac-payload {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px 14px;
+  background: var(--overlay-soft);
+  border: 1px solid var(--border-dark, var(--border));
+  border-radius: var(--radius-md);
+}
+.eac-payload-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.eac-payload-title {
+  font-size: var(--text-2xs, 11px);
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--text-secondary);
+}
+.eac-raw-toggle {
+  appearance: none;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+  font-family: var(--font-mono);
+  padding: 2px 8px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition:
+    color var(--duration-base, 120ms) ease,
+    border-color var(--duration-base, 120ms) ease;
+}
+.eac-raw-toggle:hover {
+  color: var(--text);
+  border-color: var(--border-dark, var(--text-tertiary));
+}
+.eac-raw-toggle[aria-pressed="true"] {
+  color: var(--text);
+  border-color: var(--accent, var(--text-tertiary));
+}
+.eac-fields {
+  margin: 0;
+  display: grid;
+  gap: 6px;
+}
+.eac-field {
+  display: grid;
+  grid-template-columns: 76px 1fr;
+  gap: 10px;
+  align-items: baseline;
+  font-size: 14px;
+  line-height: 1.45;
+}
+.eac-field-label {
+  margin: 0;
+  color: var(--text-secondary);
+  font-weight: 500;
+}
+.eac-field-value {
+  margin: 0;
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+.eac-trunc {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 1px 5px;
+  border-radius: 3px;
+  background: var(--warning-100, var(--bg-warm));
+  color: var(--warning-500);
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.02em;
+  vertical-align: 1px;
+}
+.eac-raw {
+  margin: 0;
+  padding: 10px 12px;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--text);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 200px;
+  overflow: auto;
+}
+.eac-payload-empty {
+  margin: 0;
+  font-size: 13px;
+  font-style: italic;
+  color: var(--text-secondary);
+}
+.eac-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 16px;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+.eac-meta-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.eac-meta-label {
+  font-weight: 500;
+  color: var(--text-tertiary, var(--text-secondary));
+}
+.eac-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: var(--radius-full, 999px);
+  background: var(--green);
+  box-shadow: 0 0 0 2px var(--green-bg, transparent);
+}
+.eac-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 2px;
+}
+.eac-actions .eac-reject:hover:not(:disabled) {
+  color: var(--red);
+  border-color: var(--red);
+}
+.eac-actions .eac-dismiss {
+  margin-left: auto;
+  color: var(--text-tertiary, var(--text-secondary));
+}
+/* Connect card specifics */
+.eac-connect-sub {
+  font-size: 12px;
+  line-height: 1.4;
+  color: var(--text-secondary);
+}
+.eac-connect-question {
+  margin: 0;
+  font-size: 14px;
+  line-height: 1.5;
+  color: var(--text);
+}
+.eac-connect-status {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  border-radius: var(--radius-md);
+  background: var(--overlay-soft);
+  border: 1px solid var(--border-dark, var(--border));
+  font-size: 13px;
+  line-height: 1.45;
+  color: var(--text-secondary);
+}
+.eac-connect-failed {
+  color: var(--red);
+  border-color: var(--red);
+  background: var(--red-bg, var(--overlay-soft));
+}
+.eac-spinner {
+  flex: none;
+  width: 14px;
+  height: 14px;
+  border-radius: var(--radius-full, 999px);
+  border: 2px solid var(--border-dark, var(--border));
+  border-top-color: var(--accent, var(--text));
+  animation: eac-spin 0.7s linear infinite;
+}
+@keyframes eac-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .eac-spinner {
+    animation: none;
+  }
+}
+@media (max-width: 480px) {
+  .eac-field {
+    grid-template-columns: 64px 1fr;
+    gap: 8px;
+  }
+  .eac-actions .eac-dismiss {
+    margin-left: 0;
+  }
+}
+
+/* ─── Always-allowed actions (scoped-grant revoke list, slice 5b) ─── */
+.grants-panel-head {
+  margin-bottom: 12px;
+}
+.grants-panel-title {
+  margin: 0 0 2px;
+  font-size: var(--text-md, 15px);
+  font-weight: 600;
+  color: var(--text);
+}
+.grants-panel-sub {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.45;
+  color: var(--text-secondary);
+}
+.grant-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.grant-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 12px;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+}
+.grant-logo {
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  border-radius: var(--radius-sm);
+  background: var(--overlay-soft);
+}
+.grant-row-main {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  flex: 1 1 auto;
+}
+.grant-scope {
+  font-family: var(--font-mono);
+  font-size: 13px;
+  color: var(--text);
+  word-break: break-all;
+}
+.grant-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+.grant-agent {
+  font-weight: 500;
+  color: var(--text-tertiary, var(--text-secondary));
+}
+.grant-sep {
+  color: var(--text-tertiary, var(--text-secondary));
+}
+.grant-revoke {
+  flex: none;
+}
+.grant-revoke:hover:not(:disabled) {
+  color: var(--red);
+  border-color: var(--red);
+}
+
+/* ─── Composio first-run onboarding ─── */
+.composio-onb {
+  display: flex;
+  justify-content: center;
+  padding: 24px 0 8px;
+}
+.composio-onb-card {
+  width: 100%;
+  max-width: 540px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 28px 30px;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg, 14px);
+  box-shadow: 0 8px 32px var(--overlay-soft);
+}
+.composio-onb-eyebrow {
+  font-size: var(--text-xs);
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--accent, var(--text-secondary));
+}
+.composio-onb-title {
+  margin: 0;
+  font-size: var(--text-xl, 22px);
+  line-height: 1.2;
+  font-weight: 600;
+  color: var(--text);
+}
+.composio-onb-lead {
+  margin: 0;
+  font-size: 14px;
+  line-height: 1.55;
+  color: var(--text-secondary);
+}
+.composio-onb-logos {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 2px 0;
+}
+.composio-onb-logo {
+  display: grid;
+  place-items: center;
+  width: 38px;
+  height: 38px;
+  border-radius: var(--radius-md);
+  background: var(--overlay-soft);
+  border: 1px solid var(--border);
+}
+.composio-onb-more {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-tertiary, var(--text-secondary));
+}
+.composio-onb-form {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 4px;
+}
+.composio-onb-label {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+.composio-onb-field {
+  display: flex;
+  gap: 8px;
+  align-items: stretch;
+}
+.composio-onb-input {
+  flex: 1 1 auto;
+  font-family: var(--font-mono);
+  font-size: 13px;
+}
+.composio-onb-reveal {
+  flex: none;
+  appearance: none;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+  padding: 0 12px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+.composio-onb-reveal:hover {
+  color: var(--text);
+  border-color: var(--border-dark, var(--text-tertiary));
+}
+.composio-onb-actions {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  margin-top: 6px;
+}
+.composio-onb-submit {
+  min-width: 160px;
+}
+.composio-onb-getkey {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--accent, var(--text-secondary));
+  text-decoration: none;
+}
+.composio-onb-getkey:hover {
+  text-decoration: underline;
+}
+.composio-onb-foot {
+  margin: 8px 0 0;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-tertiary, var(--text-secondary));
+}
+.composio-onb-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 14px 16px;
+  background: var(--bg-card);
+  border: 1px solid var(--border-light, var(--border));
+  border-radius: var(--radius-md);
+}
+.composio-onb-panel-title {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text);
+}
+.composio-onb-panel-note {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--text-secondary);
+}
+.composio-onb-panel-note code {
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+.composio-onb-wait {
+  margin: 4px 0 0;
+  font-size: 12px;
+  color: var(--text-tertiary, var(--text-secondary));
+}
+.composio-onb-error {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--red);
+}
+.composio-onb-fallback-toggle {
+  appearance: none;
+  align-self: flex-start;
+  border: none;
+  background: transparent;
+  padding: 0;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-secondary);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  cursor: pointer;
+}
+.composio-onb-fallback-toggle:hover {
+  color: var(--text);
+}
+.badge-muted {
+  background: var(--bg-warm);
+  color: var(--text-tertiary);
+  text-decoration: line-through;
+}
+
+/* ─── Pixel avatars ─── */
+/* The canvas buffer is the sprite's native 14x14 grid; CSS scales it up.
+   Without `image-rendering: pixelated` the browser bilinearly smooths the
+   upscale and the sprites lose their pixel-art edges. */
+.pixel-avatar {
+  image-rendering: crisp-edges;
+  /* biome-ignore lint/suspicious/noDuplicateProperties: Pixel-art fallback targets engines with different crisp-rendering support. */
+  image-rendering: pixelated;
+  border-radius: 4px;
+  display: block;
+}
+.pixel-avatar-sidebar {
+  width: 24px;
+  height: 24px;
+}
+.pixel-avatar-panel {
+  width: 56px;
+  height: 56px;
+}
+
+/* ─── Harness badge (overlaid on agent avatars) ─── */
+.avatar-with-harness {
+  position: relative;
+}
+.harness-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  box-shadow: 0 0 0 1.5px var(--bg-card, #fff);
+  line-height: 0;
+  flex-shrink: 0;
+}
+.harness-badge svg {
+  display: block;
+}
+.harness-badge-on-avatar {
+  position: absolute;
+  right: -3px;
+  bottom: -3px;
+  pointer-events: none;
+}
+
+/* Top-right of the agent avatar. Exactly one of these renders at a time, and
+   they are deliberately NOT the same weight.
+
+   .working-badge  the agent is processing right now. Green, full size.
+   .online-badge   the adapter is merely reachable. Smaller and muted.
+
+   These used to be one badge: `online` rendered in green, which meant the
+   most prominent indicator in the rail marked "connected" rather than
+   "actually doing something". Keeping the idle one green would reinstate that
+   ambiguity, so it is a neutral outline instead. The peek card still states
+   presence textually via "Online" / "Last seen Xm ago". */
+.working-badge,
+.online-badge {
+  position: absolute;
+  top: -2px;
+  right: -2px;
+  border-radius: 50%;
+  pointer-events: none;
+}
+
+.working-badge {
+  width: 7px;
+  height: 7px;
+  background: var(--green, #03a04c);
+  box-shadow: 0 0 0 1.5px var(--bg-card, #fff);
+}
+
+.online-badge {
+  width: 5px;
+  height: 5px;
+  background: var(--text-tertiary, #8a8a8a);
+  opacity: 0.75;
+  box-shadow: 0 0 0 1.5px var(--bg-card, #fff);
+}
+
+/* ─── Status Dot ─── */
+.status-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+.status-dot.active {
+  background: var(--green);
+}
+.status-dot.pulse {
+  animation: pulse-dot 2s ease-in-out infinite;
+}
+.status-dot.shipping {
+  background: var(--blue);
+}
+.status-dot.plotting {
+  background: var(--yellow);
+}
+.status-dot.lurking {
+  background: #9ca3af;
+  width: 4px;
+  height: 4px;
+}
+
+/* ─── Scrollbar ─── */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--border) transparent;
+}
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: transparent;
+  border-radius: 3px;
+}
+:hover::-webkit-scrollbar-thumb {
+  background: var(--border);
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--text-tertiary);
+}
+
+/* ─── App card (skill scoping additions) ─── */
+.app-card--proposed {
+  border-color: var(--yellow);
+  background: var(--yellow-bg);
+}
+.app-card--disabled {
+  position: relative;
+  background: var(--neutral-50);
+  /* Text stays neutral-900 for AA contrast (≥4.5:1). Only the diagonal
+     pinstripe overlay carries the disabled visual signal at 0.55 opacity. */
+}
+.app-card--disabled::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  border-radius: inherit;
+  opacity: 0.55;
+  background-image: repeating-linear-gradient(
+    45deg,
+    transparent 0 8px,
+    var(--neutral-50) 8px 9px
+  );
+}
+.app-card--disabled > * {
+  position: relative;
+  z-index: 1;
+}
+
+/* ─── Skills app: owners chip ─── */
+.owners-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  background: var(--neutral-100);
+  color: var(--neutral-700);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  border-radius: 6px;
+  line-height: 1.4;
+}
+.owners-chip--lead {
+  background: var(--neutral-50);
+  color: var(--neutral-500);
+  font-style: italic;
+  font-family: var(--font-sans);
+}
+
+/* ─── Side panel responsive ─── */
+@media (max-width: 900px) {
+  .side-panel {
+    /* biome-ignore lint/complexity/noImportantStyles: Responsive panel width override must win over fixed desktop sizing. */
+    width: 60vw !important;
+  }
+}
+@media (max-width: 600px) {
+  .side-panel {
+    /* biome-ignore lint/complexity/noImportantStyles: Mobile full-width panel override must win over wider breakpoints. */
+    width: 100vw !important;
+  }
+}
+
+/* ─── Mobile tap targets (a11y) ─── */
+@media (max-width: 600px) {
+  .btn-sm {
+    min-height: 44px;
+    padding: 10px 14px;
+  }
+  .btn-text {
+    min-height: 44px;
+    padding: 10px 8px;
+  }
+}
+
+/* ─── Reduced motion for optimistic-update animations ─── */
+@media (prefers-reduced-motion: reduce) {
+  .skill-suggest-expander,
+  .side-panel,
+  .animate-fade,
+  .local-llm-reveal,
+  .local-llm-reveal.open,
+  .task-suggestion,
+  .launch-screen,
+  .launch-screen-out,
+  .launch-spinner {
+    /* biome-ignore lint/complexity/noImportantStyles: Reduced-motion override must beat animation declarations. */
+    animation: none !important;
+    /* biome-ignore lint/complexity/noImportantStyles: Reduced-motion override must beat transition declarations. */
+    transition: none !important;
+  }
+}
+
+.skill-suggest-expander {
+  animation: skill-suggest-slide 0.18s ease-out;
+  overflow: hidden;
+}
+@keyframes skill-suggest-slide {
+  from {
+    opacity: 0;
+    transform: translateY(-4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* ─── SR-only ─── */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border-width: 0;
+}

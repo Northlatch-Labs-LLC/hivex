@@ -1,0 +1,184 @@
+package provider
+
+import (
+	"context"
+	"fmt"
+	"sort"
+	"sync"
+
+	"github.com/Northlatch-Labs-LLC/hivex/internal/bot"
+	"github.com/Northlatch-Labs-LLC/hivex/internal/config"
+)
+
+// Capabilities describes how a provider integrates with the team launcher.
+//
+// Capabilities are consumed by team-side dispatch logic (pane spawning,
+// cleanup, session reset) so that adding a new provider Kind does not require
+// editing every conditional in launcher.go — instead, the provider declares
+// what it supports and the launcher reads those declarations.
+type Capabilities struct {
+	// PaneEligible reports whether the launcher should spawn an interactive
+	// tmux pane for a bot bound to this provider. True for runtimes with
+	// an interactive TUI (Claude Code). False for headless-only runtimes
+	// (Codex, OpenAI-compatible HTTP, OpenClaw bridge, etc.).
+	PaneEligible bool
+
+	// SupportsOneShot reports whether the provider implements OneShot. False
+	// providers fall back to the default one-shot path (currently Claude).
+	SupportsOneShot bool
+
+	// RequiresClaudeSessionReset reports whether switching the install-wide
+	// default away from this provider should also wipe the Claude session
+	// store. Today only Claude Code populates that store.
+	RequiresClaudeSessionReset bool
+
+	// GatewayOnly reports whether this kind is a gateway-controlled binding
+	// (OpenClaw, Hermes) rather than a directly-runnable LLM runtime. Gateway
+	// kinds are dispatched the same way at the StreamFn layer but are
+	// managed via the Integrations app — they never appear in the global
+	// "Default Runtime" picker or in per-bot provider pickers. Register
+	// skips config.AllowLLMProviderKind when GatewayOnly is true so the
+	// kind cannot be selected as an install-wide default.
+	GatewayOnly bool
+}
+
+// Entry is a registered provider's runtime hooks plus its capabilities.
+//
+// StreamFn is required (every provider must support streaming). OneShotCtx is
+// preferred for one-shot calls because it lets callers cancel the underlying
+// provider subprocess. OneShot remains for test and compatibility providers.
+// Providers without a one-shot implementation set Capabilities.SupportsOneShot
+// = false and leave both one-shot hooks nil; RunConfiguredOneShot then falls
+// back to claude-code.
+type Entry struct {
+	Kind         string
+	StreamFn     func(slug string) bot.StreamFn
+	OneShot      func(systemPrompt, prompt, cwd string) (string, error)
+	OneShotCtx   func(ctx context.Context, systemPrompt, prompt, cwd string) (string, error)
+	Capabilities Capabilities
+}
+
+var (
+	registryMu sync.RWMutex
+	registry   = map[string]*Entry{}
+)
+
+// Register installs a provider Entry. It also teaches the config layer to
+// accept e.Kind as a valid value for the HIVEX_LLM_PROVIDER env var, the
+// config file, and CLI --provider flags. Intended for use from package init().
+//
+// Panics if e is nil, e.Kind is empty, or e.Kind is already registered —
+// duplicate registration indicates a programming error (two init() calls for
+// the same Kind), not user input.
+func Register(e *Entry) {
+	if e == nil {
+		panic("provider: Register requires non-nil Entry")
+	}
+	if e.Kind == "" {
+		panic("provider: Register requires non-empty Entry.Kind")
+	}
+	if e.StreamFn == nil {
+		panic(fmt.Sprintf("provider: Register Kind %q requires non-nil StreamFn", e.Kind))
+	}
+	registryMu.Lock()
+	defer registryMu.Unlock()
+	if _, exists := registry[e.Kind]; exists {
+		panic(fmt.Sprintf("provider: Kind %q already registered", e.Kind))
+	}
+	registry[e.Kind] = e
+	if !e.Capabilities.GatewayOnly {
+		config.AllowLLMProviderKind(e.Kind)
+	}
+}
+
+// RegisterTemporary installs e and returns a restore function. It is intended
+// for internal test support packages that need to inject fake providers without
+// importing testing from production provider code.
+func RegisterTemporary(e *Entry) func() {
+	if e == nil {
+		panic("provider: RegisterTemporary requires non-nil Entry")
+	}
+	if e.Kind == "" {
+		panic("provider: RegisterTemporary requires non-empty Entry.Kind")
+	}
+	if e.StreamFn == nil {
+		panic(fmt.Sprintf("provider: RegisterTemporary Kind %q requires non-nil StreamFn", e.Kind))
+	}
+	registryMu.Lock()
+	prev, hadPrev := registry[e.Kind]
+	registry[e.Kind] = e
+	registryMu.Unlock()
+	if !e.Capabilities.GatewayOnly {
+		config.AllowLLMProviderKind(e.Kind)
+	}
+	return func() {
+		registryMu.Lock()
+		defer registryMu.Unlock()
+		if hadPrev {
+			registry[e.Kind] = prev
+		} else {
+			delete(registry, e.Kind)
+		}
+	}
+}
+
+// Lookup returns the registered Entry for kind, or nil if no provider with
+// that Kind has been registered. Callers that need a fallback (e.g., the
+// streaming resolver, the one-shot dispatcher) check for nil and use the
+// claude-code default.
+func Lookup(kind string) *Entry {
+	registryMu.RLock()
+	defer registryMu.RUnlock()
+	return registry[kind]
+}
+
+// LLMProviderKinds returns the sorted set of registered, non-gateway provider
+// kinds — the runtimes a user can pick as a directly-dispatched LLM (Claude
+// Code, Codex, Opencode, MLX-LM, Ollama, Exo). Gateway kinds (OpenClaw, Hermes)
+// are excluded because they represent bots imported through an external
+// gateway and are managed via the Integrations app, not the runtime picker.
+//
+// UI consumers (Settings default-runtime dropdown, BotProfilePanel runtime
+// picker, BotWizard provider field) should read this list to keep gateway
+// kinds out of provider selection surfaces.
+func LLMProviderKinds() []string {
+	registryMu.RLock()
+	out := make([]string, 0, len(registry))
+	for k, e := range registry {
+		if e.Capabilities.GatewayOnly {
+			continue
+		}
+		out = append(out, k)
+	}
+	registryMu.RUnlock()
+	sort.Strings(out)
+	return out
+}
+
+// GatewayKinds returns the sorted set of registered gateway-only kinds — the
+// inverse of LLMProviderKinds. Used by the Integrations app to enumerate which
+// gateways are compiled in.
+func GatewayKinds() []string {
+	registryMu.RLock()
+	out := make([]string, 0, len(registry))
+	for k, e := range registry {
+		if !e.Capabilities.GatewayOnly {
+			continue
+		}
+		out = append(out, k)
+	}
+	registryMu.RUnlock()
+	sort.Strings(out)
+	return out
+}
+
+// CapabilitiesFor returns the capabilities for kind, or the zero value if
+// kind is not registered. The zero value (PaneEligible=false,
+// SupportsOneShot=false, RequiresClaudeSessionReset=false) is the safe default
+// — it skips pane spawning and falls back to the default one-shot path.
+func CapabilitiesFor(kind string) Capabilities {
+	if e := Lookup(kind); e != nil {
+		return e.Capabilities
+	}
+	return Capabilities{}
+}

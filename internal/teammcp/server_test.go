@@ -1,0 +1,1625 @@
+package teammcp
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"slices"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/modelcontextprotocol/go-sdk/mcp"
+
+	"github.com/Northlatch-Labs-LLC/hivex/internal/team"
+)
+
+func ensureBrokerMembers(t *testing.T, ctx context.Context, slugs ...string) {
+	t.Helper()
+	for _, slug := range slugs {
+		name := strings.ReplaceAll(slug, "-", " ")
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		name = strings.ToUpper(name[:1]) + name[1:]
+		err := brokerPostJSON(ctx, "/office-members", map[string]any{
+			"action":     "create",
+			"slug":       slug,
+			"name":       name,
+			"role":       name,
+			"created_by": "cos",
+		}, nil)
+		if err != nil && !strings.Contains(err.Error(), "member already exists") {
+			t.Fatalf("ensure broker member %s: %v", slug, err)
+		}
+		err = brokerPostJSON(ctx, "/channel-members", map[string]any{
+			"channel": "general",
+			"action":  "add",
+			"slug":    slug,
+		}, nil)
+		if err != nil {
+			t.Fatalf("ensure broker member %s in #general: %v", slug, err)
+		}
+	}
+}
+
+func textFromResult(t *testing.T, result *mcp.CallToolResult) string {
+	t.Helper()
+	if result == nil || len(result.Content) == 0 {
+		t.Fatal("expected text result")
+	}
+	text, ok := result.Content[0].(*mcp.TextContent)
+	if !ok {
+		t.Fatalf("expected text content, got %T", result.Content[0])
+	}
+	return text.Text
+}
+
+func TestConfigureServerToolsExposesActionToolsToOfficeSpecialists(t *testing.T) {
+	ctx := context.Background()
+	clientTransport, serverTransport := mcp.NewInMemoryTransports()
+
+	server := mcp.NewServer(&mcp.Implementation{Name: "hivex-team-test", Version: "0.1.0"}, nil)
+	configureServerTools(server, "workflow-architect", "general", false)
+
+	serverSession, err := server.Connect(ctx, serverTransport, nil)
+	if err != nil {
+		t.Fatalf("server connect: %v", err)
+	}
+	defer serverSession.Wait()
+
+	client := mcp.NewClient(&mcp.Implementation{Name: "client", Version: "0.1.0"}, nil)
+	clientSession, err := client.Connect(ctx, clientTransport, nil)
+	if err != nil {
+		t.Fatalf("client connect: %v", err)
+	}
+	defer clientSession.Close()
+
+	tools, err := clientSession.ListTools(ctx, nil)
+	if err != nil {
+		t.Fatalf("list tools: %v", err)
+	}
+	names := make([]string, 0, len(tools.Tools))
+	for _, tool := range tools.Tools {
+		names = append(names, tool.Name)
+	}
+	if !slices.Contains(names, "team_action_connections") {
+		t.Fatalf("expected team_action_connections for office specialist, got %v", names)
+	}
+	if !slices.Contains(names, "team_action_workflow_execute") {
+		t.Fatalf("expected team_action_workflow_execute for office specialist, got %v", names)
+	}
+}
+
+func TestConfigureServerToolsAnnotatesActionTools(t *testing.T) {
+	ctx := context.Background()
+	clientTransport, serverTransport := mcp.NewInMemoryTransports()
+
+	server := mcp.NewServer(&mcp.Implementation{Name: "hivex-team-test", Version: "0.1.0"}, nil)
+	configureServerTools(server, "workflow-architect", "general", false)
+
+	serverSession, err := server.Connect(ctx, serverTransport, nil)
+	if err != nil {
+		t.Fatalf("server connect: %v", err)
+	}
+	defer serverSession.Wait()
+
+	client := mcp.NewClient(&mcp.Implementation{Name: "client", Version: "0.1.0"}, nil)
+	clientSession, err := client.Connect(ctx, clientTransport, nil)
+	if err != nil {
+		t.Fatalf("client connect: %v", err)
+	}
+	defer clientSession.Close()
+
+	tools, err := clientSession.ListTools(ctx, nil)
+	if err != nil {
+		t.Fatalf("list tools: %v", err)
+	}
+
+	var connections *mcp.Tool
+	var execute *mcp.Tool
+	for i := range tools.Tools {
+		switch tools.Tools[i].Name {
+		case "team_action_connections":
+			connections = tools.Tools[i]
+		case "team_action_execute":
+			execute = tools.Tools[i]
+		}
+	}
+	if connections == nil || connections.Annotations == nil || !connections.Annotations.ReadOnlyHint {
+		t.Fatalf("expected team_action_connections to be read-only, got %+v", connections)
+	}
+	if execute == nil || execute.Annotations == nil || execute.Annotations.DestructiveHint == nil || *execute.Annotations.DestructiveHint {
+		t.Fatalf("expected team_action_execute to be a non-destructive write tool, got %+v", execute)
+	}
+}
+
+func TestSuppressBroadcastReasonBlocksOutOfDomainReply(t *testing.T) {
+	reason := suppressBroadcastReason(
+		"fe",
+		"Here is my thought.",
+		"",
+		[]brokerMessage{
+			{ID: "msg-1", From: "you", Content: "We need better launch positioning and campaign messaging."},
+		},
+		nil,
+	)
+	if reason == "" {
+		t.Fatal("expected FE reply to be suppressed for marketing-only work")
+	}
+}
+
+func TestSuppressBroadcastReasonAllowsOwnedTaskReply(t *testing.T) {
+	reason := suppressBroadcastReason(
+		"fe",
+		"Shipping the signup work now.",
+		"msg-1",
+		[]brokerMessage{
+			{ID: "msg-1", From: "cos", Content: "Frontend, take the signup flow."},
+		},
+		[]brokerTaskSummary{
+			{ID: "task-1", Owner: "fe", Status: "in_progress", ThreadID: "msg-1", Title: "Own signup flow"},
+		},
+	)
+	if reason != "" {
+		t.Fatalf("expected owned-task reply to be allowed, got %q", reason)
+	}
+}
+
+func TestSuppressBroadcastReasonBlocksAfterUntargetedCEOReply(t *testing.T) {
+	reason := suppressBroadcastReason(
+		"fe",
+		"I can take the UI piece.",
+		"msg-1",
+		[]brokerMessage{
+			{ID: "msg-1", From: "you", Content: "What should we do here?"},
+			{ID: "msg-2", From: "cos", Content: "PM owns this. Let's keep scope tight.", ReplyTo: "msg-1"},
+		},
+		nil,
+	)
+	// CEO reply no longer suppresses specialists — bots collaborate, CEO takes final call
+	if reason != "" {
+		t.Fatalf("expected CEO reply to NOT block specialist, got %q", reason)
+	}
+}
+
+func TestSuppressBroadcastReasonAllowsOperatorFollowUpInActiveTaskThread(t *testing.T) {
+	reason := suppressBroadcastReason(
+		"operator",
+		"`#task-24` approved and moving to the next execution slice.",
+		"msg-20",
+		[]brokerMessage{
+			{ID: "msg-16", From: "planner", Content: "Locked execution brief."},
+			{ID: "msg-20", From: "executor", Content: "Completed `#task-7` and moved it to review.", ReplyTo: "msg-16"},
+		},
+		[]brokerTaskSummary{
+			{ID: "task-24", Owner: "operator", Status: "in_progress", ThreadID: "msg-16", Title: "Approve script and open next execution lane"},
+		},
+	)
+	if reason != "" {
+		t.Fatalf("expected operator follow-up in active task thread to be allowed, got %q", reason)
+	}
+}
+
+// TestSuppressBroadcastReasonAllowsMarketingCompetitorPricing verifies that a
+// marketing bot can broadcast about "competitor pricing" without being suppressed.
+// Before the fix, "pricing" was a sales-only keyword so "competitor pricing findings"
+// classified as "sales" domain and a marketing bot got blocked ("outside your domain").
+func TestSuppressBroadcastReasonAllowsMarketingCompetitorPricing(t *testing.T) {
+	reason := suppressBroadcastReason(
+		"marketing",
+		"Here are our competitor pricing findings — Acme charges $50/seat, Bravo charges $45.",
+		"",
+		nil,
+		nil,
+	)
+	if reason != "" {
+		t.Errorf("marketing should not be suppressed for competitor pricing content, got %q", reason)
+	}
+}
+
+// TestSuppressBroadcastReasonBlocksFEOnPureBackend ensures the suppression still
+// fires for genuine hard domain mismatches (FE bot talking about DB schemas).
+func TestSuppressBroadcastReasonBlocksFEOnPureBackend(t *testing.T) {
+	reason := suppressBroadcastReason(
+		"fe",
+		"The database migration adds a new index on the users table for faster auth queries.",
+		"",
+		nil,
+		nil,
+	)
+	if reason == "" {
+		t.Error("FE bot should be suppressed for pure backend/database content")
+	}
+}
+
+func TestSuppressBroadcastReasonAllowsRecentlyCompletedOwnedTaskBroadcast(t *testing.T) {
+	reason := suppressBroadcastReason(
+		"gtm",
+		"Here is the locked monetization ladder and CTA routing for the launch packet.",
+		"",
+		nil,
+		[]brokerTaskSummary{
+			{
+				ID:        "task-4",
+				Owner:     "gtm",
+				Status:    "done",
+				Title:     "Lock the launch monetization path for the flagship hivebot episode",
+				Details:   "Finalize monetization ladder and CTA routing for the first live upload.",
+				UpdatedAt: time.Now().Add(-5 * time.Minute).Format(time.RFC3339),
+			},
+		},
+	)
+	if reason != "" {
+		t.Fatalf("expected recently completed owned-task broadcast to be allowed, got %q", reason)
+	}
+}
+
+func TestSuppressBroadcastReasonBlocksStaleCompletedOwnedTaskBroadcast(t *testing.T) {
+	reason := suppressBroadcastReason(
+		"gtm",
+		"Here is the locked monetization ladder and CTA routing for the launch packet.",
+		"",
+		nil,
+		[]brokerTaskSummary{
+			{
+				ID:        "task-4",
+				Owner:     "gtm",
+				Status:    "done",
+				Title:     "Lock the launch monetization path for the flagship hivebot episode",
+				Details:   "Finalize monetization ladder and CTA routing for the first live upload.",
+				UpdatedAt: time.Now().Add(-30 * time.Minute).Format(time.RFC3339),
+			},
+		},
+	)
+	if reason == "" {
+		t.Fatal("expected stale completed task to stop authorizing out-of-domain broadcast")
+	}
+}
+
+func TestIsOneOnOneModeFromEnv(t *testing.T) {
+	t.Setenv("HIVEX_ONE_ON_ONE", "1")
+	if !isOneOnOneMode() {
+		t.Fatal("expected 1o1 env to enable direct mode")
+	}
+}
+
+func TestHandleTeamMemberCreateTriggersReconfigure(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	// This test exercises the create mechanics (broker POST + reconfigure), not
+	// the human-approval gate (which has its own tests in member_approval_test.go).
+	// HIVEX_UNSAFE=1 is the intended bypass so the create proceeds without a human
+	// answering the approval card.
+	t.Setenv("HIVEX_UNSAFE", "1")
+	b := newTestBroker(t)
+	if err := b.StartOnPort(0); err != nil {
+		t.Fatalf("start broker: %v", err)
+	}
+	defer b.Stop()
+
+	t.Setenv("HIVEX_TEAM_BROKER_URL", "http://"+b.Addr())
+	t.Setenv("HIVEX_BROKER_TOKEN", b.Token())
+
+	called := 0
+	prev := reconfigureOfficeSessionFn
+	reconfigureOfficeSessionFn = func() error {
+		called++
+		return nil
+	}
+	defer func() { reconfigureOfficeSessionFn = prev }()
+
+	if _, _, err := handleTeamMember(context.Background(), nil, TeamMemberArgs{
+		Action: "create",
+		Slug:   "growthops",
+		Name:   "Growth Ops",
+		Role:   "Growth Ops",
+		MySlug: "cos",
+	}); err != nil {
+		t.Fatalf("handleTeamMember: %v", err)
+	}
+	if called != 1 {
+		t.Fatalf("expected one reconfigure call, got %d", called)
+	}
+	found := false
+	for _, member := range b.OfficeMembers() {
+		if member.Slug == "growthops" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatal("expected created office member to persist")
+	}
+}
+
+// TestHandleTeamChannelCreateIsRefusedAndDoesNotReconfigure is the INVERSION
+// of "create triggers reconfigure".
+//
+// Named channels are retired: conversations happen in a DM with one bot, and
+// the broker answers POST /channels with 409. So the team_channel tool cannot
+// mint a room any more, and the two things this pins are what must follow from
+// that. The bot is told WHY, in the retirement's own words rather than a bare
+// failure — and reconfigureOfficeSession does NOT fire, because respawning
+// every interactive pane after a create that created nothing is churn charged
+// to the user for no change.
+//
+// Inverted rather than deleted: an unconditional reconfigure on a failed tool
+// call is a real regression shape, and this is where it would show up.
+func TestHandleTeamChannelCreateIsRefusedAndDoesNotReconfigure(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	// HIVEX_UNSAFE=1 bypasses the human-approval gate (covered by its own tests
+	// in channel_approval_test.go) so the call reaches the broker and the
+	// refusal below is the RETIREMENT, not the approval card.
+	t.Setenv("HIVEX_UNSAFE", "1")
+	ctx := context.Background()
+	b := newTestBroker(t)
+	if err := b.StartOnPort(0); err != nil {
+		t.Fatalf("start broker: %v", err)
+	}
+	defer b.Stop()
+
+	t.Setenv("HIVEX_TEAM_BROKER_URL", "http://"+b.Addr())
+	t.Setenv("HIVEX_BROKER_TOKEN", b.Token())
+	ensureBrokerMembers(t, ctx, "pm", "fe")
+
+	called := 0
+	prev := reconfigureOfficeSessionFn
+	reconfigureOfficeSessionFn = func() error {
+		called++
+		return nil
+	}
+	defer func() { reconfigureOfficeSessionFn = prev }()
+
+	result, _, err := handleTeamChannel(ctx, nil, TeamChannelArgs{
+		Action:      "create",
+		Channel:     "launch",
+		Name:        "launch",
+		Description: "Launch execution channel",
+		Members:     []string{"pm", "fe"},
+		MySlug:      "cos",
+	})
+	if err != nil {
+		t.Fatalf("handleTeamChannel: %v", err)
+	}
+	if result == nil || !result.IsError {
+		t.Fatalf("expected a tool error while named channels are retired, got %+v", result)
+	}
+	if got := textFromResult(t, result); !strings.Contains(got, "named channels are retired") {
+		t.Fatalf("the refusal must say why and what to do instead, got %q", got)
+	}
+	if called != 0 {
+		t.Fatalf("a refused create reconfigured the office %d time(s); nothing changed", called)
+	}
+	// Nothing was created. Checked against broker state rather than GET
+	// /channels: that listing now withholds ordinary named rooms, so it would
+	// answer "no launch channel" whether or not one exists.
+	if team.HasChannelForTest(b, "launch") {
+		t.Fatal("a refused create still minted the channel")
+	}
+}
+
+func TestHandleTeamChannelCreateRequiresExplicitSlug(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("HIVEX_CHANNEL", "general")
+
+	b := newTestBroker(t)
+	if err := b.StartOnPort(0); err != nil {
+		t.Fatalf("start broker: %v", err)
+	}
+	defer b.Stop()
+
+	t.Setenv("HIVEX_TEAM_BROKER_URL", "http://"+b.Addr())
+	t.Setenv("HIVEX_BROKER_TOKEN", b.Token())
+
+	result, _, err := handleTeamChannel(context.Background(), nil, TeamChannelArgs{
+		Action:      "create",
+		Name:        "launch",
+		Description: "Launch execution channel",
+		Members:     []string{"pm", "fe"},
+		MySlug:      "cos",
+	})
+	if err != nil {
+		t.Fatalf("handleTeamChannel returned unexpected error: %v", err)
+	}
+	if result == nil || !result.IsError {
+		t.Fatalf("expected tool error result when slug is omitted, got %+v", result)
+	}
+	if got := textFromResult(t, result); !strings.Contains(got, "channel slug is required") {
+		t.Fatalf("expected explicit slug message, got %q", got)
+	}
+
+	// And it created nothing. This used to read GET /channels and assert the
+	// fixture's "general" was still the only room; that listing now withholds
+	// ordinary named rooms, so it answers [] regardless and would have passed
+	// even if a channel HAD been minted. Ask broker state instead.
+	if team.HasChannelForTest(b, "launch") {
+		t.Fatal("a slug-less create minted a channel anyway")
+	}
+	if !team.HasChannelForTest(b, "general") {
+		t.Fatal("the fixture room was disturbed by a refused create")
+	}
+}
+
+func TestHandleHumanMessageUsesDirectSessionLabelInOneOnOneMode(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("HIVEX_ONE_ON_ONE", "1")
+	t.Setenv("HIVEX_AGENT_SLUG", "cos")
+
+	b := newTestBroker(t)
+	if err := b.StartOnPort(0); err != nil {
+		t.Fatalf("start broker: %v", err)
+	}
+	defer b.Stop()
+
+	t.Setenv("HIVEX_TEAM_BROKER_URL", "http://"+b.Addr())
+	t.Setenv("HIVEX_BROKER_TOKEN", b.Token())
+
+	result, _, err := handleHumanMessage(context.Background(), nil, HumanMessageArgs{
+		Content: "Action complete.",
+	})
+	if err != nil {
+		t.Fatalf("handleHumanMessage: %v", err)
+	}
+	if result == nil || len(result.Content) == 0 {
+		t.Fatal("expected text result")
+	}
+	text, ok := result.Content[0].(*mcp.TextContent)
+	if !ok {
+		t.Fatalf("expected text content, got %T", result.Content[0])
+	}
+	if text.Text == "" {
+		t.Fatal("expected non-empty text")
+	}
+	if want := "this direct session"; !strings.Contains(text.Text, want) {
+		t.Fatalf("expected %q in %q", want, text.Text)
+	}
+	if strings.Contains(text.Text, "#general") {
+		t.Fatalf("did not expect office channel label in %q", text.Text)
+	}
+}
+
+func TestHandleTeamMemoryWriteAndQueryPrivate(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	b := newTestBroker(t)
+	if err := b.StartOnPort(0); err != nil {
+		t.Fatalf("start broker: %v", err)
+	}
+	defer b.Stop()
+
+	t.Setenv("HIVEX_TEAM_BROKER_URL", "http://"+b.Addr())
+	t.Setenv("HIVEX_BROKER_TOKEN", b.Token())
+
+	if _, _, err := handleTeamMemoryWrite(context.Background(), nil, TeamMemoryWriteArgs{
+		Key:        "launch-brief",
+		Title:      "Launch brief",
+		Content:    "Customer Alpha needs the launch deck cut down to one page.",
+		Visibility: "private",
+		MySlug:     "pm",
+	}); err != nil {
+		t.Fatalf("handleTeamMemoryWrite: %v", err)
+	}
+
+	result, _, err := handleTeamMemoryQuery(context.Background(), nil, TeamMemoryQueryArgs{
+		Query:  "launch deck",
+		Scope:  "private",
+		MySlug: "pm",
+	})
+	if err != nil {
+		t.Fatalf("handleTeamMemoryQuery: %v", err)
+	}
+	text := textFromResult(t, result)
+	if !strings.Contains(text, "Private memory:") || !strings.Contains(text, "launch-brief") || !strings.Contains(text, "Launch brief") {
+		t.Fatalf("expected private memory hit, got %q", text)
+	}
+}
+
+func TestHandleTeamMemoryWriteHintsPromotionForDurableNote(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	b := newTestBroker(t)
+	if err := b.StartOnPort(0); err != nil {
+		t.Fatalf("start broker: %v", err)
+	}
+	defer b.Stop()
+
+	t.Setenv("HIVEX_TEAM_BROKER_URL", "http://"+b.Addr())
+	t.Setenv("HIVEX_BROKER_TOKEN", b.Token())
+
+	result, _, err := handleTeamMemoryWrite(context.Background(), nil, TeamMemoryWriteArgs{
+		Key:        "launch-brief",
+		Title:      "Launch brief",
+		Content:    "Approved final launch positioning for Customer Alpha. This is the canonical story for the rollout.",
+		Visibility: "private",
+		MySlug:     "pm",
+	})
+	if err != nil {
+		t.Fatalf("handleTeamMemoryWrite: %v", err)
+	}
+	text := textFromResult(t, result)
+	if !strings.Contains(text, "Saved private note launch-brief.") {
+		t.Fatalf("expected save confirmation, got %q", text)
+	}
+	if !strings.Contains(text, "team_memory_promote key=launch-brief") {
+		t.Fatalf("expected promotion hint, got %q", text)
+	}
+}
+
+func TestHandleTeamPollOneOnOneHighlightsLatestHumanRequest(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("HIVEX_ONE_ON_ONE", "1")
+	t.Setenv("HIVEX_AGENT_SLUG", "cos")
+
+	b := newTestBroker(t)
+	if err := b.StartOnPort(0); err != nil {
+		t.Fatalf("start broker: %v", err)
+	}
+	defer b.Stop()
+
+	t.Setenv("HIVEX_TEAM_BROKER_URL", "http://"+b.Addr())
+	t.Setenv("HIVEX_BROKER_TOKEN", b.Token())
+
+	// The CEO's own DM, which is where a one-on-one conversation actually
+	// lives now. These used to seed "general" and rely on resolveChannel
+	// defaulting there; that default is retired.
+	ceoDM := team.DMSlugFor("cos")
+	for _, msg := range []map[string]any{
+		{"channel": ceoDM, "from": "you", "content": "Old unrelated ask."},
+		{"channel": ceoDM, "from": "cos", "content": "Acknowledged."},
+		{"channel": ceoDM, "from": "you", "content": "Newest request wins."},
+	} {
+		if err := brokerPostJSON(context.Background(), "/messages", msg, nil); err != nil {
+			t.Fatalf("post message: %v", err)
+		}
+	}
+
+	result, _, err := handleTeamPoll(context.Background(), nil, TeamPollArgs{MySlug: "cos"})
+	if err != nil {
+		t.Fatalf("handleTeamPoll: %v", err)
+	}
+	if result == nil || len(result.Content) == 0 {
+		t.Fatal("expected text result")
+	}
+	text, ok := result.Content[0].(*mcp.TextContent)
+	if !ok {
+		t.Fatalf("expected text content, got %T", result.Content[0])
+	}
+	if !strings.Contains(text.Text, "Latest human request to answer now:") {
+		t.Fatalf("expected latest-request header, got %q", text.Text)
+	}
+	if !strings.Contains(text.Text, "Newest request wins.") {
+		t.Fatalf("expected latest human message in %q", text.Text)
+	}
+}
+
+func TestHandleTeamPollScopesMessagesForNonCEO(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	ctx := context.Background()
+
+	b := newTestBroker(t)
+	if err := b.StartOnPort(0); err != nil {
+		t.Fatalf("start broker: %v", err)
+	}
+	defer b.Stop()
+
+	t.Setenv("HIVEX_TEAM_BROKER_URL", "http://"+b.Addr())
+	t.Setenv("HIVEX_BROKER_TOKEN", b.Token())
+	ensureBrokerMembers(t, ctx, "pm", "fe")
+
+	for _, msg := range []map[string]any{
+		{"channel": "general", "from": "you", "content": "Human wants a quick update."},
+		{"channel": "general", "from": "pm", "content": "Unrelated PM planning note."},
+		{"channel": "general", "from": "cos", "content": "Frontend, tighten the CTA copy.", "tagged": []string{"fe"}},
+		{"channel": "general", "from": "fe", "content": "I am on the CTA copy now."},
+	} {
+		if err := brokerPostJSON(ctx, "/messages", msg, nil); err != nil {
+			t.Fatalf("post message: %v", err)
+		}
+	}
+
+	result, _, err := handleTeamPoll(ctx, nil, TeamPollArgs{Channel: "general", MySlug: "fe"})
+	if err != nil {
+		t.Fatalf("handleTeamPoll: %v", err)
+	}
+	text := textFromResult(t, result)
+	if !strings.Contains(text, "Frontend, tighten the CTA copy.") {
+		t.Fatalf("expected tagged CEO direction in %q", text)
+	}
+	if !strings.Contains(text, "I am on the CTA copy now.") {
+		t.Fatalf("expected FE outbox message in %q", text)
+	}
+	if strings.Contains(text, "Unrelated PM planning note.") {
+		t.Fatalf("did not expect unrelated PM note in scoped poll %q", text)
+	}
+}
+
+func TestSummarizeTaskRuntimeIncludesIsolationCounts(t *testing.T) {
+	summary := summarizeTaskRuntime("general", []brokerTaskSummary{
+		{
+			ID:             "task-1",
+			Owner:          "fe",
+			Status:         "in_progress",
+			ExecutionMode:  "local_worktree",
+			WorktreePath:   "/tmp/hivex-task-1",
+			WorktreeBranch: "feat/task-1",
+			Title:          "Implement landing page",
+		},
+		{
+			ID:          "task-2",
+			Owner:       "pm",
+			Status:      "review",
+			ReviewState: "ready_for_review",
+			Title:       "Review launch scope",
+		},
+	})
+
+	if !strings.Contains(summary, "Running tasks: 2 of 2") {
+		t.Fatalf("expected running count in %q", summary)
+	}
+	if !strings.Contains(summary, "Isolated worktrees: 1") {
+		t.Fatalf("expected isolation count in %q", summary)
+	}
+	if !strings.Contains(summary, "branch feat/task-1") {
+		t.Fatalf("expected worktree branch in %q", summary)
+	}
+	if !strings.Contains(summary, "/tmp/hivex-task-1") {
+		t.Fatalf("expected worktree path in %q", summary)
+	}
+	if !strings.Contains(summary, "working_directory") {
+		t.Fatalf("expected working_directory guidance in %q", summary)
+	}
+}
+
+func TestHandleTeamTaskStatusReportsWorktreeIsolation(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	ctx := context.Background()
+
+	b := newTestBroker(t)
+	if err := b.StartOnPort(0); err != nil {
+		t.Fatalf("start broker: %v", err)
+	}
+	defer b.Stop()
+
+	t.Setenv("HIVEX_TEAM_BROKER_URL", "http://"+b.Addr())
+	t.Setenv("HIVEX_BROKER_TOKEN", b.Token())
+	ensureBrokerMembers(t, ctx, "fe")
+
+	payload := map[string]any{
+		"action":          "create",
+		"channel":         "general",
+		"title":           "Implement worktree task",
+		"owner":           "fe",
+		"created_by":      "cos",
+		"execution_mode":  "local_worktree",
+		"worktree_path":   "/tmp/hivex-task-42",
+		"worktree_branch": "task/42",
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("marshal task payload: %v", err)
+	}
+	req, err := http.NewRequest(http.MethodPost, fmt.Sprintf("http://%s/tasks", b.Addr()), bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+b.Token())
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("create task: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 creating task, got %d", resp.StatusCode)
+	}
+
+	// Channel-per-task: an owned worktree task created against #general mints
+	// its own task-<id> channel, so resolve where it landed and report status
+	// there (status reports are channel-scoped).
+	var allTasks brokerTasksResponse
+	if err := brokerGetJSON(ctx, "/tasks?all_channels=true&include_done=true", &allTasks); err != nil {
+		t.Fatalf("fetch tasks: %v", err)
+	}
+	taskChannel := "general"
+	for _, tk := range allTasks.Tasks {
+		if tk.Title == "Implement worktree task" {
+			taskChannel = tk.Channel
+			break
+		}
+	}
+
+	result, _, err := handleTeamTaskStatus(ctx, nil, TeamTasksArgs{
+		Channel: taskChannel,
+		MySlug:  "fe",
+	})
+	if err != nil {
+		t.Fatalf("handleTeamTaskStatus: %v", err)
+	}
+	text := textFromResult(t, result)
+	if !strings.Contains(text, "Running tasks: 1 of 1") {
+		t.Fatalf("expected runtime count in %q", text)
+	}
+	if !strings.Contains(text, "Isolated worktrees: 1") {
+		t.Fatalf("expected isolation count in %q", text)
+	}
+	if !strings.Contains(text, "branch hivex-") {
+		t.Fatalf("expected worktree branch in %q", text)
+	}
+	if !strings.Contains(text, ".hivex/task-worktrees/") {
+		t.Fatalf("expected worktree path in %q", text)
+	}
+	if !strings.Contains(text, "working_directory") {
+		t.Fatalf("expected working_directory guidance in %q", text)
+	}
+
+	tasksResult, _, err := handleTeamTasks(ctx, nil, TeamTasksArgs{
+		Channel: taskChannel,
+		MySlug:  "fe",
+	})
+	if err != nil {
+		t.Fatalf("handleTeamTasks: %v", err)
+	}
+	tasksText := textFromResult(t, tasksResult)
+	if !strings.Contains(tasksText, "Current team tasks:") {
+		t.Fatalf("expected task listing header in %q", tasksText)
+	}
+	if !strings.Contains(tasksText, "branch hivex-") {
+		t.Fatalf("expected worktree branch in task listing %q", tasksText)
+	}
+	if !strings.Contains(tasksText, "working_directory ") || !strings.Contains(tasksText, ".hivex/task-worktrees/") {
+		t.Fatalf("expected working_directory path in task listing %q", tasksText)
+	}
+}
+
+func TestHandleTeamTaskReturnsWorktreeGuidance(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	ctx := context.Background()
+
+	b := newTestBroker(t)
+	if err := b.StartOnPort(0); err != nil {
+		t.Fatalf("start broker: %v", err)
+	}
+	defer b.Stop()
+
+	t.Setenv("HIVEX_TEAM_BROKER_URL", "http://"+b.Addr())
+	t.Setenv("HIVEX_BROKER_TOKEN", b.Token())
+	ensureBrokerMembers(t, ctx, "fe")
+
+	payload := map[string]any{
+		"action":          "create",
+		"channel":         "general",
+		"title":           "Implement worktree task",
+		"owner":           "fe",
+		"created_by":      "cos",
+		"execution_mode":  "local_worktree",
+		"worktree_path":   "/tmp/hivex-task-99",
+		"worktree_branch": "task/99",
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("marshal task payload: %v", err)
+	}
+	req, err := http.NewRequest(http.MethodPost, fmt.Sprintf("http://%s/tasks", b.Addr()), bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+b.Token())
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("create task: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 creating task, got %d", resp.StatusCode)
+	}
+
+	var created struct {
+		Task struct {
+			ID string `json:"id"`
+		} `json:"task"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&created); err != nil {
+		t.Fatalf("decode created task: %v", err)
+	}
+
+	result, _, err := handleTeamTask(ctx, nil, TeamTaskArgs{
+		Action:  "review",
+		Channel: "general",
+		ID:      created.Task.ID,
+		MySlug:  "fe",
+	})
+	if err != nil {
+		t.Fatalf("handleTeamTask: %v", err)
+	}
+	text := textFromResult(t, result)
+	if !strings.Contains(text, "branch hivex-") {
+		t.Fatalf("expected worktree branch in %q", text)
+	}
+	if !strings.Contains(text, "working_directory ") || !strings.Contains(text, ".hivex/task-worktrees/") {
+		t.Fatalf("expected working_directory guidance in %q", text)
+	}
+}
+
+func TestHandleTeamTaskCreateDefaultsOwnerToCaller(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	ctx := context.Background()
+
+	b := newTestBroker(t)
+	if err := b.StartOnPort(0); err != nil {
+		t.Fatalf("start broker: %v", err)
+	}
+	defer b.Stop()
+
+	t.Setenv("HIVEX_TEAM_BROKER_URL", "http://"+b.Addr())
+	t.Setenv("HIVEX_BROKER_TOKEN", b.Token())
+	ensureBrokerMembers(t, ctx, "eng")
+
+	// Slice 7: specialists can't create Issues directly — only CEO
+	// (or human). Test the "default owner to caller" semantic with
+	// MySlug="cos" since cos is the lead and allowed to create.
+	result, _, err := handleTeamTask(ctx, nil, TeamTaskArgs{
+		Action:  "create",
+		Channel: "general",
+		Title:   "Investigate webhook retries",
+		Details: "The bot detected this as follow-up implementation work.",
+		MySlug:  "cos",
+	})
+	if err != nil {
+		t.Fatalf("handleTeamTask: %v", err)
+	}
+	text := textFromResult(t, result)
+	// Creation is the authorization: an owner-set Issue (the default
+	// task_type via RULE ZERO override) lands running / in_progress
+	// immediately — no Approve & Start ceremony.
+	// Slice 7: MySlug must be cos (only lead can create); owner
+	// defaults to the caller, so the assertion reads "@cos".
+	// Task IDs follow the workspace prefix (Linear-style, default OFFICE).
+	// We assert the message shape without pinning the exact prefix so the
+	// test survives prefix-from-company-name resolution.
+	if !strings.Contains(text, "Task ") || !strings.Contains(text, "is now in_progress @cos") {
+		t.Fatalf("expected self-owned running (in_progress) task result, got %q", text)
+	}
+
+	var tasks brokerTasksResponse
+	// Channel-per-task: a created task mints its own task-<id> channel and
+	// leaves #general (now owned by the archived Backup & Migration system
+	// task), so scan all channels and match by title instead of assuming the
+	// task is the lone occupant of #general.
+	if err := brokerGetJSON(ctx, "/tasks?all_channels=true&include_done=true", &tasks); err != nil {
+		t.Fatalf("fetch tasks: %v", err)
+	}
+	var task brokerTaskSummary
+	for _, candidate := range tasks.Tasks {
+		if candidate.Title == "Investigate webhook retries" {
+			task = candidate
+			break
+		}
+	}
+	if task.Title != "Investigate webhook retries" {
+		t.Fatalf("expected created task present across channels, got %+v", tasks.Tasks)
+	}
+	if task.Owner != "cos" || task.CreatedBy != "cos" || task.Status != "in_progress" {
+		t.Fatalf("expected caller-owned running (status=in_progress) task, got %+v", task)
+	}
+
+	result, _, err = handleTeamTask(ctx, nil, TeamTaskArgs{
+		Action:  "create",
+		Channel: "general",
+		Title:   "Whitespace owner fallback",
+		Owner:   "   ",
+		MySlug:  "cos",
+	})
+	if err != nil {
+		t.Fatalf("handleTeamTask whitespace owner: %v", err)
+	}
+	text = textFromResult(t, result)
+	if !strings.Contains(text, "is now in_progress @cos") {
+		t.Fatalf("expected whitespace-owner task to be caller-owned (running), got %q", text)
+	}
+
+	if err := brokerGetJSON(ctx, "/tasks?all_channels=true&include_done=true", &tasks); err != nil {
+		t.Fatalf("fetch tasks after whitespace-owner create: %v", err)
+	}
+	foundWhitespace := false
+	for _, task := range tasks.Tasks {
+		if task.Title != "Whitespace owner fallback" {
+			continue
+		}
+		foundWhitespace = true
+		if task.Owner != "cos" || task.CreatedBy != "cos" || task.Status != "in_progress" {
+			t.Fatalf("expected trimmed-empty owner to default to caller (running), got %+v", task)
+		}
+	}
+	if !foundWhitespace {
+		t.Fatal("expected whitespace-owner fallback task to exist")
+	}
+}
+
+func TestHandleTeamRuntimeStateIncludesRecoveryAndCapabilities(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	ctx := context.Background()
+
+	b := newTestBroker(t)
+	if err := b.StartOnPort(0); err != nil {
+		t.Fatalf("start broker: %v", err)
+	}
+	defer b.Stop()
+
+	t.Setenv("HIVEX_TEAM_BROKER_URL", "http://"+b.Addr())
+	t.Setenv("HIVEX_BROKER_TOKEN", b.Token())
+	ensureBrokerMembers(t, ctx, "fe")
+
+	// Create the worktree task first so we can target its channel. Under
+	// channel-per-task an owned task mints its own task-<id> channel, so the
+	// message, approval request, and runtime-state query all target that same
+	// channel — mirroring production, where a task's approvals and chatter live
+	// in the task's channel rather than #general.
+	if err := brokerPostJSON(ctx, "/tasks", map[string]any{
+		"action":          "create",
+		"channel":         "general",
+		"title":           "Ship release candidate",
+		"owner":           "fe",
+		"created_by":      "cos",
+		"execution_mode":  "local_worktree",
+		"worktree_path":   "/tmp/hivex-task-77",
+		"worktree_branch": "task/77",
+	}, nil); err != nil {
+		t.Fatalf("create task: %v", err)
+	}
+
+	var allTasks brokerTasksResponse
+	if err := brokerGetJSON(ctx, "/tasks?all_channels=true&include_done=true", &allTasks); err != nil {
+		t.Fatalf("fetch tasks: %v", err)
+	}
+	taskChannel := "general"
+	for _, tk := range allTasks.Tasks {
+		if tk.Title == "Ship release candidate" {
+			taskChannel = tk.Channel
+			break
+		}
+	}
+
+	if err := brokerPostJSON(ctx, "/messages", map[string]any{
+		"channel": taskChannel,
+		"from":    "cos",
+		"content": "Need your approval before shipping.",
+	}, nil); err != nil {
+		t.Fatalf("post message: %v", err)
+	}
+
+	if err := brokerPostJSON(ctx, "/requests", map[string]any{
+		"kind":     "approval",
+		"channel":  taskChannel,
+		"from":     "cos",
+		"title":    "Approve release",
+		"question": "Should we ship the release candidate?",
+		"blocking": true,
+		"required": true,
+		"secret":   false,
+		"reply_to": "",
+		"options":  []map[string]any{{"id": "yes", "label": "Ship it"}},
+	}, nil); err != nil {
+		t.Fatalf("create request: %v", err)
+	}
+
+	result, structured, err := handleTeamRuntimeState(ctx, nil, TeamRuntimeStateArgs{
+		Channel:      taskChannel,
+		MySlug:       "fe",
+		MessageLimit: 10,
+	})
+	if err != nil {
+		t.Fatalf("handleTeamRuntimeState: %v", err)
+	}
+	text := textFromResult(t, result)
+	for _, want := range []string{
+		fmt.Sprintf("Runtime state for #%s", taskChannel),
+		// 1 = the fixture's blocking approval. The drafting "Waiting on
+		// you" notice is gone with the start-approval ceremony: created
+		// tasks land running, so no awaiting-start request is raised.
+		"Pending human requests: 1",
+		"Current focus: Approve release from @cos.",
+		"working_directory ",
+		"Runtime capabilities:",
+		// With no explicit memory-backend, we fall through to the markdown
+		// wiki (no external deps) instead of silently running with no memory
+		// backend at all. The capability label follows the
+		// active-backend naming convention (`<Backend> memory`) and the
+		// detail describes where the wiki lives.
+		"Markdown wiki memory [ready]: Markdown-backed team wiki at ~/.hivex/wiki is configured.",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("expected %q in %q", want, text)
+		}
+	}
+
+	snapshot, ok := structured.(team.RuntimeSnapshot)
+	if !ok {
+		t.Fatalf("expected structured runtime snapshot, got %T", structured)
+	}
+	if snapshot.Channel != taskChannel {
+		t.Fatalf("expected %q channel, got %q", taskChannel, snapshot.Channel)
+	}
+	if len(snapshot.Tasks) != 1 || !strings.Contains(snapshot.Tasks[0].WorktreePath, ".hivex/task-worktrees/") {
+		t.Fatalf("unexpected runtime tasks: %+v", snapshot.Tasks)
+	}
+	if len(snapshot.Requests) == 0 || snapshot.Requests[0].Title != "Approve release" {
+		t.Fatalf("unexpected runtime requests: %+v", snapshot.Requests)
+	}
+	if _, ok := snapshot.Registry.Entry(team.CapabilityKeyConnections); !ok {
+		t.Fatalf("expected connections readiness in runtime registry, got %+v", snapshot.Registry.Entries)
+	}
+	if _, ok := snapshot.Registry.Entry(team.CapabilityKeyOfficeActions); !ok {
+		t.Fatalf("expected office actions readiness in runtime registry, got %+v", snapshot.Registry.Entries)
+	}
+}
+
+func TestHandleTeamRequestDefaultsApprovalOptions(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	b := newTestBroker(t)
+	if err := b.StartOnPort(0); err != nil {
+		t.Fatalf("start broker: %v", err)
+	}
+	defer b.Stop()
+
+	t.Setenv("HIVEX_TEAM_BROKER_URL", "http://"+b.Addr())
+	t.Setenv("HIVEX_BROKER_TOKEN", b.Token())
+
+	if _, _, err := handleTeamRequest(context.Background(), nil, TeamRequestArgs{
+		Kind:     "approval",
+		Channel:  "general",
+		Question: "Ship this?",
+		MySlug:   "cos",
+	}); err != nil {
+		t.Fatalf("handleTeamRequest: %v", err)
+	}
+
+	var result brokerRequestsResponse
+	if err := brokerGetJSON(context.Background(), "/requests?channel=general", &result); err != nil {
+		t.Fatalf("fetch requests: %v", err)
+	}
+	if len(result.Requests) != 1 {
+		t.Fatalf("expected one request, got %+v", result.Requests)
+	}
+	req := result.Requests[0]
+	if req.RecommendedID != "approve" {
+		t.Fatalf("expected recommended approval option, got %q", req.RecommendedID)
+	}
+	if len(req.Options) != 5 {
+		t.Fatalf("expected default approval options, got %+v", req.Options)
+	}
+	found := false
+	for _, option := range req.Options {
+		if option.ID == "approve_with_note" {
+			found = option.RequiresText && strings.TrimSpace(option.TextHint) != ""
+		}
+	}
+	if !found {
+		t.Fatalf("expected approve_with_note option with text guidance, got %+v", req.Options)
+	}
+}
+
+func TestHandleTeamPollUsesBotScopedTranscript(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	ctx := context.Background()
+
+	b := newTestBroker(t)
+	if err := b.StartOnPort(0); err != nil {
+		t.Fatalf("start broker: %v", err)
+	}
+	defer b.Stop()
+
+	t.Setenv("HIVEX_TEAM_BROKER_URL", "http://"+b.Addr())
+	t.Setenv("HIVEX_BROKER_TOKEN", b.Token())
+	ensureBrokerMembers(t, ctx, "pm", "fe")
+
+	for _, msg := range []map[string]any{
+		{"channel": "general", "from": "you", "content": "Frontend, should we ship this?", "tagged": []string{"fe"}},
+		{"channel": "general", "from": "pm", "content": "Unrelated roadmap chatter."},
+		{"channel": "general", "from": "cos", "content": "Keep scope tight and focus on signup."},
+		{"channel": "general", "from": "fe", "content": "I can take the signup work."},
+	} {
+		if err := brokerPostJSON(ctx, "/messages", msg, nil); err != nil {
+			t.Fatalf("post message: %v", err)
+		}
+	}
+
+	result, _, err := handleTeamPoll(ctx, nil, TeamPollArgs{
+		Channel: "general",
+		MySlug:  "fe",
+	})
+	if err != nil {
+		t.Fatalf("handleTeamPoll: %v", err)
+	}
+	text := textFromResult(t, result)
+	if !strings.Contains(text, "Keep scope tight and focus on signup.") {
+		t.Fatalf("expected CEO context in scoped transcript, got %q", text)
+	}
+	if strings.Contains(text, "Unrelated roadmap chatter.") {
+		t.Fatalf("did not expect unrelated PM chatter in scoped transcript, got %q", text)
+	}
+}
+
+func TestHandleTeamBroadcastDefaultsToLatestTaggedChannelAndThread(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	ctx := context.Background()
+
+	b := newTestBroker(t)
+	if err := b.StartOnPort(0); err != nil {
+		t.Fatalf("start broker: %v", err)
+	}
+	defer b.Stop()
+
+	t.Setenv("HIVEX_TEAM_BROKER_URL", "http://"+b.Addr())
+	t.Setenv("HIVEX_BROKER_TOKEN", b.Token())
+	ensureBrokerMembers(t, ctx, "pm", "fe")
+
+	// The launch room comes from the fixture as a BRIDGED room, not from POST
+	// /channels: named-channel create is retired and answers 409, a DM holds
+	// only two participants so the CEO could not tag @fe inside one, and a
+	// plain named room is withheld from GET /channels — which is the listing
+	// this tool's channel inference reads, so the room would exist and the
+	// routing would still resolve elsewhere. A bridged room is the shared
+	// surface that survives the retirement. What this test is about is
+	// unchanged: which room a reply defaults to when the bot was tagged in
+	// one.
+	team.SeedBridgedRoomForTest(b, "launch", "fe", "pm")
+	if err := brokerPostJSON(ctx, "/messages", map[string]any{
+		"channel": "launch",
+		"from":    "cos",
+		"content": "Frontend, tighten the launch CTA in this thread.",
+		"tagged":  []string{"fe"},
+	}, nil); err != nil {
+		t.Fatalf("post launch message: %v", err)
+	}
+
+	result, _, err := handleTeamBroadcast(ctx, nil, TeamBroadcastArgs{
+		MySlug:  "fe",
+		Content: "On it. I will keep this in the launch thread.",
+	})
+	if err != nil {
+		t.Fatalf("handleTeamBroadcast: %v", err)
+	}
+	text := textFromResult(t, result)
+	if !strings.Contains(text, "Posted to #launch as @fe") {
+		t.Fatalf("expected launch channel in %q", text)
+	}
+	if !strings.Contains(text, "in reply to msg-1") {
+		t.Fatalf("expected reply target in %q", text)
+	}
+
+	var launch brokerMessagesResponse
+	if err := brokerGetJSON(ctx, "/messages?channel=launch&limit=10", &launch); err != nil {
+		t.Fatalf("fetch launch messages: %v", err)
+	}
+	if len(launch.Messages) != 2 {
+		t.Fatalf("expected two launch messages, got %+v", launch.Messages)
+	}
+	got := launch.Messages[len(launch.Messages)-1]
+	if got.From != "fe" || got.ReplyTo != "msg-1" {
+		t.Fatalf("expected FE reply in launch thread, got %+v", got)
+	}
+}
+
+func TestHandleTeamPollDefaultsToLatestTaggedChannel(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	ctx := context.Background()
+
+	b := newTestBroker(t)
+	if err := b.StartOnPort(0); err != nil {
+		t.Fatalf("start broker: %v", err)
+	}
+	defer b.Stop()
+
+	t.Setenv("HIVEX_TEAM_BROKER_URL", "http://"+b.Addr())
+	t.Setenv("HIVEX_BROKER_TOKEN", b.Token())
+	ensureBrokerMembers(t, ctx, "pm", "fe")
+
+	// The launch room comes from the fixture as a BRIDGED room, not from POST
+	// /channels: named-channel create is retired and answers 409, a DM holds
+	// only two participants so the CEO could not tag @fe inside one, and a
+	// plain named room is withheld from GET /channels — which is the listing
+	// this tool's channel inference reads, so the room would exist and the
+	// routing would still resolve elsewhere. A bridged room is the shared
+	// surface that survives the retirement. What this test is about is
+	// unchanged: which room a reply defaults to when the bot was tagged in
+	// one.
+	team.SeedBridgedRoomForTest(b, "launch", "fe", "pm")
+	if err := brokerPostJSON(ctx, "/messages", map[string]any{
+		"channel": "launch",
+		"from":    "cos",
+		"content": "Frontend, review the launch thread.",
+		"tagged":  []string{"fe"},
+	}, nil); err != nil {
+		t.Fatalf("post launch message: %v", err)
+	}
+
+	result, _, err := handleTeamPoll(ctx, nil, TeamPollArgs{MySlug: "fe"})
+	if err != nil {
+		t.Fatalf("handleTeamPoll: %v", err)
+	}
+	text := textFromResult(t, result)
+	if !strings.Contains(text, "Channel #launch") {
+		t.Fatalf("expected inferred launch channel in %q", text)
+	}
+	if !strings.Contains(text, "Frontend, review the launch thread.") {
+		t.Fatalf("expected launch content in %q", text)
+	}
+}
+
+func TestHandleTeamTaskUsesTaskChannelWhenIDGiven(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	ctx := context.Background()
+
+	b := newTestBroker(t)
+	if err := b.StartOnPort(0); err != nil {
+		t.Fatalf("start broker: %v", err)
+	}
+	defer b.Stop()
+
+	t.Setenv("HIVEX_TEAM_BROKER_URL", "http://"+b.Addr())
+	t.Setenv("HIVEX_BROKER_TOKEN", b.Token())
+	ensureBrokerMembers(t, ctx, "pm", "fe")
+
+	// The launch room comes from the fixture as a BRIDGED room, not from POST
+	// /channels: named-channel create is retired and answers 409, a DM holds
+	// only two participants so the CEO could not tag @fe inside one, and a
+	// plain named room is withheld from GET /channels — which is the listing
+	// this tool's channel inference reads, so the room would exist and the
+	// routing would still resolve elsewhere. A bridged room is the shared
+	// surface that survives the retirement. What this test is about is
+	// unchanged: which room a reply defaults to when the bot was tagged in
+	// one.
+	team.SeedBridgedRoomForTest(b, "launch", "fe", "pm")
+
+	var created struct {
+		Task struct {
+			ID string `json:"id"`
+		} `json:"task"`
+	}
+	if err := brokerPostJSON(ctx, "/tasks", map[string]any{
+		"action":     "create",
+		"channel":    "launch",
+		"title":      "Review launch CTA",
+		"owner":      "fe",
+		"created_by": "cos",
+		"thread_id":  "msg-launch",
+	}, &created); err != nil {
+		t.Fatalf("create task: %v", err)
+	}
+
+	result, _, err := handleTeamTask(ctx, nil, TeamTaskArgs{
+		Action: "review",
+		ID:     created.Task.ID,
+		MySlug: "fe",
+	})
+	if err != nil {
+		t.Fatalf("handleTeamTask: %v", err)
+	}
+	text := textFromResult(t, result)
+	if !strings.Contains(text, "in #launch") {
+		t.Fatalf("expected task action to stay in launch, got %q", text)
+	}
+}
+
+func TestHandleHumanMessageDefaultsToDirectReplyThreadInOneOnOneMode(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("HIVEX_ONE_ON_ONE", "1")
+	ctx := context.Background()
+
+	b := newTestBroker(t)
+	if err := b.StartOnPort(0); err != nil {
+		t.Fatalf("start broker: %v", err)
+	}
+	defer b.Stop()
+
+	t.Setenv("HIVEX_TEAM_BROKER_URL", "http://"+b.Addr())
+	t.Setenv("HIVEX_BROKER_TOKEN", b.Token())
+	ensureBrokerMembers(t, ctx, "pm")
+	if err := b.SetSessionMode(team.SessionModeOneOnOne, "pm"); err != nil {
+		t.Fatalf("set session mode: %v", err)
+	}
+
+	// The direct session's own DM, not the retired shared room.
+	if err := brokerPostJSON(ctx, "/messages", map[string]any{
+		"channel": team.DMSlugFor("pm"),
+		"from":    "you",
+		"content": "Can you send me the latest product answer?",
+	}, nil); err != nil {
+		t.Fatalf("post direct human message: %v", err)
+	}
+
+	result, _, err := handleHumanMessage(ctx, nil, HumanMessageArgs{
+		MySlug:  "pm",
+		Content: "Yes. Here is the latest product answer.",
+	})
+	if err != nil {
+		t.Fatalf("handleHumanMessage: %v", err)
+	}
+	text := textFromResult(t, result)
+	if !strings.Contains(text, "this direct session") {
+		t.Fatalf("expected direct-session label in %q", text)
+	}
+	if !strings.Contains(text, "in reply to msg-1") {
+		t.Fatalf("expected direct reply threading in %q", text)
+	}
+}
+
+func TestHandleTeamInboxAndOutboxExposeOwnedTranscriptSlices(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	ctx := context.Background()
+
+	b := newTestBroker(t)
+	if err := b.StartOnPort(0); err != nil {
+		t.Fatalf("start broker: %v", err)
+	}
+	defer b.Stop()
+
+	t.Setenv("HIVEX_TEAM_BROKER_URL", "http://"+b.Addr())
+	t.Setenv("HIVEX_BROKER_TOKEN", b.Token())
+	ensureBrokerMembers(t, ctx, "pm", "fe")
+
+	if err := brokerPostJSON(ctx, "/messages", map[string]any{
+		"channel": "general",
+		"from":    "cos",
+		"content": "Frontend, take the signup thread.",
+	}, nil); err != nil {
+		t.Fatalf("post cos message: %v", err)
+	}
+	if err := brokerPostJSON(ctx, "/messages", map[string]any{
+		"channel":  "general",
+		"from":     "fe",
+		"content":  "I can own the signup thread.",
+		"reply_to": "msg-1",
+	}, nil); err != nil {
+		t.Fatalf("post own message: %v", err)
+	}
+	if err := brokerPostJSON(ctx, "/messages", map[string]any{
+		"channel":  "general",
+		"from":     "pm",
+		"content":  "Please include pricing copy in that thread.",
+		"reply_to": "msg-2",
+	}, nil); err != nil {
+		t.Fatalf("post thread reply: %v", err)
+	}
+	if err := brokerPostJSON(ctx, "/messages", map[string]any{
+		"channel": "general",
+		"from":    "fe",
+		"content": "Shipped the initial branch.",
+	}, nil); err != nil {
+		t.Fatalf("post own top-level message: %v", err)
+	}
+	if err := brokerPostJSON(ctx, "/messages", map[string]any{
+		"channel": "general",
+		"from":    "pm",
+		"content": "Unrelated roadmap chatter.",
+	}, nil); err != nil {
+		t.Fatalf("post unrelated message: %v", err)
+	}
+
+	inboxResult, _, err := handleTeamInbox(ctx, nil, TeamPollArgs{Channel: "general", MySlug: "fe"})
+	if err != nil {
+		t.Fatalf("handleTeamInbox: %v", err)
+	}
+	inboxText := textFromResult(t, inboxResult)
+	if !strings.Contains(inboxText, "Inbox for @fe in #general") {
+		t.Fatalf("expected inbox heading, got %q", inboxText)
+	}
+	if !strings.Contains(inboxText, "Please include pricing copy in that thread.") {
+		t.Fatalf("expected thread reply in inbox, got %q", inboxText)
+	}
+	if strings.Contains(inboxText, "Shipped the initial branch.") || strings.Contains(inboxText, "Unrelated roadmap chatter.") {
+		t.Fatalf("unexpected content in inbox slice: %q", inboxText)
+	}
+
+	outboxResult, _, err := handleTeamOutbox(context.Background(), nil, TeamPollArgs{Channel: "general", MySlug: "fe"})
+	if err != nil {
+		t.Fatalf("handleTeamOutbox: %v", err)
+	}
+	outboxText := textFromResult(t, outboxResult)
+	if !strings.Contains(outboxText, "Outbox for @fe in #general") {
+		t.Fatalf("expected outbox heading, got %q", outboxText)
+	}
+	if !strings.Contains(outboxText, "Shipped the initial branch.") {
+		t.Fatalf("expected authored message in outbox, got %q", outboxText)
+	}
+	if strings.Contains(outboxText, "Frontend, take the signup thread.") || strings.Contains(outboxText, "Please include pricing copy in that thread.") {
+		t.Fatalf("unexpected non-authored content in outbox slice: %q", outboxText)
+	}
+}
+
+func TestDetectUntaggedMentions(t *testing.T) {
+	// No @-mentions → nothing flagged
+	if got := detectUntaggedMentions("Hello there, nice work!", nil); len(got) != 0 {
+		t.Fatalf("expected no mentions, got %v", got)
+	}
+
+	// @-mention that IS in tagged → not flagged
+	if got := detectUntaggedMentions("@engineering please write this", []string{"engineering"}); len(got) != 0 {
+		t.Fatalf("expected no untagged, got %v", got)
+	}
+
+	// @-mention NOT in tagged → flagged
+	got := detectUntaggedMentions("@engineering please write this", nil)
+	if len(got) != 1 || got[0] != "engineering" {
+		t.Fatalf("expected engineering flagged, got %v", got)
+	}
+
+	// Known non-bot @-references → not flagged
+	nonBots := []string{"you", "human", "team", "everyone"}
+	for _, na := range nonBots {
+		content := fmt.Sprintf("@%s please reply", na)
+		if found := detectUntaggedMentions(content, nil); len(found) != 0 {
+			t.Fatalf("@%s should not be flagged, got %v", na, found)
+		}
+	}
+
+	// Multiple @-mentions, one tagged → only untagged one flagged
+	got = detectUntaggedMentions("@cos @marketing please coordinate", []string{"cos"})
+	if len(got) != 1 || got[0] != "marketing" {
+		t.Fatalf("expected only marketing untagged, got %v", got)
+	}
+
+	// Trailing punctuation stripped correctly
+	got = detectUntaggedMentions("@marketing, please write a draft.", nil)
+	if len(got) != 1 || got[0] != "marketing" {
+		t.Fatalf("expected marketing after stripping punctuation, got %v", got)
+	}
+}
+
+// TestHandleTeamPlanCreatesDependentBlockedTasks verifies the team_plan MCP tool
+// round-trips through the HTTP broker, creates both tasks, and marks the dependent
+// task as BLOCKED when its dependency is still open.
+func TestHandleTeamPlanCreatesDependentBlockedTasks(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	b := newTestBroker(t)
+	if err := b.StartOnPort(0); err != nil {
+		t.Fatalf("start broker: %v", err)
+	}
+	defer b.Stop()
+
+	t.Setenv("HIVEX_TEAM_BROKER_URL", "http://"+b.Addr())
+	t.Setenv("HIVEX_BROKER_TOKEN", b.Token())
+
+	result, _, err := handleTeamPlan(context.Background(), nil, TeamPlanArgs{
+		Channel: "general",
+		MySlug:  "cos",
+		Tasks: []struct {
+			Title         string   `json:"title" jsonschema:"Task title"`
+			Assignee      string   `json:"assignee" jsonschema:"Bot slug to own this task"`
+			Details       string   `json:"details,omitempty" jsonschema:"Optional task details"`
+			TaskType      string   `json:"task_type,omitempty" jsonschema:"Optional task type such as research, feature, launch, follow_up, bugfix, or incident"`
+			ExecutionMode string   `json:"execution_mode,omitempty" jsonschema:"Optional execution mode such as office or local_worktree"`
+			Effort        string   `json:"effort,omitempty" jsonschema:"Optional model-specific reasoning-effort level (e.g. \"high\" for claude, \"medium\" for codex). Omit for runtime default."`
+			Provider      string   `json:"provider,omitempty" jsonschema:"Optional per-task LLM runtime kind (claude-code, codex, …). Dispatch prefers it over the owner's binding. Omit to inherit."`
+			Model         string   `json:"model,omitempty" jsonschema:"Optional per-task model id for the chosen provider. Omit to inherit the owner's binding or the install default."`
+			DependsOn     []string `json:"depends_on,omitempty" jsonschema:"Titles or IDs of tasks this depends on"`
+		}{
+			{Title: "Research competitors", Assignee: "research"},
+			{Title: "Write positioning copy", Assignee: "marketing", DependsOn: []string{"Research competitors"}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("handleTeamPlan: %v", err)
+	}
+	text := textFromResult(t, result)
+
+	if !strings.Contains(text, "Created 2 tasks") {
+		t.Fatalf("expected 2 tasks created, got %q", text)
+	}
+	if !strings.Contains(text, "Research competitors") {
+		t.Fatalf("expected research task in output, got %q", text)
+	}
+	if !strings.Contains(text, "Write positioning copy") {
+		t.Fatalf("expected marketing task in output, got %q", text)
+	}
+	// The dependent task must be marked BLOCKED in the output.
+	if !strings.Contains(text, "BLOCKED") {
+		t.Fatalf("expected BLOCKED flag for dependent task, got %q", text)
+	}
+	// The first task (no deps) must NOT be blocked.
+	lines := strings.Split(text, "\n")
+	for _, line := range lines {
+		if strings.Contains(line, "Research competitors") && strings.Contains(line, "BLOCKED") {
+			t.Fatalf("research task should not be BLOCKED: %q", line)
+		}
+	}
+}
+
+func TestHandleTeamPlanPreservesTaskMetadata(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	b := newTestBroker(t)
+	if err := b.StartOnPort(0); err != nil {
+		t.Fatalf("start broker: %v", err)
+	}
+	defer b.Stop()
+
+	t.Setenv("HIVEX_TEAM_BROKER_URL", "http://"+b.Addr())
+	t.Setenv("HIVEX_BROKER_TOKEN", b.Token())
+
+	_, _, err := handleTeamPlan(context.Background(), nil, TeamPlanArgs{
+		Channel: "general",
+		MySlug:  "cos",
+		Tasks: []struct {
+			Title         string   `json:"title" jsonschema:"Task title"`
+			Assignee      string   `json:"assignee" jsonschema:"Bot slug to own this task"`
+			Details       string   `json:"details,omitempty" jsonschema:"Optional task details"`
+			TaskType      string   `json:"task_type,omitempty" jsonschema:"Optional task type such as research, feature, launch, follow_up, bugfix, or incident"`
+			ExecutionMode string   `json:"execution_mode,omitempty" jsonschema:"Optional execution mode such as office or local_worktree"`
+			Effort        string   `json:"effort,omitempty" jsonschema:"Optional model-specific reasoning-effort level (e.g. \"high\" for claude, \"medium\" for codex). Omit for runtime default."`
+			Provider      string   `json:"provider,omitempty" jsonschema:"Optional per-task LLM runtime kind (claude-code, codex, …). Dispatch prefers it over the owner's binding. Omit to inherit."`
+			Model         string   `json:"model,omitempty" jsonschema:"Optional per-task model id for the chosen provider. Omit to inherit the owner's binding or the install default."`
+			DependsOn     []string `json:"depends_on,omitempty" jsonschema:"Titles or IDs of tasks this depends on"`
+		}{
+			{Title: "Build the studio control plane", Assignee: "eng", TaskType: "feature", ExecutionMode: "local_worktree"},
+			{Title: "Package the launch slate", Assignee: "gtm", TaskType: "launch", ExecutionMode: "office"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("handleTeamPlan: %v", err)
+	}
+
+	var result brokerTasksResponse
+	if err := brokerGetJSON(context.Background(), "/tasks?all_channels=true&include_done=true", &result); err != nil {
+		t.Fatalf("fetch tasks: %v", err)
+	}
+
+	found := map[string]brokerTaskSummary{}
+	for _, task := range result.Tasks {
+		found[task.Title] = task
+	}
+	if got := found["Build the studio control plane"]; got.TaskType != "feature" || got.ExecutionMode != "local_worktree" {
+		t.Fatalf("expected feature/local_worktree metadata, got %+v", got)
+	}
+	if got := found["Package the launch slate"]; got.TaskType != "launch" || got.ExecutionMode != "office" {
+		t.Fatalf("expected launch/office metadata, got %+v", got)
+	}
+}
+
+func TestHandleTeamTaskCreatePreservesTaskMetadata(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	b := newTestBroker(t)
+	if err := b.StartOnPort(0); err != nil {
+		t.Fatalf("start broker: %v", err)
+	}
+	defer b.Stop()
+
+	t.Setenv("HIVEX_TEAM_BROKER_URL", "http://"+b.Addr())
+	t.Setenv("HIVEX_BROKER_TOKEN", b.Token())
+
+	_, _, err := handleTeamTask(context.Background(), nil, TeamTaskArgs{
+		Action:        "create",
+		Channel:       "general",
+		Title:         "Implement studio foundations",
+		Owner:         "eng",
+		TaskType:      "feature",
+		ExecutionMode: "local_worktree",
+		MySlug:        "cos",
+	})
+	if err != nil {
+		t.Fatalf("handleTeamTask: %v", err)
+	}
+
+	var result brokerTasksResponse
+	if err := brokerGetJSON(context.Background(), "/tasks?all_channels=true&include_done=true", &result); err != nil {
+		t.Fatalf("fetch tasks: %v", err)
+	}
+
+	for _, task := range result.Tasks {
+		if task.Title != "Implement studio foundations" {
+			continue
+		}
+		if task.TaskType != "feature" || task.ExecutionMode != "local_worktree" {
+			t.Fatalf("expected feature/local_worktree metadata, got %+v", task)
+		}
+		return
+	}
+	t.Fatal("expected created task to be present")
+}

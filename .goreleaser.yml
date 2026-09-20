@@ -1,0 +1,99 @@
+version: 2
+
+builds:
+  - id: hivex
+    main: ./cmd/hivebot
+    binary: hivebot
+    goos:
+      - darwin
+      - linux
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    env:
+      - CGO_ENABLED=0
+    ldflags:
+      # Inject the release version (and build timestamp) so `hivex --version`
+      # reports the actual release instead of the hardcoded 0.1.0 fallback in
+      # internal/buildinfo. goreleaser exposes {{.Version}} without a leading v
+      # and {{.Date}} as RFC3339 — both match what buildinfo.Current() returns
+      # to users.
+      - -s -w
+      - -X github.com/Northlatch-Labs-LLC/hivex/internal/buildinfo.Version={{.Version}}
+      - -X github.com/Northlatch-Labs-LLC/hivex/internal/buildinfo.BuildTimestamp={{.Date}}
+
+archives:
+  - formats: [tar.gz]
+    # Windows users get .zip — tar.gz is unfamiliar there, and the npm
+    # wrapper relies on the extension to pick the right unpack path.
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    name_template: "hivebot_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  use: git
+  sort: asc
+  abbrev: -1
+  format: "{{ .Message }}"
+  groups:
+    - title: Breaking changes
+      regexp: '^.*?(feat|fix|perf|refactor|docs|chore|test|build|ci|style|revert)(\([^)]+\))?!:.+$'
+      order: 0
+    - title: New features
+      regexp: '^.*?feat(\([^)]+\))?(!)?:.+$'
+      order: 1
+    - title: Bug fixes
+      regexp: '^.*?fix(\([^)]+\))?(!)?:.+$'
+      order: 2
+    - title: Performance
+      regexp: '^.*?perf(\([^)]+\))?(!)?:.+$'
+      order: 3
+    - title: Refactoring
+      regexp: '^.*?refactor(\([^)]+\))?(!)?:.+$'
+      order: 4
+    - title: Documentation
+      regexp: '^.*?docs(\([^)]+\))?(!)?:.+$'
+      order: 5
+    - title: Build and CI
+      regexp: '^.*?(build|ci)(\([^)]+\))?(!)?:.+$'
+      order: 6
+    - title: Maintenance
+      regexp: '^.*?(chore|test|style)(\([^)]+\))?(!)?:.+$'
+      order: 7
+    - title: Reverts
+      regexp: '^.*?revert(\([^)]+\))?(!)?:.+$'
+      order: 8
+    - title: Other changes
+      order: 999
+  filters:
+    exclude:
+      - "^Merge pull request"
+      - "^Merge remote-tracking branch"
+
+release:
+  github:
+    # The repo lives under the company org. Release targets must name the
+    # real repo: the retired org path answers with a 307 redirect that the
+    # asset uploader does not follow on POST, so a redirected target builds
+    # every artifact and then fails to upload a single one.
+    owner: Northlatch-Labs-LLC
+    name: hivebot
+
+  # Re-running Release at an already-released tag must work.
+  #
+  # The npm publish step lives in the same job, AFTER goreleaser. So any tag
+  # where goreleaser succeeded and npm failed — which is every tag from
+  # v0.236.0 to v0.237.1 — can only be repaired by re-running the workflow at
+  # that tag. Without this, that re-run dies before it gets near npm:
+  # goreleaser re-uploads the assets it already attached and GitHub answers
+  # 422 already_exists, so "Publish to npm" is skipped and the tag stays
+  # unpublishable forever.
+  #
+  # replace_existing_artifacts makes the upload idempotent: same bytes, same
+  # names, overwritten rather than rejected.
+  replace_existing_artifacts: true

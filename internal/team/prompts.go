@@ -1,0 +1,289 @@
+package team
+
+// prompts.go owns per-bot prompt + claude-command construction
+// (PLAN.md §C13/§C22). buildPrompt delegates to promptBuilder;
+// newPromptBuilder is the snapshot-accessor closure assembly;
+// writeBotPromptFile + cleanupBotTempFiles handle the prompt-file
+// lifecycle; resolvePermissionFlags returns the claude permission
+// flags; claudeCommand assembles the long shell-command string the
+// launcher feeds to tmux split-window for an interactive claude pane.
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+
+	"github.com/Northlatch-Labs-LLC/hivex/internal/config"
+)
+
+// buildPrompt generates the system prompt for a bot. The body lives on
+// promptBuilder (see prompt_builder.go) so it can be tested without a
+// Launcher; this wrapper assembles the snapshot accessors from launcher
+// state and delegates.
+func (l *Launcher) buildPrompt(slug string) string {
+	return l.newPromptBuilder().Build(slug)
+}
+
+// newPromptBuilder captures the launcher state the prompt depends on into
+// a promptBuilder. Built fresh per call so each prompt sees the current
+// member roster and active policies; the construction itself is cheap
+// (closures + a couple of map lookups).
+func (l *Launcher) newPromptBuilder() *promptBuilder {
+	memoryBackend := config.ResolveMemoryBackend("")
+	return &promptBuilder{
+		isOneOnOne:  l.isOneOnOne,
+		isFocusMode: l.isFocusModeEnabled,
+		packName:    l.PackName,
+		leadSlug:    l.targeter().LeadSlug,
+		members:     l.officeMembersSnapshot,
+		policies: func() []officePolicy {
+			if l == nil || l.broker == nil {
+				return nil
+			}
+			// promptBuilder.Build sorts the returned slice for
+			// prompt-cache byte-stability, so this callback hands
+			// back the broker's order as-is. Sorting both here and
+			// inside Build is redundant.
+			return l.broker.ListPolicies()
+		},
+		skills: func() []SkillSummary {
+			if l == nil || l.broker == nil {
+				return nil
+			}
+			// Same pattern as policies above: builder re-sorts by
+			// slug for byte-stability, so this callback hands back
+			// the broker's order as-is.
+			return l.broker.ListActiveSkillSummaries()
+		},
+		activeIssues: func() []IssueSummary {
+			if l == nil || l.broker == nil {
+				return nil
+			}
+			return l.broker.ListActiveIssueSummariesForPrompt()
+		},
+		botInstruction: func(slug, name string) string {
+			if l == nil || l.broker == nil {
+				return ""
+			}
+			return l.broker.ReadBotInstruction(slug, name)
+		},
+		officeUser: func() string {
+			if l == nil || l.broker == nil {
+				return ""
+			}
+			return l.broker.ReadOfficeUserFile()
+		},
+		nameFor: l.targeter().NameFor,
+		learnings: func(slug string) []LearningSearchResult {
+			if l == nil || l.broker == nil || memoryBackend != config.MemoryBackendMarkdown {
+				return nil
+			}
+			l.broker.ensureTeamLearningLog()
+			log := l.broker.TeamLearningLog()
+			if log == nil {
+				return nil
+			}
+			results, err := log.Search(LearningSearchFilters{Limit: 8})
+			if err != nil {
+				return nil
+			}
+			return results
+		},
+		markdownMemory: memoryBackend == config.MemoryBackendMarkdown,
+	}
+}
+
+// writeBotPromptFile persists the per-bot system prompt to a stable
+// per-slug temp file so it can be passed to `claude --append-system-prompt-file`
+// without bloating the tmux command.
+//
+// File naming mirrors ensureBotMCPConfig (hivex-mcp-<slug>.json) so both
+// artifacts are easy to clean up together. Perms are 0o600 because the prompt
+// can contain team-internal instructions and tool lists.
+func (l *Launcher) writeBotPromptFile(slug, prompt string) (string, error) {
+	dir, err := l.launchTempDir()
+	if err != nil {
+		return "", err
+	}
+	path := filepath.Join(dir, "hivex-prompt-"+slug+".txt")
+	if err := os.WriteFile(path, []byte(prompt), 0o600); err != nil {
+		return "", err
+	}
+	return path, nil
+}
+
+// launchTempDir returns the per-launch temp directory, lazily
+// creating it via os.MkdirTemp on first call. Pre-fix every launcher
+// wrote to $TMPDIR/hivex-{prompt,mcp}-<slug>; two offices launching
+// the same slug clobbered each other's prompt during startup, and one
+// shutdown's cleanupBotTempFiles would delete the other session's
+// prompt out from under it. With a per-launch directory each office
+// gets its own scoped namespace and cleanupBotTempFiles can rm -rf
+// the whole directory atomically.
+func (l *Launcher) launchTempDir() (string, error) {
+	l.launchTempDirOnce.Do(func() {
+		dir, err := os.MkdirTemp("", "hivex-launch-*")
+		if err != nil {
+			l.launchTempDirErr = err
+			return
+		}
+		l.launchTempDirPath = dir
+	})
+	return l.launchTempDirPath, l.launchTempDirErr
+}
+
+// cleanupBotTempFiles removes the per-launch temp directory (which
+// holds every per-bot MCP config + system prompt). Safe to call
+// multiple times and idempotent. Called from Shutdown so the broker
+// token + prompt content do not linger in $TMPDIR after the session
+// ends. Pre-fix this iterated office members and tried to delete each
+// file by name from the global $TMPDIR — that worked but didn't
+// catch members removed mid-session and could collide with peer
+// launches; rm -rf on the launch-scoped dir solves both.
+func (l *Launcher) cleanupBotTempFiles() {
+	if l.launchTempDirPath != "" {
+		_ = os.RemoveAll(l.launchTempDirPath)
+	}
+}
+
+// turnPosture is the read/write posture of a single bot turn.
+type turnPosture int
+
+const (
+	// postureExecute lets the turn change the repo and take actions — full
+	// autonomy. This is every office/conversational turn and every turn for a
+	// Running/Approved task.
+	postureExecute turnPosture = iota
+	// posturePlan runs the turn read-only: the owner explores and produces a
+	// plan but must not change the repo or take external actions until a human
+	// approves the plan. Mapped onto each provider's native plan mode.
+	posturePlan
+)
+
+// resolveTurnPosture decides whether THIS turn runs read-only (plan) or
+// read-write (execute). A turn is plan-posture only when its task is in the
+// structured-planning phase (LifecycleStatePlanning); everything else stays
+// execute-posture. The task is resolved per-turn via turnTaskForCtx so that,
+// under parallel instances, a bot's planning turn and a concurrent
+// office/execution turn get independent postures. A background context falls
+// back to the bot's active task (correct for the single-task interactive
+// pane).
+func (l *Launcher) resolveTurnPosture(ctx context.Context, slug string) turnPosture {
+	if l == nil {
+		return postureExecute
+	}
+	if task := l.turnTaskForCtx(ctx, slug); task != nil && isPlanningLifecycleState(task.LifecycleState) {
+		return posturePlan
+	}
+	return postureExecute
+}
+
+// resolvePermissionFlags returns the Claude Code permission flags for a bot's
+// current turn. Execute-posture turns run in bypass mode — the team is
+// autonomous. Plan-posture turns (the task is in LifecycleStatePlanning) run in
+// Claude's NATIVE plan mode: read-only exploration where the model presents a
+// plan via ExitPlanMode and no mutating tool runs. --dangerously-skip-permissions
+// is deliberately omitted in plan posture — it would defeat the read-only gate.
+func (l *Launcher) resolvePermissionFlags(ctx context.Context, slug string) string {
+	if l.resolveTurnPosture(ctx, slug) == posturePlan {
+		return "--permission-mode plan"
+	}
+	return "--permission-mode bypassPermissions --dangerously-skip-permissions"
+}
+
+// claudeCommand returns the shell command that launches an interactive
+// `claude` session for the given bot. The command is passed as a single
+// argument to tmux split-window; if it grows past tmux's internal
+// command-parse buffer, tmux rejects it with "command too long" before the
+// shell ever runs. Keep the command bounded — put the bulky system prompt in
+// a file and pass --append-system-prompt-file <path> instead of inlining.
+//
+// Sets HIVEX_AGENT_SLUG so the MCP knows which bot this session serves.
+// Returns an error if the per-bot temp files (MCP config or prompt) cannot
+// be written; callers should fall back to the headless path so bots do not
+// silently launch with a missing system prompt.
+func (l *Launcher) claudeCommand(slug, systemPrompt string) (string, error) {
+	// Always fail closed when ensureBotMCPConfig errors. Pre-fix
+	// the function fell back to l.mcpConfig (the launcher-wide
+	// config containing every MCP server) when the per-bot
+	// filtered write failed — turning a transient os.WriteFile
+	// failure into silent privilege expansion: a bot restricted
+	// to a small allowlist via botMCPServers(slug) would launch
+	// with full access to every server in the office. Caller must
+	// now handle the error (typically by falling back to the
+	// headless path that doesn't share this code path).
+	botMCP, err := l.ensureBotMCPConfig(slug)
+	if err != nil {
+		return "", fmt.Errorf("claudeCommand(%s): write bot MCP config: %w", slug, err)
+	}
+	// Every interpolated value below flows through shellQuote so the
+	// resulting tmux command is injection-safe regardless of source.
+	// Pre-fix the slug, brokerToken, BrokerBaseURL(), model, and OTEL
+	// header/resource strings were interpolated raw — most can't carry
+	// shell metacharacters today (slug is alphanumeric per blueprint
+	// validation, BrokerBaseURL is a Go-formatted URL), but a hostile
+	// blueprint or a future BrokerBaseURL bug could land a single
+	// quote or $() inside the command and execute arbitrary shell as
+	// the user. Single-quoting via shellQuote closes that surface
+	// uniformly; the cost is one shellQuote() call per field.
+
+	promptPath, err := l.writeBotPromptFile(slug, systemPrompt)
+	if err != nil {
+		return "", fmt.Errorf("claudeCommand(%s): write prompt file: %w", slug, err)
+	}
+
+	name := l.targeter().NameFor(slug)
+	// The interactive pane runs one task at a time and has no per-turn ctx, so a
+	// background context resolves posture from the bot's active task (a
+	// Planning task → native plan mode; anything else → bypass).
+	permFlags := l.resolvePermissionFlags(context.Background(), slug)
+
+	brokerToken := ""
+	if l.broker != nil {
+		brokerToken = l.broker.Token()
+	}
+
+	oneOnOneEnv := ""
+	if l.isOneOnOne() {
+		oneOnOneEnv = "HIVEX_ONE_ON_ONE=1 HIVEX_ONE_ON_ONE_AGENT=" + shellQuote(l.oneOnOneBot()) + " "
+	}
+	oneSecretEnv := ""
+	if secret := strings.TrimSpace(config.ResolveOneSecret()); secret != "" {
+		oneSecretEnv = "ONE_SECRET=" + shellQuote(secret) + " "
+	}
+	oneIdentityEnv := ""
+	if identity := strings.TrimSpace(config.ResolveOneIdentity()); identity != "" {
+		oneIdentityEnv = "ONE_IDENTITY=" + shellQuote(identity) + " "
+		if identityType := strings.TrimSpace(config.ResolveOneIdentityType()); identityType != "" {
+			oneIdentityEnv += "ONE_IDENTITY_TYPE=" + shellQuote(identityType) + " "
+		}
+	}
+
+	// The interactive pane builder has no per-turn context; a background
+	// context makes headlessClaudeModel fall back to the bot's active task,
+	// which is correct here because tmux panes run one task at a time.
+	model := l.headlessClaudeModel(context.Background(), slug)
+	brokerBaseURL := l.BrokerBaseURL()
+	otelLogsEndpoint := brokerBaseURL + "/v1/logs"
+	otelHeaders := "Authorization=Bearer " + brokerToken
+	otelResource := "agent.slug=" + slug + ",hivex.channel=office"
+	return fmt.Sprintf(
+		"%s%s%sHIVEX_AGENT_SLUG=%s HIVEX_BROKER_TOKEN=%s HIVEX_BROKER_BASE_URL=%s ANTHROPIC_PROMPT_CACHING=1 CLAUDE_CODE_ENABLE_TELEMETRY=1 OTEL_METRICS_EXPORTER=none OTEL_LOGS_EXPORTER=otlp OTEL_EXPORTER_OTLP_LOGS_PROTOCOL=http/json OTEL_EXPORTER_OTLP_LOGS_ENDPOINT=%s OTEL_EXPORTER_OTLP_HEADERS=%s OTEL_RESOURCE_ATTRIBUTES=%s claude --model %s %s --append-system-prompt-file %s --mcp-config %s --strict-mcp-config -n %s",
+		oneOnOneEnv,
+		oneSecretEnv,
+		oneIdentityEnv,
+		shellQuote(slug),
+		shellQuote(brokerToken),
+		shellQuote(brokerBaseURL),
+		shellQuote(otelLogsEndpoint),
+		shellQuote(otelHeaders),
+		shellQuote(otelResource),
+		shellQuote(model),
+		permFlags,
+		shellQuote(promptPath),
+		shellQuote(botMCP),
+		shellQuote(name),
+	), nil
+}

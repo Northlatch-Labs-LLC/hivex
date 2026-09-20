@@ -1,0 +1,240 @@
+package team
+
+// launcher_web.go owns the web-mode entry points (PLAN.md §C8): the
+// preflight check, the LaunchWeb path that boots the broker + web UI
+// without tmux, and the small
+// browser-launch helpers used only by web mode. Splitting these off
+// keeps launcher.go focused on the tmux-mode orchestrator while letting
+// web-only imports (`net`, `golang.org/x/term`, `internal/runtimebin`
+// for the opencode lookup) sit in
+// one file. No new types or behaviour changes — pure file split.
+
+import (
+	"context"
+	"fmt"
+	"net"
+	"os"
+	"os/exec"
+	"runtime"
+	"time"
+
+	"golang.org/x/term"
+
+	"github.com/Northlatch-Labs-LLC/hivex/internal/runtimebin"
+)
+
+// PreflightWeb checks only for claude (no tmux requirement for web mode).
+//
+// When the user has not yet completed onboarding we deliberately skip the
+// runtime-binary check: the whole point of the web-mode onboarding wizard is
+// to pick a runtime. Hard-failing here would make the binary unlaunchable
+// until the user already had the CLI they were trying to pick. A missing
+// runtime is still caught at first-dispatch time with a clear message once
+// onboarding has committed a choice to ~/.hivex/config.json.
+func (l *Launcher) PreflightWeb() error {
+	if !isOnboarded() {
+		if _, _, note := checkGHCapability(); note != "" {
+			fmt.Fprintf(os.Stderr, "note: %s\n", note)
+		}
+		return nil
+	}
+	if l.usesCodexRuntime() {
+		if l.usesOpencodeRuntime() {
+			if _, err := runtimebin.LookPath("opencode"); err != nil {
+				return fmt.Errorf("opencode not found. Install Opencode CLI (https://opencode.ai) and configure your provider credentials")
+			}
+			return nil
+		}
+		if _, err := exec.LookPath("codex"); err != nil {
+			return fmt.Errorf("codex not found. Install Codex CLI and run `codex login`")
+		}
+		return nil
+	}
+	if _, err := exec.LookPath("claude"); err != nil {
+		return fmt.Errorf("claude not found in PATH. Install Claude Code CLI first")
+	}
+	if _, _, note := checkGHCapability(); note != "" {
+		fmt.Fprintf(os.Stderr, "note: %s\n", note)
+	}
+	return nil
+}
+
+// LaunchWeb starts the broker, web UI server, and background bots without tmux.
+func (l *Launcher) LaunchWeb(webPort int) error {
+	mcpConfig, err := l.ensureMCPConfig()
+	if err != nil {
+		return fmt.Errorf("prepare mcp config: %w", err)
+	}
+	l.mcpConfig = mcpConfig
+	l.webMode = true
+
+	killStaleBroker()
+
+	l.installBroker(NewBroker())
+	l.broker.runtimeProvider = l.provider
+	l.broker.packSlug = l.packSlug
+	l.broker.blankSlateLaunch = l.blankSlateLaunch
+	if err := l.broker.SetSessionMode(l.sessionMode, l.oneOnOne); err != nil {
+		return fmt.Errorf("set session mode: %w", err)
+	}
+	if err := l.broker.SetFocusMode(l.focusMode); err != nil {
+		return fmt.Errorf("set focus mode: %w", err)
+	}
+	if err := l.broker.Start(); err != nil {
+		return fmt.Errorf("start broker: %w", err)
+	}
+
+	stopTransports, err := RegisterTransports(l.broker)
+	if err != nil {
+		// Non-fatal: a misconfigured optional adapter should not prevent the
+		// web UI from starting.
+		fmt.Fprintf(os.Stderr, "warning: transport registration: %v\n", err)
+	}
+
+	if err := writeOfficePIDFile(); err != nil {
+		// Stop adapters before the broker so they can flush in-flight sends.
+		stopTransports()
+		l.broker.Stop()
+		_ = clearOfficePIDFile()
+		_ = clearOfficeInfo()
+		return fmt.Errorf("write office pid: %w", err)
+	}
+
+	l.broker.SetGenerateMemberFn(l.GenerateMemberTemplateFromPrompt)
+	l.broker.SetGenerateChannelFn(l.GenerateChannelTemplateFromPromptCtx)
+	l.broker.SetGenerateBotFileFn(l.GenerateBotFileFromContext)
+	if err := l.broker.ServeWebUI(webPort); err != nil {
+		// The broker is already running and the office PID file is on
+		// disk (above). On a port-bind failure we exit, so tear both
+		// down — leaving the broker accepting requests on a "hivex has
+		// failed to start" path is worse than a clean exit, and a stale
+		// PID file would block the next launch attempt's writeOfficePID.
+		stopTransports()
+		l.broker.Stop()
+		_ = clearOfficePIDFile()
+		_ = clearOfficeInfo()
+		return fmt.Errorf("web UI failed to start: %w\n\nIs port %d already in use? Try: hivex --web-port %d", err, webPort, webPort+1)
+	}
+
+	// Record the running broker's URLs the moment the listener is accepting, so
+	// a concurrent front-end (desktop shell, CLI, browser) can ATTACH to this
+	// office instead of booting a second broker on the same workspace. Writing
+	// it here — before the slower resume/goroutine setup below — shrinks the
+	// window where the listener is up but the attach signal isn't yet visible.
+	// 127.0.0.1 (not localhost) matches ServeWebUI's bind. Best-effort: a write
+	// failure must not stop the office from serving (RunningOfficeURL then falls
+	// back to "no peer").
+	webAddr := fmt.Sprintf("127.0.0.1:%d", webPort)
+	webURL := fmt.Sprintf("http://%s", webAddr)
+	if err := writeOfficeInfo(webURL, l.BrokerBaseURL()); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: write office info: %v\n", err)
+	}
+
+	// Default path: headless `claude --print` per turn. Anthropic re-sanctioned
+	// this invocation (OpenClaw policy note, 2026-04), so it runs on the user's
+	// normal subscription quota — no separate extra-usage quota is charged on
+	// top. The interactive pane-per-bot mode remains reachable via
+	// TrySpawnWebBotPanes as an internal fallback primitive, but is not
+	// invoked at startup.
+	//
+	// Headless context is used for codex runtime, default dispatch, and
+	// per-turn operations that don't fit a long-lived pane session.
+	l.headless.ctx, l.headless.cancel = context.WithCancel(context.Background())
+	l.resolveHeadlessConcurrencyCaps()
+	l.resumeInFlightWork()
+
+	// Stream tmux pane output to the web UI's per-bot stream so users see
+	// live Claude TUI activity (thinking, tool calls, responses) during a
+	// pane-backed turn. No-op when paneBackedBots is false.
+	l.startPaneCaptureLoops(l.headless.ctx)
+
+	go l.notifyBotsLoop()
+	go l.notifyTaskActionsLoop()
+	go l.notifyOfficeChangesLoop()
+	go l.watchdogSchedulerLoop()
+	if l.paneBackedBots {
+		go l.primeVisibleBots()
+	}
+
+	// webAddr/webURL were computed above (right after ServeWebUI) so office.json
+	// is written as early as possible. 127.0.0.1 (not localhost) matches
+	// ServeWebUI's bind and the readiness probe below — localhost can resolve to
+	// ::1 first on IPv6-preferring setups, reproducing ERR_CONNECTION_REFUSED.
+	if l.broker != nil {
+		// Surfaces that link back to the web app (e.g. the Slack App Home
+		// tab) read this; before LaunchWeb runs they render without links.
+		l.broker.SetWebURL(webURL)
+	}
+	fmt.Printf("\n  Web UI:  %s\n", webURL)
+	fmt.Printf("  Broker:  %s\n", l.BrokerBaseURL())
+	fmt.Printf("  Press Ctrl+C to stop.\n\n")
+
+	if !l.noOpen {
+		// Wait for the web server to actually accept connections before
+		// triggering the browser. Otherwise users on cold starts (and PH
+		// visitors clicking through `npx hivex` for the first time) hit
+		// ERR_CONNECTION_REFUSED before the listener is ready. 5s is a
+		// generous ceiling: in practice the listener is up in milliseconds.
+		// Skip the open if the listener never came up — opening a dead URL
+		// just produces a confusing error page in the user's first second.
+		if waitForWebReady(webAddr, 5*time.Second) {
+			openBrowser(webURL)
+		} else {
+			fmt.Printf("  Web UI did not become reachable at %s within 5s; skipping browser auto-open.\n", webURL)
+		}
+	}
+
+	// Broker, web UI, and background goroutines own the process lifetime;
+	// Ctrl+C (default SIGINT) is the only exit path.
+	select {}
+}
+
+// waitForWebReady polls addr until a TCP dial succeeds or the timeout
+// elapses. It exists because ServeWebUI returns immediately and the
+// listener can take a few hundred ms to come up — opening the browser
+// before then produces ERR_CONNECTION_REFUSED in the user's first
+// second of the product. Returns true when the listener accepted a
+// connection within the timeout, false otherwise. LaunchWeb gates
+// openBrowser on this return value, so a never-up listener results in
+// a printed "skipping browser auto-open" line rather than a dead URL.
+func waitForWebReady(addr string, timeout time.Duration) bool {
+	dialer := &net.Dialer{Timeout: 250 * time.Millisecond}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	for {
+		conn, err := dialer.DialContext(ctx, "tcp", addr)
+		if err == nil {
+			_ = conn.Close()
+			return true
+		}
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+}
+
+// stdinIsTTY reports whether os.Stdin is connected to a real terminal.
+// Uses golang.org/x/term so /dev/null (a char device but not a TTY) is
+// classified correctly — the original os.ModeCharDevice check let
+// `npx ... </dev/null` fall back to the auto-yes install path, which
+// is the cold-start bug this whole helper exists to prevent.
+func stdinIsTTY() bool {
+	return term.IsTerminal(int(os.Stdin.Fd()))
+}
+
+func openBrowser(url string) {
+	var cmd *exec.Cmd
+	switch runtime.GOOS {
+	case "darwin":
+		cmd = exec.CommandContext(context.Background(), "open", url)
+	case "linux":
+		cmd = exec.CommandContext(context.Background(), "xdg-open", url)
+	case "windows":
+		cmd = exec.CommandContext(context.Background(), "cmd", "/c", "start", "", url)
+	default:
+		return
+	}
+	_ = cmd.Start()
+}

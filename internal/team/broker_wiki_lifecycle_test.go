@@ -1,0 +1,112 @@
+package team
+
+import (
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"testing"
+)
+
+// TestEnsureWikiWorkerRetriesAfterInitFailure verifies that a transient
+// repo.Init failure (parent path is a regular file rather than a dir) no
+// longer permanently consumes the init slot. After the obstruction is
+// removed, the next ensureWikiWorker call must successfully bring the
+// worker up — this is the regression that left /notebook/* and /review/*
+// stuck on 503 until the operator restarted the broker.
+func TestEnsureWikiWorkerRetriesAfterInitFailure(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HIVEX_RUNTIME_HOME", home)
+	t.Setenv("HIVEX_MEMORY_BACKEND", "markdown")
+
+	// Block init by planting a regular file where ~/.hivex must be a dir.
+	// MkdirAll(<home>/.hivex/wiki) returns ENOTDIR because .hivex is a file.
+	blocker := filepath.Join(home, ".hivex")
+	if err := os.WriteFile(blocker, []byte("not a dir"), 0o600); err != nil {
+		t.Fatalf("plant blocker: %v", err)
+	}
+
+	b := newTestBroker(t)
+	// Registered after t.TempDir, so it runs first: the successful retry
+	// below kicks off the async skill backfill, and the temp dir must not
+	// be removed underneath it.
+	t.Cleanup(b.Stop)
+
+	b.ensureWikiWorker()
+	if b.WikiWorker() != nil {
+		t.Fatalf("wiki worker should be nil after init failure, got %p", b.WikiWorker())
+	}
+	if err := b.WikiInitErr(); err == nil {
+		t.Fatalf("WikiInitErr should be set after init failure")
+	}
+
+	// Clear the obstruction and retry. Pre-fix this would stay nil because
+	// sync.Once was already consumed.
+	if err := os.Remove(blocker); err != nil {
+		t.Fatalf("remove blocker: %v", err)
+	}
+
+	b.ensureWikiWorker()
+	// The retry starts a REAL wiki worker rooted in this test's TempDir, and
+	// it keeps writing in the background after the test body returns —
+	// notably the system-skill backfill (app-building, wiki-maintenance).
+	// Without this, those writes race t.TempDir's RemoveAll and it fails with
+	// "directory not empty". Registered here rather than at the top because
+	// there is no worker to stop until this call succeeds; t.TempDir's own
+	// cleanup was queued first, so it still runs last.
+	t.Cleanup(func() {
+		if w := b.WikiWorker(); w != nil {
+			w.Stop()
+		}
+	})
+	if b.WikiWorker() == nil {
+		t.Fatalf("wiki worker should be set after retry; init err: %v", b.WikiInitErr())
+	}
+	if err := b.WikiInitErr(); err != nil {
+		t.Fatalf("WikiInitErr should be cleared on success, got %v", err)
+	}
+
+	// Idempotent on subsequent calls — must not double-init or panic.
+	prev := b.WikiWorker()
+	b.ensureWikiWorker()
+	if b.WikiWorker() != prev {
+		t.Fatalf("ensureWikiWorker should be idempotent; got new worker pointer")
+	}
+}
+
+// TestHealthMemoryBackendReadyReflectsWikiWorker locks in the /health
+// fix: when memory_backend_active=markdown but wiki worker init failed,
+// memory_backend_ready must be false. The pre-fix value of true masked
+// the failure from operators and the web UI status bar.
+func TestHealthMemoryBackendReadyReflectsWikiWorker(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HIVEX_RUNTIME_HOME", home)
+	t.Setenv("HIVEX_MEMORY_BACKEND", "markdown")
+
+	blocker := filepath.Join(home, ".hivex")
+	if err := os.WriteFile(blocker, []byte("not a dir"), 0o600); err != nil {
+		t.Fatalf("plant blocker: %v", err)
+	}
+
+	b := newTestBroker(t)
+	b.ensureWikiWorker() // fails — wikiWorker stays nil
+
+	srv := httptest.NewServer(http.HandlerFunc(b.handleHealth))
+	defer srv.Close()
+	resp, err := http.Get(srv.URL)
+	if err != nil {
+		t.Fatalf("get health: %v", err)
+	}
+	defer resp.Body.Close()
+	var got HealthResponse
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode health: %v", err)
+	}
+	if got.MemoryBackendActive != "markdown" {
+		t.Fatalf("expected memory_backend_active=markdown, got %q", got.MemoryBackendActive)
+	}
+	if got.MemoryBackendReady {
+		t.Fatalf("expected memory_backend_ready=false when wiki worker is nil; got true")
+	}
+}

@@ -1,0 +1,46 @@
+# hivex code owners
+#
+# This file is currently advisory: branch protection on `main` does NOT
+# have `require_code_owner_reviews` enabled, so GitHub will auto-suggest
+# reviewers from this list but a PR can still merge without their
+# approval. The intent is that the file moves with the codebase as
+# ownership shifts; flipping branch protection to enforce is a one-line
+# admin action when the team is ready.
+#
+# Order matters in CODEOWNERS: the LAST matching pattern wins. So the
+# global default sits first, then more specific overrides.
+
+# Global default: every change pings the maintainer.
+*   @FranDias
+
+# Go service code & tests
+/cmd/                       @FranDias @hive-crm/backend
+/internal/                  @FranDias @hive-crm/backend
+/tests/                     @FranDias @hive-crm/backend
+go.mod                      @FranDias @hive-crm/backend
+go.sum                      @FranDias @hive-crm/backend
+
+# Web UI (vite + React + biome)
+/web/                       @FranDias @hive-crm/web
+
+# Build, release, and supply-chain hygiene — owners across both teams,
+# since a regression here breaks every consumer of every artifact.
+/.github/                   @FranDias @hive-crm/backend @hive-crm/web
+/scripts/                   @FranDias @hive-crm/backend
+/lefthook.yml               @FranDias @hive-crm/backend @hive-crm/web
+/.golangci.yml              @FranDias @hive-crm/backend
+/.goreleaser.yml            @FranDias @hive-crm/backend
+/.commitlintrc.json         @FranDias @hive-crm/backend @hive-crm/web
+/.secretlintrc.json         @FranDias @hive-crm/backend @hive-crm/web
+
+# Public-facing surfaces
+README.md                   @FranDias
+CHANGELOG.md                @FranDias
+DESIGN.md                   @FranDias
+DESIGN-WIKI.md              @FranDias
+DESIGN-NOTEBOOK.md          @FranDias
+DEVELOPMENT.md              @FranDias
+ARCHITECTURE.md             @FranDias
+
+# CODEOWNERS itself: only the maintainer can repoint ownership.
+/.github/CODEOWNERS         @FranDias

@@ -1,0 +1,107 @@
+import { fireEvent, render, screen } from "@testing-library/react";
+import { describe, expect, it, vi } from "vitest";
+
+const { mockUseBotStream } = vi.hoisted(() => ({
+  mockUseBotStream: vi.fn(),
+}));
+
+vi.mock("../../hooks/useBotStream", () => ({
+  useBotStream: mockUseBotStream,
+}));
+
+import { TaskActivity } from "./TaskActivity";
+
+function line(id: number, event: Record<string, unknown>) {
+  return { id, data: "", parsed: { kind: "headless_event", ...event } };
+}
+
+describe("TaskActivity", () => {
+  it("renders the owner bot's tool activity as resolving rows", () => {
+    mockUseBotStream.mockReturnValue({
+      connected: true,
+      lines: [
+        line(1, {
+          type: "tool_use",
+          tool_name: "Write",
+          detail: '{"file_path":"src/App.tsx"}',
+          turn_id: "t1",
+        }),
+        line(2, {
+          type: "tool_result",
+          tool_name: "Write",
+          text: '{"message":"ok"}',
+          turn_id: "t1",
+        }),
+        line(3, {
+          type: "tool_use",
+          tool_name: "Bash",
+          detail: '{"command":"bun run build"}',
+          turn_id: "t1",
+        }),
+      ],
+    });
+
+    render(<TaskActivity taskId="OFFICE-1" agentSlug="app-builder" />);
+
+    expect(screen.getByText("Writing")).toBeInTheDocument();
+    expect(screen.getByText("App.tsx")).toBeInTheDocument();
+    expect(screen.getByText("✓")).toBeInTheDocument();
+    // Raw shell commands never render — bash rows classify to a verb.
+    expect(screen.getByText("Building")).toBeInTheDocument();
+    expect(screen.queryByText("bun run build")).not.toBeInTheDocument();
+    expect(screen.getByText("2")).toBeInTheDocument();
+    // It is labelled "Task activity" (generalized from "Build activity").
+    expect(
+      screen.getByRole("region", { name: /task activity/i }),
+    ).toBeInTheDocument();
+  });
+
+  it("passes the owner slug to the stream", () => {
+    mockUseBotStream.mockReturnValue({ connected: false, lines: [] });
+    render(<TaskActivity taskId="OFFICE-2" agentSlug="revops" />);
+    expect(mockUseBotStream).toHaveBeenCalledWith("revops", "OFFICE-2", {
+      keepAlive: true,
+      maxLines: 5000,
+    });
+  });
+
+  it("renders nothing when there is no activity", () => {
+    mockUseBotStream.mockReturnValue({ connected: false, lines: [] });
+    const { container } = render(
+      <TaskActivity taskId="OFFICE-2" agentSlug="app-builder" />,
+    );
+    expect(container).toBeEmptyDOMElement();
+  });
+
+  it("renders nothing for an unstaffed task (no owner)", () => {
+    mockUseBotStream.mockReturnValue({ connected: false, lines: [] });
+    const { container } = render(
+      <TaskActivity taskId="OFFICE-4" agentSlug={null} />,
+    );
+    expect(container).toBeEmptyDOMElement();
+    // A null owner streams nothing.
+    expect(mockUseBotStream).toHaveBeenCalledWith(null, "OFFICE-4", {
+      keepAlive: true,
+      maxLines: 5000,
+    });
+  });
+
+  it("collapses the list when the header is toggled", () => {
+    mockUseBotStream.mockReturnValue({
+      connected: true,
+      lines: [
+        line(1, {
+          type: "tool_use",
+          tool_name: "Read",
+          detail: '{"file_path":"AI_RULES.md"}',
+          turn_id: "t1",
+        }),
+      ],
+    });
+
+    render(<TaskActivity taskId="OFFICE-3" agentSlug="app-builder" />);
+    expect(screen.getByText("Reading")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /task activity/i }));
+    expect(screen.queryByText("Reading")).not.toBeInTheDocument();
+  });
+});

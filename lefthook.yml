@@ -1,0 +1,240 @@
+commit-msg:
+  commands:
+    commitlint:
+      run: bunx --bun commitlint --edit {1}
+
+pre-commit:
+  parallel: true
+  commands:
+    secretlint:
+      run: bunx --bun secretlint {staged_files}
+      exclude:
+        - "node_modules/**"
+        - "web/dist/**"
+        - "web/node_modules/**"
+        - "bun.lock"
+        - "web/bun.lock"
+
+    biome:
+      # biome runs against staged web/** files only — it's scoped to web/
+      # because that's where biome.json lives. `root: web` chdirs lefthook
+      # into web/ so {staged_files} arrives as paths relative to web/;
+      # stage_fixed=true re-stages formatter + safe-autofix changes so the
+      # commit includes them.
+      root: web
+      glob: "**/*.{js,ts,jsx,tsx,json,css}"
+      run: bunx --bun biome check --write --max-diagnostics=500 {staged_files}
+      stage_fixed: true
+      exclude:
+        - "dist/**"
+        - "node_modules/**"
+        - "bun.lock"
+        - "web/bun.lock"
+        - "**/*.gen.ts"
+        - "**/*.gen.tsx"
+
+    biome-protocol:
+      # @hivex/protocol package has its own biome config (different from web/'s
+      # because it's a Node-only library, no JSX/CSS). Run biome from the
+      # package root against staged packages/protocol/** files.
+      root: packages/protocol
+      glob: "packages/protocol/**/*.{js,ts,json}"
+      run: bunx --bun biome check --write --max-diagnostics=500 {staged_files}
+      stage_fixed: true
+      exclude:
+        - "dist/**"
+        - "node_modules/**"
+        - "coverage/**"
+
+    gofmt:
+      glob: "*.go"
+      run: |
+        unformatted=$(gofmt -l {staged_files})
+        if [ -n "$unformatted" ]; then
+          echo "gofmt needs to be run on:"
+          echo "$unformatted"
+          echo "Run: gofmt -w <file>"
+          exit 1
+        fi
+
+    go-vet:
+      glob: "*.go"
+      exclude:
+        - "packages/protocol/testdata/*.go"
+        - "packages/protocol/testdata/**/*.go"
+      run: go vet ./...
+
+    golangci-lint:
+      glob: "*.go"
+      exclude:
+        - "packages/protocol/testdata/*.go"
+        - "packages/protocol/testdata/**/*.go"
+      run: golangci-lint run ./...
+
+    no-secrets:
+      # The leading (^|[^a-zA-Z0-9]) anchors the keyword to a non-
+      # alphanumeric boundary. Crucially, that INCLUDES `_` as a
+      # boundary char so env-var-shaped identifiers like
+      # OPENAI_API_KEY=, STRIPE_SECRET=, or MY_PASSWORD= still match
+      # — those are the dominant real-world leak shape. Bare-Go word
+      # boundary (\b) would treat _ as a word char and disable
+      # detection of this category, which an earlier version of this
+      # hook accidentally did.
+      #
+      # The boundary alone does NOT suppress the
+      # `oneSecretEnv = "ONE_SECRET=" + shellQuote(secret) + " "`
+      # false positive: `_SECRET=` matches because the underscore
+      # IS a non-alphanumeric. The grep -v allowlist below (with
+      # `shellQuote` as a same-line marker) is what drops it; if
+      # the line ever splits across two physical lines, the
+      # allowlist-by-line approach stops working and the hook will
+      # need to grow per-token suppression.
+      run: >
+        git diff --cached --diff-filter=ACM -U0
+        | grep -iE '(^|[^a-zA-Z0-9])(api_token|password|api_key|secret)\s*=\s*[''"][^''"]+[''"]'
+        | grep -v '.example\|.fake\|fake_\|placeholder\|your_\|os.Getenv\|environ.get\|shellQuote\|ResolveOneSecret\|ResolveOneIdentity'
+        && echo 'Possible secret in staged changes' && exit 1
+        || true
+
+    check-merge-conflicts:
+      glob: "*.{go,yml,yaml,md,toml,json}"
+      run: grep -lE '^(<{7}|>{7}|={7})' {staged_files} && echo "Merge conflict markers found" && exit 1 || true
+
+    no-large-files:
+      run: |
+        fail=0
+        for f in {staged_files}; do
+          [ -f "$f" ] || continue
+          size=$(wc -c < "$f" 2>/dev/null | tr -d ' ')
+          if [ "${size:-0}" -gt 5242880 ]; then
+            echo "ERROR: $f exceeds 5MB ($(( size / 1048576 ))MB)"
+            fail=1
+          fi
+        done
+        [ "$fail" -eq 0 ]
+
+pre-push:
+  # Serial, not parallel: running Go tests, web tests, build/vet, and
+  # `vhs` concurrently contends for disk/CPU on workstations, and
+  # internal/team's wiki worker queue saturates under that load
+  # ("playbook: compile write timed out after 10s", "wiki: queue saturated,
+  # retry on next turn"). Same tests pass reliably when run sequentially.
+  # Until the wiki worker is bounded-queue-tolerant, keep pre-push serial.
+  parallel: false
+  commands:
+    go-unit:
+      # Local mirror of CI's Go race split, with each package isolated in
+      # its own `go test` process. Scoped to pushes that actually touch Go
+      # files — TS-only branches (e.g. `packages/protocol`) skip the ~5min
+      # Go suite. CI still runs the full Go matrix on every PR, so any
+      # cross-language interface drift surfaces there in <5min.
+      #
+      # Excludes packages/protocol/testdata Go files: those are
+      # `//go:build ignore` reference programs, NOT part of the hivex
+      # binary build. Letting them trigger the full Go suite would
+      # double-bill protocol-only PRs (the protocol-wire-contract hook
+      # below already exercises the verifier directly via `go run`).
+      # Both patterns are needed: `*.go` matches files directly in
+      # testdata/ (e.g. verifier-reference.go) — `**/*.go` alone does
+      # not — and `**/*.go` covers any future nested testdata package.
+      files: bash scripts/changed-files-since-base.sh
+      glob: "*.go"
+      exclude:
+        - "packages/protocol/testdata/*.go"
+        - "packages/protocol/testdata/**/*.go"
+      run: bash scripts/test-go.sh
+    web-unit:
+      # Scoped to pushes that touch web/ or related JS/TS files. Same
+      # rationale as go-unit: keep TS-only-protocol branches off the
+      # 80-second web suite.
+      files: bash scripts/changed-files-since-base.sh
+      glob: "web/**/*.{ts,tsx,js,jsx,css,json,html}"
+      run: |
+        cd web
+        bun run typecheck
+        bun run test
+    css-phantom-tokens:
+      # `var(--x, #fff)` where --x is defined nowhere is a hardcoded value
+      # wearing a token costume: the literal always wins, so the rule looks
+      # right in whichever theme the literal suits and wrong in the other
+      # two. Bare `var(--x)` is worse — the declaration is dropped entirely.
+      # Covers component inline styles too, not just stylesheets. Pure text
+      # scan (<1s), scoped to stylesheet and component changes because a
+      # component can both use and runtime-define a token.
+      files: bash scripts/changed-files-since-base.sh
+      glob: "web/{public/themes/**/*.css,src/**/*.{css,ts,tsx}}"
+      run: bash scripts/check-css-phantom-tokens.sh
+    smoke:
+      # internal/team's former test-isolation bugs (shared ~/.hivex/wiki,
+      # worktrees registered against the invoking repo, cross-test state
+      # leakage via broker-state.json) are now guarded at the package
+      # level: worktree_guard_test.go flips allowRealTaskWorktree and
+      # unscopedWikiRootAllowed off for tests, installs safe stub
+      # prepare/cleanup worktree funcs, and skips the NewBroker auto-load
+      # so every test starts from a clean slate. Persistence tests opt
+      # back in via reloadedBroker(t). The dedicated `go-unit` hook above
+      # runs the test suite; this smoke remains a fast build/vet guard.
+      files: bash scripts/changed-files-since-base.sh
+      glob: "*.go"
+      exclude:
+        - "packages/protocol/testdata/*.go"
+      run: go build ./... && go vet ./...
+    build:
+      files: bash scripts/changed-files-since-base.sh
+      glob: "*.go"
+      exclude:
+        - "packages/protocol/testdata/*.go"
+      run: go build -o /dev/null ./cmd/hivex
+    vhs:
+      # vhs records `hivex --help` and `--version`; only fires when the Go
+      # binary or its tapes change.
+      files: bash scripts/changed-files-since-base.sh
+      glob: "{cmd/hivex/**,internal/**,testdata/vhs/**,*.go}"
+      exclude:
+        - "packages/protocol/testdata/*.go"
+      run: |
+        if ! command -v vhs >/dev/null 2>&1; then
+          echo "vhs not installed — skipping visual regression check (install: brew install vhs)"
+          exit 0
+        fi
+        testdata/vhs/check.sh
+    protocol-demo:
+      # Composes the @hivex/protocol public surface end-to-end: imports
+      # from index.ts, exercises 11 adversarial scenarios. Vitest covers
+      # per-module invariants; this catches drift in how the modules
+      # COMPOSE (missing exports, accidental API breaks at index.ts).
+      # Cheap (<1s) so it runs on every protocol change.
+      files: bash scripts/changed-files-since-base.sh
+      glob: "packages/protocol/**/*.{ts,json}"
+      run: bun run packages/protocol/scripts/demo.ts
+    protocol-wire-contract:
+      # Independent Go reference verifier of the audit-chain wire bytes.
+      # Catches a class of bug Vitest cannot: TS writer + external reader
+      # drift where someone updates BOTH the serializer AND the in-package
+      # golden vector (Vitest stays green, this fails). Scoped to the files
+      # that affect the wire contract — ~2s on warm Go cache.
+      files: bash scripts/changed-files-since-base.sh
+      glob: "packages/protocol/{src/audit-event.ts,src/canonical-json.ts,src/event-lsn.ts,src/sha256.ts,testdata/**}"
+      run: cd packages/protocol/testdata && go run verifier-reference.go
+    protocol-invariants:
+      # Custom invariant checks for protocol-grade rules Biome cannot
+      # express: instanceof allowlist, single hashing entry point,
+      # no process.env in src/, demo imports from index only, every value
+      # export from index.ts referenced in tests/ or demo. See
+      # `packages/protocol/scripts/check-invariants.sh` for the full list
+      # and the per-allowlist rationales.
+      files: bash scripts/changed-files-since-base.sh
+      glob: "packages/protocol/{src/**,tests/**,scripts/**}"
+      run: bash packages/protocol/scripts/check-invariants.sh
+    file-size:
+      # Enforce CONTRIBUTING.md's file-size budget: warn at 800 LOC, fail
+      # at 1500 LOC unless the file is on scripts/file-size-allowlist.txt
+      # (forward-only). See docs/CODE-QUALITY.md for the decomposition
+      # patterns. Cheap to run (git ls-files + wc -l), so it lives in
+      # pre-push alongside the other smoke checks.
+      run: bash scripts/check-file-size.sh
+    complexity-baseline:
+      # Keep Biome complexity suppressions forward-only. This lets the
+      # migration baseline land while forcing future broad complexity ignores
+      # to show up as explicit debt diffs.
+      run: bash scripts/check-complexity-baseline.sh

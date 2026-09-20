@@ -1,0 +1,399 @@
+package action
+
+import (
+	"context"
+	"encoding/json"
+	"strings"
+)
+
+type Capability string
+
+const (
+	CapabilityGuide           Capability = "guide"
+	CapabilityConnections     Capability = "connections"
+	CapabilityActionSearch    Capability = "action_search"
+	CapabilityActionKnowledge Capability = "action_knowledge"
+	CapabilityActionExecute   Capability = "action_execute"
+	CapabilityWorkflowCreate  Capability = "workflow_create"
+	CapabilityWorkflowExecute Capability = "workflow_execute"
+	CapabilityWorkflowRuns    Capability = "workflow_runs"
+	CapabilityRelayList       Capability = "relay_list"
+	CapabilityRelayEventTypes Capability = "relay_event_types"
+	CapabilityRelayCreate     Capability = "relay_create"
+	CapabilityRelayActivate   Capability = "relay_activate"
+	CapabilityRelayEvents     Capability = "relay_events"
+	CapabilityRelayEvent      Capability = "relay_event"
+)
+
+func DisplayPlatformName(platform string) string {
+	platform = strings.TrimSpace(platform)
+	if platform == "" {
+		return "Unknown"
+	}
+	parts := strings.FieldsFunc(strings.ReplaceAll(platform, "_", "-"), func(r rune) bool { return r == '-' })
+	for i, part := range parts {
+		switch strings.ToLower(part) {
+		case "gmail":
+			parts[i] = "Gmail"
+		case "github":
+			parts[i] = "GitHub"
+		case "hubspot":
+			parts[i] = "HubSpot"
+		case "slackbot":
+			parts[i] = "Slack"
+		case "googlecalendar":
+			parts[i] = "Google Calendar"
+		case "googledrive":
+			parts[i] = "Google Drive"
+		default:
+			if part != "" {
+				parts[i] = strings.ToUpper(part[:1]) + strings.ToLower(part[1:])
+			}
+		}
+	}
+	return strings.Join(parts, " ")
+}
+
+// Provider exposes a provider-agnostic action plane for external systems.
+type Provider interface {
+	Name() string
+	Configured() bool
+	Supports(Capability) bool
+	Guide(ctx context.Context, topic string) (GuideResult, error)
+	ListConnections(ctx context.Context, opts ListConnectionsOptions) (ConnectionsResult, error)
+	SearchActions(ctx context.Context, platform, query, mode string) (ActionSearchResult, error)
+	ActionKnowledge(ctx context.Context, platform, actionID string) (KnowledgeResult, error)
+	ExecuteAction(ctx context.Context, req ExecuteRequest) (ExecuteResult, error)
+	CreateWorkflow(ctx context.Context, req WorkflowCreateRequest) (WorkflowCreateResult, error)
+	ExecuteWorkflow(ctx context.Context, req WorkflowExecuteRequest) (WorkflowExecuteResult, error)
+	ListWorkflowRuns(ctx context.Context, key string) (WorkflowRunsResult, error)
+	ListRelays(ctx context.Context, opts ListRelaysOptions) (RelayListResult, error)
+	RelayEventTypes(ctx context.Context, platform string) (RelayEventTypesResult, error)
+	CreateRelay(ctx context.Context, req RelayCreateRequest) (RelayResult, error)
+	ActivateRelay(ctx context.Context, req RelayActivateRequest) (RelayResult, error)
+	ListRelayEvents(ctx context.Context, opts RelayEventsOptions) (RelayEventsResult, error)
+	GetRelayEvent(ctx context.Context, id string) (RelayEventDetail, error)
+}
+
+// IntegrationProvider is implemented by action providers that can manage
+// external account connections, not just use already-connected accounts.
+type IntegrationProvider interface {
+	Provider
+	ListIntegrationCatalog(ctx context.Context, opts IntegrationCatalogOptions) (IntegrationCatalogResult, error)
+	StartIntegrationConnection(ctx context.Context, req IntegrationConnectRequest) (IntegrationConnectResult, error)
+	GetIntegrationConnectionStatus(ctx context.Context, req IntegrationStatusRequest) (IntegrationConnectResult, error)
+	DisconnectIntegration(ctx context.Context, req IntegrationDisconnectRequest) (IntegrationDisconnectResult, error)
+}
+
+type GuideResult struct {
+	Topic  string          `json:"topic,omitempty"`
+	Guide  string          `json:"guide,omitempty"`
+	Raw    json.RawMessage `json:"raw,omitempty"`
+	Topics []string        `json:"topics,omitempty"`
+}
+
+type ListConnectionsOptions struct {
+	Search string
+	Limit  int
+}
+
+type Connection struct {
+	Platform string   `json:"platform"`
+	State    string   `json:"state,omitempty"`
+	Key      string   `json:"key"`
+	Name     string   `json:"name,omitempty"`
+	Tags     []string `json:"tags,omitempty"`
+}
+
+type ConnectionsResult struct {
+	Total       int          `json:"total,omitempty"`
+	Showing     int          `json:"showing,omitempty"`
+	Search      string       `json:"search,omitempty"`
+	Hint        string       `json:"hint,omitempty"`
+	Connections []Connection `json:"connections"`
+}
+
+type IntegrationCatalogOptions struct {
+	Search    string
+	Connected string
+	Limit     int
+	Cursor    string
+}
+
+type IntegrationCatalogItem struct {
+	Provider          string       `json:"provider"`
+	Platform          string       `json:"platform"`
+	Name              string       `json:"name"`
+	Description       string       `json:"description,omitempty"`
+	Category          string       `json:"category,omitempty"`
+	LogoURL           string       `json:"logo_url,omitempty"`
+	State             string       `json:"state"`
+	ConnectionKey     string       `json:"connection_key,omitempty"`
+	ConnectionName    string       `json:"connection_name,omitempty"`
+	CanConnect        bool         `json:"can_connect"`
+	CanDisconnect     bool         `json:"can_disconnect"`
+	Connections       []Connection `json:"connections,omitempty"`
+	LastActionAt      string       `json:"last_action_at,omitempty"`
+	LastActionSummary string       `json:"last_action_summary,omitempty"`
+}
+
+type IntegrationCatalogResult struct {
+	Items      []IntegrationCatalogItem `json:"items"`
+	NextCursor string                   `json:"next_cursor,omitempty"`
+	Hint       string                   `json:"hint,omitempty"`
+}
+
+type IntegrationConnectRequest struct {
+	Provider string `json:"provider,omitempty"`
+	Platform string `json:"platform"`
+}
+
+type IntegrationStatusRequest struct {
+	Provider  string `json:"provider,omitempty"`
+	Platform  string `json:"platform,omitempty"`
+	ConnectID string `json:"connect_id,omitempty"`
+}
+
+type IntegrationConnectResult struct {
+	Provider      string `json:"provider"`
+	Platform      string `json:"platform"`
+	Status        string `json:"status"`
+	AuthURL       string `json:"auth_url,omitempty"`
+	ConnectID     string `json:"connect_id,omitempty"`
+	ConnectionKey string `json:"connection_key,omitempty"`
+	ExpiresAt     string `json:"expires_at,omitempty"`
+	Instructions  string `json:"instructions,omitempty"`
+	// AuthMode classifies how this toolkit authenticates: "oauth" (the
+	// hosted redirect flow), or "api_key"/"bearer"/"basic" (the user supplies
+	// their own credentials — Composio cannot mint a managed OAuth app).
+	AuthMode string `json:"auth_mode,omitempty"`
+	// RequiredFields is non-empty when Status == "needs_fields": the frontend
+	// must collect these values and POST them back to /integrations/connect/
+	// credentials. Drives the API-key entry card so toolkits like Instantly
+	// (which 400 on use_composio_managed_auth) get a real connect path instead
+	// of an opaque error.
+	RequiredFields []IntegrationConnectField `json:"required_fields,omitempty"`
+}
+
+// IntegrationConnectField describes one credential input the user must supply
+// for a non-OAuth toolkit (e.g. an API key). Mirrors the field metadata
+// Composio exposes for a toolkit's connected-account initiation.
+type IntegrationConnectField struct {
+	Name        string `json:"name"`
+	Label       string `json:"label"`
+	Description string `json:"description,omitempty"`
+	// Secret marks credential fields the UI should render as a password input
+	// (API keys, tokens) so they are masked on screen.
+	Secret   bool `json:"secret,omitempty"`
+	Required bool `json:"required,omitempty"`
+}
+
+// IntegrationConnectCredentialsRequest carries the user-supplied credentials
+// for a non-OAuth toolkit back to the broker, which hands them to Composio to
+// create a custom-auth config + connected account.
+type IntegrationConnectCredentialsRequest struct {
+	Provider string            `json:"provider,omitempty"`
+	Platform string            `json:"platform"`
+	Fields   map[string]string `json:"fields"`
+}
+
+type IntegrationDisconnectRequest struct {
+	Provider      string `json:"provider,omitempty"`
+	Platform      string `json:"platform,omitempty"`
+	ConnectionKey string `json:"connection_key"`
+}
+
+type IntegrationDisconnectResult struct {
+	OK            bool   `json:"ok"`
+	Provider      string `json:"provider"`
+	Platform      string `json:"platform,omitempty"`
+	ConnectionKey string `json:"connection_key"`
+	Status        string `json:"status"`
+}
+
+type Action struct {
+	ActionID string `json:"action_id"`
+	Title    string `json:"title,omitempty"`
+	Method   string `json:"method,omitempty"`
+	Path     string `json:"path,omitempty"`
+}
+
+type ActionSearchResult struct {
+	Platform string   `json:"platform,omitempty"`
+	Query    string   `json:"query,omitempty"`
+	Mode     string   `json:"mode,omitempty"`
+	Actions  []Action `json:"actions"`
+}
+
+type KnowledgeResult struct {
+	Platform  string `json:"platform,omitempty"`
+	ActionID  string `json:"action_id,omitempty"`
+	Method    string `json:"method,omitempty"`
+	Knowledge string `json:"knowledge"`
+}
+
+type ExecuteRequest struct {
+	Platform        string         `json:"platform"`
+	ActionID        string         `json:"action_id"`
+	ConnectionKey   string         `json:"connection_key"`
+	Data            map[string]any `json:"data,omitempty"`
+	PathVariables   map[string]any `json:"path_variables,omitempty"`
+	QueryParameters map[string]any `json:"query_parameters,omitempty"`
+	Headers         map[string]any `json:"headers,omitempty"`
+	FormData        bool           `json:"form_data,omitempty"`
+	FormURLEncoded  bool           `json:"form_url_encoded,omitempty"`
+	DryRun          bool           `json:"dry_run,omitempty"`
+}
+
+type ExecuteResult struct {
+	DryRun   bool            `json:"dry_run"`
+	Request  ExecuteEnvelope `json:"request"`
+	Response json.RawMessage `json:"response,omitempty"`
+}
+
+type ExecuteEnvelope struct {
+	Method  string         `json:"method,omitempty"`
+	URL     string         `json:"url,omitempty"`
+	Headers map[string]any `json:"headers,omitempty"`
+	Data    map[string]any `json:"data,omitempty"`
+}
+
+type WorkflowCreateRequest struct {
+	Key        string          `json:"key"`
+	Definition json.RawMessage `json:"definition"`
+}
+
+type WorkflowCreateResult struct {
+	Created bool   `json:"created"`
+	Key     string `json:"key,omitempty"`
+	Path    string `json:"path,omitempty"`
+}
+
+type WorkflowExecuteRequest struct {
+	KeyOrPath      string         `json:"key_or_path"`
+	Inputs         map[string]any `json:"inputs,omitempty"`
+	DryRun         bool           `json:"dry_run,omitempty"`
+	Verbose        bool           `json:"verbose,omitempty"`
+	Mock           bool           `json:"mock,omitempty"`
+	SkipValidation bool           `json:"skip_validation,omitempty"`
+	AllowBash      bool           `json:"allow_bash,omitempty"`
+}
+
+type WorkflowExecuteResult struct {
+	RunID   string                     `json:"run_id,omitempty"`
+	LogFile string                     `json:"log_file,omitempty"`
+	Status  string                     `json:"status,omitempty"`
+	Steps   map[string]json.RawMessage `json:"steps,omitempty"`
+	Events  []json.RawMessage          `json:"events,omitempty"`
+}
+
+type WorkflowRunsResult struct {
+	Runs []json.RawMessage `json:"runs,omitempty"`
+	Raw  json.RawMessage   `json:"raw,omitempty"`
+}
+
+// WorkflowStepView is one step of a persisted (frozen) workflow definition,
+// shaped for rendering. It carries the deterministic mechanics (type, platform,
+// action, run_if gate) plus a precomputed Gated flag (the action mutates an
+// external system, so a real run holds it for human approval).
+type WorkflowStepView struct {
+	ID          string `json:"id"`
+	Type        string `json:"type"`
+	Description string `json:"description,omitempty"`
+	Platform    string `json:"platform,omitempty"`
+	ActionID    string `json:"action_id,omitempty"`
+	RunIf       string `json:"run_if,omitempty"`
+	Template    string `json:"template,omitempty"`
+	Gated       bool   `json:"gated"`
+}
+
+// WorkflowGetResult is the read side of a frozen workflow: the persisted
+// definition decoded into steps. Exists is false when nothing has been compiled
+// for the key yet (not an error — a "compile it" affordance, not a failure).
+type WorkflowGetResult struct {
+	Exists      bool               `json:"exists"`
+	Key         string             `json:"key,omitempty"`
+	Title       string             `json:"title,omitempty"`
+	Description string             `json:"description,omitempty"`
+	Steps       []WorkflowStepView `json:"steps,omitempty"`
+}
+
+type ListRelaysOptions struct {
+	Limit int
+	Page  int
+}
+
+type Relay struct {
+	ID           string   `json:"id"`
+	URL          string   `json:"url,omitempty"`
+	Active       bool     `json:"active,omitempty"`
+	Description  string   `json:"description,omitempty"`
+	EventFilters []string `json:"event_filters,omitempty"`
+	ActionsCount int      `json:"actions_count,omitempty"`
+	CreatedAt    string   `json:"created_at,omitempty"`
+}
+
+type RelayListResult struct {
+	Total     int     `json:"total,omitempty"`
+	Showing   int     `json:"showing,omitempty"`
+	Endpoints []Relay `json:"endpoints"`
+}
+
+type RelayEventTypesResult struct {
+	Platform   string   `json:"platform"`
+	EventTypes []string `json:"event_types"`
+}
+
+type RelayCreateRequest struct {
+	ConnectionKey string   `json:"connection_key"`
+	Description   string   `json:"description,omitempty"`
+	EventFilters  []string `json:"event_filters,omitempty"`
+	CreateWebhook bool     `json:"create_webhook,omitempty"`
+}
+
+type RelayActivateRequest struct {
+	ID            string          `json:"id"`
+	Actions       json.RawMessage `json:"actions"`
+	WebhookSecret string          `json:"webhook_secret,omitempty"`
+}
+
+type RelayResult struct {
+	ID           string          `json:"id"`
+	URL          string          `json:"url,omitempty"`
+	Active       bool            `json:"active,omitempty"`
+	Description  string          `json:"description,omitempty"`
+	EventFilters []string        `json:"event_filters,omitempty"`
+	Actions      json.RawMessage `json:"actions,omitempty"`
+	Raw          json.RawMessage `json:"raw,omitempty"`
+}
+
+type RelayEventsOptions struct {
+	Limit     int    `json:"limit,omitempty"`
+	Page      int    `json:"page,omitempty"`
+	Platform  string `json:"platform,omitempty"`
+	EventType string `json:"event_type,omitempty"`
+	After     string `json:"after,omitempty"`
+	Before    string `json:"before,omitempty"`
+}
+
+type RelayEvent struct {
+	ID        string `json:"id"`
+	Platform  string `json:"platform,omitempty"`
+	EventType string `json:"event_type,omitempty"`
+	Timestamp string `json:"timestamp,omitempty"`
+}
+
+type RelayEventsResult struct {
+	Total   int          `json:"total,omitempty"`
+	Showing int          `json:"showing,omitempty"`
+	Events  []RelayEvent `json:"events"`
+}
+
+type RelayEventDetail struct {
+	ID        string          `json:"id"`
+	Platform  string          `json:"platform,omitempty"`
+	EventType string          `json:"event_type,omitempty"`
+	Timestamp string          `json:"timestamp,omitempty"`
+	Payload   json.RawMessage `json:"payload,omitempty"`
+	Raw       json.RawMessage `json:"raw,omitempty"`
+}
