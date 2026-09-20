@@ -135,6 +135,9 @@ type Broker struct {
 	// turnMeter is the settle-phase usage meter hook (tier enforcement).
 	// nil means metering disabled. Guarded by b.mu.
 	turnMeter TurnMeter
+	// turnObservers receive AG-UI turn events (turn_events.go). Emitted
+	// outside the lock; observers must never block. Guarded by b.mu.
+	turnObservers []TurnObserver
 	// composioSignin is the in-memory "Sign in with Composio" CLI flow state
 	// (broker_composio_signin.go). Carries its own mutex; zero value ready.
 	composioSignin composioSigninFlow
@@ -810,6 +813,7 @@ func (b *Broker) StartOnPort(port int) error {
 	mux.HandleFunc("/policy/resolve", b.requireAuth(b.handlePolicyResolve))
 	mux.HandleFunc("/policy/grants", b.requireAuth(b.handlePolicyGrants))
 	mux.HandleFunc("/policy/rules", b.requireAuth(b.handlePolicyRules))
+	mux.HandleFunc("/agui/turns", b.requireAuth(b.handleAguiTurns))
 	// "Sign in with Composio" — the broker drives the composio CLI so the
 	// user never copy/pastes an API key. See broker_composio_signin.go.
 	mux.HandleFunc("/integrations/composio/signin/start", b.requireAuth(b.handleComposioSigninStart))
