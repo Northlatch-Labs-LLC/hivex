@@ -122,6 +122,11 @@ type Broker struct {
 	// exact-match standing approvals over the declared capability registry,
 	// evaluated by the default-deny policy gate. Guarded by b.mu.
 	policyGrants []policyGrant
+	// policyRules are the CEL data-driven policy rules (policy_engine_cel.go):
+	// operator-authored expressions evaluated before the class defaults,
+	// deny before allow, never bypassing the irreversible human gate.
+	// Guarded by b.mu.
+	policyRules []policyRule
 	// turnRecords is the Turn Engine v2 journal (turn_engine.go): one
 	// persisted record per bot turn with its typed state and audited
 	// transition trail. Bounded to the latest maxTurnRecords turns. Guarded
@@ -804,6 +809,7 @@ func (b *Broker) StartOnPort(port int) error {
 	mux.HandleFunc("/integrations/grants", b.requireAuth(b.handleIntegrationGrants))
 	mux.HandleFunc("/policy/resolve", b.requireAuth(b.handlePolicyResolve))
 	mux.HandleFunc("/policy/grants", b.requireAuth(b.handlePolicyGrants))
+	mux.HandleFunc("/policy/rules", b.requireAuth(b.handlePolicyRules))
 	// "Sign in with Composio" — the broker drives the composio CLI so the
 	// user never copy/pastes an API key. See broker_composio_signin.go.
 	mux.HandleFunc("/integrations/composio/signin/start", b.requireAuth(b.handleComposioSigninStart))

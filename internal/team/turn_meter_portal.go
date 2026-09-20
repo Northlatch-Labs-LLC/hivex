@@ -21,6 +21,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Northlatch-Labs-LLC/hivex/internal/config"
@@ -85,9 +86,68 @@ func (m *portalTurnMeter) MeterTurn(bot, taskID string, failed bool) {
 		if err != nil {
 			return
 		}
-		_, _ = io.Copy(io.Discard, io.LimitReader(res.Body, 1<<20))
+		// The endpoint answers with the authoritative budget
+		// {success, used, cap, capped, remaining} — capture it for the
+		// pre-turn gate. Parse failures degrade to the previous posture
+		// (under-counting, fail-open gate).
+		respRaw, respErr := io.ReadAll(io.LimitReader(res.Body, 1<<20))
 		_ = res.Body.Close()
+		if respErr != nil {
+			return
+		}
+		var report struct {
+			Success bool   `json:"success"`
+			Used    int64  `json:"used"`
+			Cap     *int64 `json:"cap"`
+			Capped  bool   `json:"capped"`
+		}
+		if json.Unmarshal(respRaw, &report) == nil && report.Success {
+			recordPortalTurnBudget(&portalTurnBudget{
+				Used:   report.Used,
+				Cap:    report.Cap,
+				Capped: report.Capped,
+				At:     time.Now(),
+			})
+		}
 	}()
+}
+
+// portalTurnBudget is the cap state the turns endpoint returns with every
+// meter report: {success, used, cap, capped, remaining}. The harness uses the
+// authoritative capped flag as the pre-turn gate.
+type portalTurnBudget struct {
+	Used   int64  `json:"used"`
+	Cap    *int64 `json:"cap"`
+	Capped bool   `json:"capped"`
+	At     time.Time
+}
+
+var (
+	portalBudgetMu sync.Mutex
+	portalBudget   *portalTurnBudget
+)
+
+func recordPortalTurnBudget(b *portalTurnBudget) {
+	portalBudgetMu.Lock()
+	defer portalBudgetMu.Unlock()
+	portalBudget = b
+}
+
+// lastPortalTurnBudget returns the most recent meter-report budget, if any.
+func lastPortalTurnBudget() *portalTurnBudget {
+	portalBudgetMu.Lock()
+	defer portalBudgetMu.Unlock()
+	if portalBudget == nil {
+		return nil
+	}
+	out := *portalBudget
+	return &out
+}
+
+func resetPortalTurnBudgetForTests() {
+	portalBudgetMu.Lock()
+	defer portalBudgetMu.Unlock()
+	portalBudget = nil
 }
 
 // installPortalTurnMeter wires the production meter onto the broker when the

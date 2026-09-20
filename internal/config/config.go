@@ -147,6 +147,12 @@ const (
 	// (third_party/memanto) as the shared organizational memory backend:
 	// HIVEX_MEMANTO_URL + HIVEX_MEMANTO_API_KEY configure the instance.
 	MemoryBackendMemanto = "memanto"
+	// MemoryBackendCognee selects the self-hosted Cognee memory engine
+	// (Apache-2.0, topoteretes/cognee; derived image in third_party/cognee)
+	// as the shared organizational memory backend: HIVEX_COGNEE_URL (+ the
+	// optional HIVEX_COGNEE_API_KEY) configure the instance. Fully local:
+	// keyless extraction/embedding — no cloud dependency.
+	MemoryBackendCognee = "cognee"
 )
 
 // OpenclawBridgeBinding binds a hivebot bot session to an OpenClaw bridge slug.
@@ -262,6 +268,8 @@ func NormalizeMemoryBackend(value string) string {
 		return MemoryBackendMarkdown
 	case MemoryBackendMemanto:
 		return MemoryBackendMemanto
+	case MemoryBackendCognee:
+		return MemoryBackendCognee
 	default:
 		return ""
 	}
@@ -387,6 +395,8 @@ func MemoryBackendLabel(backend string) string {
 		return "Markdown wiki"
 	case MemoryBackendMemanto:
 		return "Memanto"
+	case MemoryBackendCognee:
+		return "Cognee"
 	default:
 		return "Local-only"
 	}

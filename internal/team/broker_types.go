@@ -768,7 +768,12 @@ type officeDecisionRecord struct {
 	SignalIDs     []string `json:"signal_ids,omitempty"`
 	RequiresHuman bool     `json:"requires_human,omitempty"`
 	Blocking      bool     `json:"blocking,omitempty"`
-	CreatedAt     string   `json:"created_at"`
+	// Initiator provenance (the openbot audit-schema adaptation): who or what
+	// initiated the decision — person | routine | handoff | deployment — and
+	// the acting identity (user id, bot slug, or deployment id).
+	InitiatorKind string `json:"initiator_kind,omitempty"`
+	ActorID       string `json:"actor_id,omitempty"`
+	CreatedAt     string `json:"created_at"`
 }
 
 type watchdogAlert struct {
@@ -890,6 +895,7 @@ type brokerState struct {
 	ConnectionRegistry map[string]connectionRegistryEntry `json:"connection_registry,omitempty"`
 	ActionGrants       []actionGrant                      `json:"action_grants,omitempty"`
 	PolicyGrants       []policyGrant                      `json:"policy_grants,omitempty"`
+	PolicyRules        []policyRule                       `json:"policy_rules,omitempty"`
 	TurnRecords        []TurnRecord                       `json:"turn_records,omitempty"`
 	Actions            []officeActionLog                  `json:"actions,omitempty"`
 	Signals            []officeSignalRecord               `json:"signals,omitempty"`

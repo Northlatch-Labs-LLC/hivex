@@ -153,6 +153,14 @@ func (b *Broker) EvaluateCapability(bot, capability, scope string) PolicyDecisio
 		return PolicyDecision{Decision: "approve", Reason: fmt.Sprintf("capability %q is not declared in the registry; default deny requires a human decision", capability)}
 	}
 	now := time.Now().UTC()
+	// CEL policy rules (policy_engine_cel.go): data-driven policy evaluated
+	// before the class defaults, deny before allow. Irreversible capabilities
+	// never consult rules — a human decides, always.
+	if cap.Class != CapabilityIrreversible {
+		if d, matched := b.evaluatePolicyRules(bot, cap, scope); matched {
+			return d
+		}
+	}
 	switch cap.Class {
 	case CapabilityReadOnly:
 		return PolicyDecision{Decision: "allow", Reason: fmt.Sprintf("read-only capability %q auto-proceeds", cap.ID)}
@@ -348,10 +356,12 @@ func (b *Broker) auditPolicyDecision(bot, capability, scope string, d PolicyDeci
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.decisions = append(b.decisions, officeDecisionRecord{
-		ID:      fmt.Sprintf("pol-%d", time.Now().UnixNano()),
-		Kind:    "policy",
-		Summary: fmt.Sprintf("policy gate: %s", d.Decision),
-		Reason:  entry,
-		Owner:   policyGrantBotKey(bot),
+		ID:            fmt.Sprintf("pol-%d", time.Now().UnixNano()),
+		Kind:          "policy",
+		Summary:       fmt.Sprintf("policy gate: %s", d.Decision),
+		Reason:        entry,
+		Owner:         policyGrantBotKey(bot),
+		InitiatorKind: "routine",
+		ActorID:       policyGrantBotKey(bot),
 	})
 }

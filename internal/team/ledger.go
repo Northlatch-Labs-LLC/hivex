@@ -135,6 +135,14 @@ func (b *Broker) RecordSignals(signals []officeSignal) ([]officeSignalRecord, er
 }
 
 func (b *Broker) RecordDecision(kind, channel, summary, reason, owner string, signalIDs []string, requiresHuman, blocking bool) (officeDecisionRecord, error) {
+	return b.RecordDecisionAs(kind, channel, summary, reason, owner, "", "", signalIDs, requiresHuman, blocking)
+}
+
+// RecordDecisionAs records a decision with initiator provenance
+// (initiatorKind: person | routine | handoff | deployment; actorID: the
+// acting user, bot slug, or deployment id). The openbot audit-schema
+// adaptation: every decision names who or what initiated it.
+func (b *Broker) RecordDecisionAs(kind, channel, summary, reason, owner, initiatorKind, actorID string, signalIDs []string, requiresHuman, blocking bool) (officeDecisionRecord, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
@@ -149,6 +157,8 @@ func (b *Broker) RecordDecision(kind, channel, summary, reason, owner string, si
 		Summary:       strings.TrimSpace(summary),
 		Reason:        strings.TrimSpace(reason),
 		Owner:         strings.TrimSpace(owner),
+		InitiatorKind: strings.TrimSpace(initiatorKind),
+		ActorID:       strings.TrimSpace(actorID),
 		SignalIDs:     append([]string(nil), signalIDs...),
 		RequiresHuman: requiresHuman,
 		Blocking:      blocking,
