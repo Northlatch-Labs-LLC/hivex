@@ -814,6 +814,7 @@ func (b *Broker) StartOnPort(port int) error {
 	mux.HandleFunc("/policy/grants", b.requireAuth(b.handlePolicyGrants))
 	mux.HandleFunc("/policy/rules", b.requireAuth(b.handlePolicyRules))
 	mux.HandleFunc("/agui/turns", b.requireAuth(b.handleAguiTurns))
+	mux.HandleFunc("/review/run", b.requireAuth(b.handleReviewRun))
 	// "Sign in with Composio" — the broker drives the composio CLI so the
 	// user never copy/pastes an API key. See broker_composio_signin.go.
 	mux.HandleFunc("/integrations/composio/signin/start", b.requireAuth(b.handleComposioSigninStart))
