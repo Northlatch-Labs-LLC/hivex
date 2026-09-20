@@ -320,14 +320,34 @@ func evalJobTurnEngine(fx *officeEvalFixture, r *OfficeEvalReport) error {
 		irreversible.Reason, "")
 
 	// 5. The settle meter fires exactly once per turn — a duplicate close
-	// must not double-meter.
+	// must not double-meter — and the AG-UI event bus mirrors the lifecycle
+	// (RUN_STARTED on open, RUN_FINISHED on settle).
 	metered := 0
 	b.SetTurnMeter(meterFunc(func(bot, taskID string, failed bool) { metered++ }))
+	events := &evalTurnEventCollector{ch: make(chan TurnEvent, 16)}
+	removeEvents := b.AddTurnObserver(events)
+	defer removeEvents()
 	id3 := b.TurnBegin("eng", "task-eval-3", "general")
 	b.TurnSettle(id3, "settled")
 	b.TurnSettle(id3, "duplicate close")
 	r.add(job, "meter fires exactly once per turn", metered == 1,
 		fmt.Sprintf("metered=%d", metered), "")
+	sawStart, sawFinish := false, false
+	for {
+		select {
+		case ev := <-events.ch:
+			if ev.TurnID != id3 {
+				continue
+			}
+			sawStart = sawStart || ev.Type == "RUN_STARTED"
+			sawFinish = sawFinish || ev.Type == "RUN_FINISHED"
+		default:
+			goto eventsChecked
+		}
+	}
+eventsChecked:
+	r.add(job, "agui event bus mirrors the turn lifecycle",
+		sawStart && sawFinish, "", "")
 
 	// 6. CEL policy rules: an operator rule lets a declared mutating
 	// capability proceed without a grant, deny beats allow+grant, and
@@ -366,6 +386,16 @@ func evalJobTurnEngine(fx *officeEvalFixture, r *OfficeEvalReport) error {
 type meterFunc func(bot, taskID string, failed bool)
 
 func (f meterFunc) MeterTurn(bot, taskID string, failed bool) { f(bot, taskID, failed) }
+
+// evalTurnEventCollector captures turn events for eval assertions.
+type evalTurnEventCollector struct{ ch chan TurnEvent }
+
+func (c *evalTurnEventCollector) OnTurnEvent(e TurnEvent) {
+	select {
+	case c.ch <- e:
+	default:
+	}
+}
 
 // evalJobEntitlementGate: the portal-linked entitlement layer holds its
 // contract — the token scheme is pinned to the portal's exact wire format,

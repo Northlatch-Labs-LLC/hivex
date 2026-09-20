@@ -111,6 +111,9 @@ func (b *Broker) TurnBegin(bot, taskID, channel string) string {
 		b.turnRecords = b.turnRecords[excess:]
 	}
 	b.mu.Unlock()
+	ev := turnEventFor(rec, TurnIntake, "turn opened")
+	ev.Type = "RUN_STARTED"
+	b.emitTurnEvent(ev)
 	return id
 }
 
@@ -125,7 +128,8 @@ func (b *Broker) TurnTransition(id string, state TurnState, detail string) bool 
 	}
 	now := time.Now().UTC().Format(time.RFC3339)
 	b.mu.Lock()
-	defer b.mu.Unlock()
+	applied := false
+	var appliedRec TurnRecord
 	for i := range b.turnRecords {
 		if b.turnRecords[i].ID != id {
 			continue
@@ -133,20 +137,28 @@ func (b *Broker) TurnTransition(id string, state TurnState, detail string) bool 
 		rec := &b.turnRecords[i]
 		if turnTerminal(rec.State) {
 			log.Printf("turn engine: dropping transition %q on terminal turn %s (%s)", state, id, rec.State)
-			return false
+			break
 		}
 		if len(rec.Transitions) >= maxTurnTransitions {
 			log.Printf("turn engine: transition cap hit for turn %s; recording %s without trail", id, state)
 			rec.State = state
 			rec.UpdatedAt = now
-			return true
+			applied = true
+			appliedRec = *rec
+			break
 		}
 		rec.State = state
 		rec.UpdatedAt = now
 		rec.Transitions = append(rec.Transitions, TurnTransition{At: now, State: state, Detail: detail})
-		return true
+		applied = true
+		appliedRec = *rec
+		break
 	}
-	return false
+	b.mu.Unlock()
+	if applied {
+		b.emitTurnEvent(turnEventFor(appliedRec, state, detail))
+	}
+	return applied
 }
 
 // TurnFail closes a turn as failed — the runner errored, the turn timed out,
