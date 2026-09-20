@@ -9,7 +9,7 @@ import (
 
 func TestDeriveIDPrefix(t *testing.T) {
 	cases := []struct{ in, want string }{
-		{"Hive", "NEX"},
+		{"Hive", "HIVE"},
 		{"Acme Corp", "ACMEC"},
 		{"a.b.c", "ABC"},
 		{"  ", defaultIDPrefix},
@@ -32,7 +32,7 @@ func TestWorkspaceIDPrefix(t *testing.T) {
 		workspaceName string
 		want          string
 	}{
-		{"company name wins when set", "Hive", "acme-revops", "NEX"},
+		{"company name wins when set", "Hive", "acme-revops", "HIVE"},
 		{"blank company falls back to workspace name", "", "acme-revops", "ACMER"},
 		{"symbol-only company falls back to workspace name", "!!!", "beta-team", "BETAT"},
 		{"both blank yields empty", "", "", ""},
@@ -96,7 +96,7 @@ func TestRefreshIDPrefixUsesWorkspaceNameWhenCompanyNameEmpty(t *testing.T) {
 }
 
 // TestRefreshIDPrefixCompanyNameWins confirms an explicit company name still
-// takes precedence over the workspace name, preserving the "Hive" → NEX-1
+// takes precedence over the workspace name, preserving the "Hive" → HIVE-1
 // behaviour for onboarded workspaces.
 func TestRefreshIDPrefixCompanyNameWins(t *testing.T) {
 	home := t.TempDir()
@@ -124,7 +124,7 @@ func TestRefreshIDPrefixCompanyNameWins(t *testing.T) {
 	b.refreshIDPrefixFromWorkspaceLocked()
 	b.mu.Unlock()
 
-	if got := b.idPrefix; got != "NEX" {
-		t.Fatalf("IDPrefix = %q, want NEX (company name should win)", got)
+	if got := b.idPrefix; got != "HIVE" {
+		t.Fatalf("IDPrefix = %q, want HIVE (company name should win)", got)
 	}
 }

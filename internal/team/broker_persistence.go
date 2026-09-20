@@ -72,6 +72,7 @@ func brokerStateActivityScore(state brokerState) int {
 	score += len(state.ConnectionRegistry) * 4
 	score += len(state.ActionGrants) * 4
 	score += len(state.PolicyGrants) * 4
+	score += len(state.PolicyRules) * 2
 	score += len(state.TurnRecords) * 2
 	score += len(state.Actions) * 4
 	score += len(state.Signals) * 4
@@ -168,6 +169,7 @@ func (b *Broker) loadState() error {
 	b.connectionRegistry = state.ConnectionRegistry
 	b.actionGrants = state.ActionGrants
 	b.policyGrants = state.PolicyGrants
+	b.policyRules = state.PolicyRules
 	b.turnRecords = turnResumeInterruptedLocked(state.TurnRecords)
 	b.humanInvites = state.HumanInvites
 	b.humanSessions = state.HumanSessions
@@ -326,6 +328,7 @@ func (b *Broker) prepareBrokerStateWriteLocked() (brokerStateWrite, error) {
 		ConnectionRegistry: b.cloneConnectionRegistryLocked(),
 		ActionGrants:       cloneActionGrants(b.actionGrants),
 		PolicyGrants:       clonePolicyGrants(b.policyGrants),
+		PolicyRules:        clonePolicyRules(b.policyRules),
 		TurnRecords:        append([]TurnRecord(nil), b.turnRecords...),
 		Actions:            actions,
 		Signals:            signals,

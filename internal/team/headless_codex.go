@@ -2,6 +2,7 @@ package team
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"runtime"
@@ -51,6 +52,13 @@ func defaultHeadlessCodexRunTurn(l *Launcher, ctx context.Context, slug, notific
 	turnCh := ""
 	if len(channel) > 0 {
 		turnCh = channel[0]
+	}
+	// Portal turn gate: the portal's authoritative meter report pauses new
+	// turns when the account's monthly budget is exhausted (Free-tier cap).
+	// Fail-open by construction: no report yet means the gate allows.
+	if turnGateBlockedByPortal() {
+		postTurnCapGateNotice(l.broker, slug)
+		return fmt.Errorf("turn blocked for %s: monthly free-turn cap reached — upgrade at the Hive Customer Portal", slug)
 	}
 	turnID := l.broker.TurnBegin(slug, "", turnCh)
 	l.broker.TurnTransition(turnID, TurnPolicyGate, "default-deny capability gate armed for tool calls")

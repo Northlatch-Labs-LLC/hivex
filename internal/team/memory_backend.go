@@ -331,6 +331,16 @@ func ResolveMemoryBackendStatus() MemoryBackendStatus {
 		status.ActiveKind = config.MemoryBackendMemanto
 		status.ActiveLabel = config.MemoryBackendLabel(config.MemoryBackendMemanto)
 		status.Detail = "Memanto-backed organizational context is active: verified outcomes consolidate into the team estate, and retrieval briefs each turn."
+	case config.MemoryBackendCognee:
+		cogneeBackend := cogneeMemoryBackend{}
+		if !cogneeBackend.Ready() {
+			status.Detail = "Cognee backend selected, but the instance is not answering."
+			status.NextStep = "Set HIVEX_COGNEE_URL to a running Cognee instance (see third_party/cognee/Dockerfile + the compose service)."
+			return status
+		}
+		status.ActiveKind = config.MemoryBackendCognee
+		status.ActiveLabel = config.MemoryBackendLabel(config.MemoryBackendCognee)
+		status.Detail = "Cognee-backed organizational context is active: verified outcomes consolidate into the local knowledge graph, and retrieval briefs each turn."
 	case config.MemoryBackendGBrain:
 		if !gbrain.EmbeddingAvailable() {
 			// gbrain needs an embedding provider for semantic retrieval.
@@ -370,6 +380,8 @@ func selectedMemoryBackend() memoryBackend {
 		return gbrainMemoryBackend{}
 	case config.MemoryBackendMemanto:
 		return memantoMemoryBackend{}
+	case config.MemoryBackendCognee:
+		return cogneeMemoryBackend{}
 	default:
 		return noMemoryBackend{}
 	}
@@ -452,7 +464,7 @@ func gbrainMCPEnvVars() []string {
 
 func directMemoryPromptBlock() string {
 	switch activeMemoryBackendKind() {
-	case config.MemoryBackendGBrain, config.MemoryBackendMemanto:
+	case config.MemoryBackendGBrain, config.MemoryBackendMemanto, config.MemoryBackendCognee:
 		return "Memory scopes:\n- team_memory_query: Read your private notes (`scope=private`) or shared org memory backed by the active shared-memory backend (`scope=shared`)\n- team_memory_write: Store private notes by default; only write shared memory after a durable outcome is real\n- team_memory_promote: Copy one of your private notes into the shared memory backend when it becomes canonical\n- If shared memory points at another bot, ask them on the team for fresher working detail instead of guessing\n\n"
 	default:
 		return "Memory scopes:\n- team_memory_query: Your private notes still work with `scope=private`\n- team_memory_write: Store private notes for yourself\n- Shared org memory is not active for this run, so `scope=shared` and team_memory_promote are unavailable\n\n"
@@ -461,7 +473,7 @@ func directMemoryPromptBlock() string {
 
 func directMemoryStorageRule() string {
 	switch activeMemoryBackendKind() {
-	case config.MemoryBackendGBrain, config.MemoryBackendMemanto:
+	case config.MemoryBackendGBrain, config.MemoryBackendMemanto, config.MemoryBackendCognee:
 		return "7. Keep scratch notes private by default. Only claim shared storage after team_memory_write visibility=shared or team_memory_promote actually succeeded.\n"
 	default:
 		return "7. Do not pretend anything was stored outside your private note scope.\n"
@@ -470,7 +482,7 @@ func directMemoryStorageRule() string {
 
 func leadMemoryPromptBlock() string {
 	switch activeMemoryBackendKind() {
-	case config.MemoryBackendGBrain, config.MemoryBackendMemanto:
+	case config.MemoryBackendGBrain, config.MemoryBackendMemanto, config.MemoryBackendCognee:
 		return "Memory scopes: use team_memory_query with scope=shared for org memory backed by the active shared-memory backend, scope=private for your own notes, and team_memory_promote when a private note becomes durable shared knowledge. If shared memory points at another bot, ask them on the team for the freshest working context. Keep task coordination on the team, not in shared memory.\n\n"
 	default:
 		return "Shared org memory is not active for this run. You can still use private notes with team_memory_query/team_memory_write scope=private.\n\n"
@@ -479,7 +491,7 @@ func leadMemoryPromptBlock() string {
 
 func leadMemoryFirstRule() string {
 	switch activeMemoryBackendKind() {
-	case config.MemoryBackendGBrain, config.MemoryBackendMemanto:
+	case config.MemoryBackendGBrain, config.MemoryBackendMemanto, config.MemoryBackendCognee:
 		return "1. On strategy, relationships, or prior decisions, start with team_memory_query. Use shared scope for org context and private scope for your own retained notes.\n"
 	default:
 		return "1. Coordinate inside the team channel first, and use private memory only for your own scratch history.\n"
@@ -488,7 +500,7 @@ func leadMemoryFirstRule() string {
 
 func leadMemoryStorageRule() string {
 	switch activeMemoryBackendKind() {
-	case config.MemoryBackendGBrain, config.MemoryBackendMemanto:
+	case config.MemoryBackendGBrain, config.MemoryBackendMemanto, config.MemoryBackendCognee:
 		return "8. When you lock a durable decision, promote it into shared memory before claiming the brain knows it\n"
 	default:
 		return "8. Summarize final decisions clearly in-channel; shared org memory is unavailable in this run\n"
@@ -497,7 +509,7 @@ func leadMemoryStorageRule() string {
 
 func leadMemoryFinalWarning() string {
 	switch activeMemoryBackendKind() {
-	case config.MemoryBackendGBrain, config.MemoryBackendMemanto:
+	case config.MemoryBackendGBrain, config.MemoryBackendMemanto, config.MemoryBackendCognee:
 		return "Do not pretend shared memory was updated; verify team_memory_write visibility=shared or team_memory_promote succeeded.\n"
 	default:
 		return "Do not claim you stored anything outside your private notes.\n"
@@ -506,7 +518,7 @@ func leadMemoryFinalWarning() string {
 
 func specialistMemoryPromptBlock() string {
 	switch activeMemoryBackendKind() {
-	case config.MemoryBackendGBrain, config.MemoryBackendMemanto:
+	case config.MemoryBackendGBrain, config.MemoryBackendMemanto, config.MemoryBackendCognee:
 		return "Memory scopes: use team_memory_query with scope=shared for org memory backed by the active shared-memory backend, scope=private for your own notes, and team_memory_promote when a private note becomes durable shared knowledge. If shared memory points at another bot, ask them on the team for the freshest working context.\n\n"
 	default:
 		return "Shared org memory is not active for this run. You can still use private notes with team_memory_query/team_memory_write scope=private.\n\n"
@@ -515,7 +527,7 @@ func specialistMemoryPromptBlock() string {
 
 func specialistMemoryStorageRule() string {
 	switch activeMemoryBackendKind() {
-	case config.MemoryBackendGBrain, config.MemoryBackendMemanto:
+	case config.MemoryBackendGBrain, config.MemoryBackendMemanto, config.MemoryBackendCognee:
 		return "9. Use team_memory_query when prior knowledge matters. Keep notes private by default, and only promote durable conclusions into shared memory once they are real.\n\n"
 	default:
 		return "9. Don't fake shared memory. Surface uncertainty in-channel and keep any retained notes private.\n\n"

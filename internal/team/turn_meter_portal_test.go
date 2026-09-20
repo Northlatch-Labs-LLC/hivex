@@ -57,6 +57,61 @@ func TestPortalTurnMeterReportsSettledTurns(t *testing.T) {
 	}
 }
 
+// TestPortalTurnMeterCapturesTheBudgetResponse pins the Free-cap gate's
+// data source: the turns endpoint's authoritative {success, used, cap,
+// capped} answer is captured from a real HTTP round trip and arms the
+// pre-turn gate; a non-capped answer re-opens it.
+func TestPortalTurnMeterCapturesTheBudgetResponse(t *testing.T) {
+	resetPortalTurnBudgetForTests()
+	t.Cleanup(resetPortalTurnBudgetForTests)
+
+	capped := make(chan bool, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(map[string]any{"success": true, "used": 1000, "cap": 1000, "capped": true, "remaining": 0})
+		capped <- true
+	}))
+	defer srv.Close()
+
+	t.Setenv("HIVEX_PORTAL_TURNS_URL", srv.URL)
+	t.Setenv("HIVEX_PORTAL_ACCOUNT_KEY", "sk-test-account-key")
+	m := newPortalTurnMeterFromEnv()
+
+	b := newTestBroker(t)
+	b.SetTurnMeter(m)
+	id := b.TurnBegin("researcher", "task-cap", "general")
+	b.TurnSettle(id, "settled")
+
+	select {
+	case <-capped:
+	case <-time.After(5 * time.Second):
+		t.Fatal("meter report never reached the endpoint")
+	}
+	// The capture happens on the meter's goroutine; poll briefly for it.
+	for i := 0; i < 50 && !turnGateBlockedByPortal(); i++ {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !turnGateBlockedByPortal() {
+		t.Fatal("capped budget answer must arm the pre-turn gate")
+	}
+
+	// An uncapped answer re-opens the gate.
+	srv2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(map[string]any{"success": true, "used": 5, "cap": 1000, "capped": false, "remaining": 995})
+	}))
+	defer srv2.Close()
+	m2 := &portalTurnMeter{url: srv2.URL, apiKey: "sk-test-account-key", client: &http.Client{Timeout: portalTurnTimeout}}
+	m2.MeterTurn("researcher", "task-cap", false)
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) && turnGateBlockedByPortal() {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if turnGateBlockedByPortal() {
+		t.Fatal("uncapped budget answer must re-open the gate")
+	}
+}
+
 // TestPortalTurnMeterDisabledWithoutEnv pins the fail-safe: with the env
 // contract unset, no meter is built and turns settle without any reporting.
 func TestPortalTurnMeterDisabledWithoutEnv(t *testing.T) {

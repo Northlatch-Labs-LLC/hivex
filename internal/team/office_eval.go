@@ -208,6 +208,7 @@ func RunOfficeEvals(dir string) (*OfficeEvalReport, error) {
 		{"dependency-handoff", evalJobDependencyHandoff},
 		{"turn-journal", evalJobTurnJournal},
 		{"turn-engine", evalJobTurnEngine},
+		{"entitlement-gate", evalJobEntitlementGate},
 		{"compounding-loop", evalJobCompoundingLoop},
 		{"completion-hook", evalJobCompletionHook},
 		{"human-sovereignty", evalJobHumanSovereignty},
@@ -327,6 +328,37 @@ func evalJobTurnEngine(fx *officeEvalFixture, r *OfficeEvalReport) error {
 	b.TurnSettle(id3, "duplicate close")
 	r.add(job, "meter fires exactly once per turn", metered == 1,
 		fmt.Sprintf("metered=%d", metered), "")
+
+	// 6. CEL policy rules: an operator rule lets a declared mutating
+	// capability proceed without a grant, deny beats allow+grant, and
+	// irreversible never consults rules.
+	rule, err := b.addPolicyRule(policyRule{
+		Expression: `agent == "eng" && capability == "memory.write"`,
+		Effect:     policyRuleEffectAllow,
+	})
+	if err != nil {
+		return err
+	}
+	d = b.EvaluateCapability("eng", "memory.write", "")
+	r.add(job, "cel rule allows a mutating capability",
+		d.Decision == "allow" && strings.Contains(d.Reason, rule.ID), d.Reason, "")
+	_, _ = b.addPolicyRule(policyRule{
+		Expression: `capability == "spend.authorize"`,
+		Effect:     policyRuleEffectAllow,
+	})
+	irr := b.EvaluateCapability("eng", "spend.authorize", "")
+	r.add(job, "cel rules never bypass the irreversible human gate",
+		irr.Decision == "approve" && strings.Contains(irr.Reason, "irreversible"), irr.Reason, "")
+	denyRule, err := b.addPolicyRule(policyRule{
+		Expression: `capability == "memory.write"`,
+		Effect:     policyRuleEffectDeny,
+	})
+	if err != nil {
+		return err
+	}
+	denied := b.EvaluateCapability("eng", "memory.write", "")
+	r.add(job, "cel deny beats allow",
+		denied.Decision == "approve" && strings.Contains(denied.Reason, denyRule.ID), denied.Reason, "")
 	return nil
 }
 
@@ -334,6 +366,64 @@ func evalJobTurnEngine(fx *officeEvalFixture, r *OfficeEvalReport) error {
 type meterFunc func(bot, taskID string, failed bool)
 
 func (f meterFunc) MeterTurn(bot, taskID string, failed bool) { f(bot, taskID, failed) }
+
+// evalJobEntitlementGate: the portal-linked entitlement layer holds its
+// contract — the token scheme is pinned to the portal's exact wire format,
+// the cap gate is fail-open without a report, a capped meter report pauses
+// new turns (and an uncapped one re-opens), and the upgrade notice posts
+// exactly once per cooldown. No LLM calls, no portal dependency — the
+// fixture drives the same seams the launcher does in production.
+func evalJobEntitlementGate(fx *officeEvalFixture, r *OfficeEvalReport) error {
+	b := fx.broker
+	job := "entitlement-gate"
+	defer func() {
+		resetPortalTurnBudgetForTests()
+		resetTurnCapNoticeForTests()
+	}()
+
+	// 1. Token scheme: a portal-format token verifies; a wrong key fails.
+	const key = "eval-entitlement-key"
+	payload := map[string]any{
+		"account": "acc-eval", "tier": "monthly", "turn_cap_monthly": nil,
+		"provider_locked": true, "issued_at": time.Now().Unix(),
+		"exp": time.Now().Add(time.Hour).Unix(),
+	}
+	token, err := signEntitlementToken(payload, key)
+	if err != nil {
+		return err
+	}
+	verified, err := verifyEntitlementToken(token, key, time.Now())
+	pass := err == nil && verified.Tier == "monthly" && verified.ProviderLocked && verified.UncappedTurns()
+	r.add(job, "portal entitlement token verifies (tier + provider lock)", pass, fmt.Sprintf("err=%v", err), "")
+	if _, err := verifyEntitlementToken(token, "wrong-key", time.Now()); err == nil {
+		r.add(job, "wrong signing key is rejected", false, "", "")
+	} else {
+		r.add(job, "wrong signing key is rejected", true, "", "")
+	}
+
+	// 2. The cap gate is fail-open with no meter report.
+	resetPortalTurnBudgetForTests()
+	r.add(job, "cap gate is fail-open without a meter report",
+		!turnGateBlockedByPortal(), "", "")
+
+	// 3. A capped meter report arms the gate; an uncapped one re-opens it.
+	cap := int64(1000)
+	recordPortalTurnBudget(&portalTurnBudget{Used: 1000, Cap: &cap, Capped: true, At: time.Now()})
+	r.add(job, "capped meter report pauses new turns",
+		turnGateBlockedByPortal(), "", "")
+	recordPortalTurnBudget(&portalTurnBudget{Used: 5, Cap: &cap, Capped: false, At: time.Now()})
+	r.add(job, "uncapped meter report re-opens the gate",
+		!turnGateBlockedByPortal(), "", "")
+
+	// 4. The upgrade notice posts exactly once per cooldown.
+	resetTurnCapNoticeForTests()
+	before := len(b.messages)
+	postTurnCapGateNotice(b, "eng")
+	postTurnCapGateNotice(b, "eng")
+	r.add(job, "cap notice posts exactly once per cooldown",
+		len(b.messages) == before+1, "", "")
+	return nil
+}
 
 // evalJobLifecycleBasic: a task created with an owner can be completed by
 // that owner and lands in a done status with dependents' bookkeeping intact.
