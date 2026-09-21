@@ -51,19 +51,19 @@ export const APP_LABELS: Record<AppPanelId | FirstClassAppId, string> = {
   // First-class surfaces (live at dedicated routes, not `/apps/$id`).
   wiki: "Wiki",
   inbox: "Inbox",
-  tasks: "Tasks",
+  tasks: "Task Board",
   agents: "Bots",
   // Routed app panels under `/apps/$appId`. The `activity` id keeps its
   // historical slug so existing /apps/activity URLs still resolve; the
   // human-facing label is "Dashboard" (renamed in #1002). The `calendar`
   // entry is intentionally dropped — Routines replaces it.
-  activity: "Dashboard",
-  graph: "Graph",
-  "health-check": "Access & Health",
+  activity: "Activity",
+  graph: "Team Graph",
+  "health-check": "Health",
   integrations: "Integrations",
   policies: "Policies",
   requests: "Requests",
-  routines: "Scheduled Tasks",
+  routines: "Automations",
   settings: "Settings",
   skills: "Skills",
 };

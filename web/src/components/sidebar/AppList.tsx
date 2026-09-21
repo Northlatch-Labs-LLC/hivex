@@ -65,10 +65,10 @@ const NAV_SECTIONS: ReadonlyArray<{
     label: "Work",
     items: ["tasks", "routines", "activity"],
   },
-  { label: "Knowledge", items: ["wiki", "graph"] },
+  { label: "Build", items: ["agents", "skills", "integrations", "graph", "wiki"] },
   {
-    label: "Config",
-    items: ["agents", "policies", "skills", "integrations", "health-check"],
+    label: "Govern",
+    items: ["policies", "health-check"],
   },
 ];
 

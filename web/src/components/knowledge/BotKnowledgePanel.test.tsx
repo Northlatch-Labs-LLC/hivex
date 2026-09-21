@@ -185,12 +185,13 @@ describe("AgentKnowledgePanel", () => {
   it("answers the approval by request id", async () => {
     mockPending("# Beet rotation\n\nFour year cycle, then clover.\n");
     post.mockResolvedValue({ ok: true });
-    const { findByRole, findByText } = wrap(
+    const { findByRole, findAllByText } = wrap(
       <BotKnowledgePanel agentSlug="dwight" />,
     );
     // The approve button only enables once the snapshot is on screen — a human
-    // cannot approve a page they have not been shown.
-    await findByText(/Four year cycle, then clover\./);
+    // cannot approve a page they have not been shown. findAllByText: the
+    // snapshot legitimately renders twice (raw request context + preview).
+    await findAllByText(/Four year cycle, then clover\./);
     fireEvent.click(
       await findByRole("button", { name: /approve this promotion/i }),
     );

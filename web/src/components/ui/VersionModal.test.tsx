@@ -63,7 +63,7 @@ describe("<VersionModal>", () => {
       </Wrapper>,
     );
 
-    const dialog = screen.getByRole("dialog", { name: "hivebot version" });
+    const dialog = screen.getByRole("dialog", { name: "Hivex version" });
     expect(dialog.getAttribute("aria-modal")).toBe("true");
     expect(dialog.getAttribute("aria-labelledby")).toBe("version-modal-title");
     expect(dialog.classList.contains("version-modal")).toBe(true);
