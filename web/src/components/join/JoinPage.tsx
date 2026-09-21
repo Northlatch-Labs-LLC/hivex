@@ -41,7 +41,7 @@ async function callSubmitJoinInvite(
     // Treat it as a generic network failure so the joiner can retry.
     const message =
       err instanceof Error && err.message
-        ? `Could not reach hivebot: ${err.message}`
+        ? `Could not reach the Hivex office: ${err.message}`
         : "Something went wrong submitting the invite. Try again.";
     setStatus({ kind: "error", code: "network", message });
     return null;
@@ -164,7 +164,7 @@ export function JoinPage({ token, onAccepted }: JoinPageProps) {
   return (
     <JoinShell>
       <p className="join-eyebrow">Team member invite</p>
-      <h1 className="join-heading">Join this hivebot office</h1>
+      <h1 className="join-heading">Join this Hivex office</h1>
       <p className="join-copy">
         Pick the name your teammate should see in messages, requests, and office
         activity. hivebot will not share the host's broker token with this

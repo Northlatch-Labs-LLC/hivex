@@ -234,7 +234,7 @@ export function VersionModal({ open, onClose }: VersionModalProps) {
         <header className="help-header">
           <div>
             <h2 id={VERSION_MODAL_TITLE_ID} className="help-title">
-              hivebot version
+              Hivex version
             </h2>
             <p className="help-subtitle">
               See what's running, force a reinstall, or restart the broker.
