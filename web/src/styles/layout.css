@@ -416,6 +416,10 @@ html[data-theme="hive"]
   font-size: 22px;
   letter-spacing: -0.01em;
   cursor: pointer;
+  /* Mark + wordmark on one line; the mark rides the text baseline. */
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
   /* Renders as the home button — reset native button chrome, keep the
      logo type styling above. */
   background: none;
@@ -424,6 +428,11 @@ html[data-theme="hive"]
   margin: 0;
   color: inherit;
   text-align: left;
+}
+.sidebar-logo img {
+  width: 22px;
+  height: 22px;
+  flex: none;
 }
 .sidebar-logo:hover {
   opacity: 0.85;
