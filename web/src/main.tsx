@@ -116,5 +116,5 @@ try {
   showFatalError("React failed to mount", `${message}\n\n${stack}`);
   window.__hivexBootDone?.();
   // eslint-disable-next-line no-console
-  console.error("[hivebot boot]", err);
+  console.error("[hivex boot]", err);
 }

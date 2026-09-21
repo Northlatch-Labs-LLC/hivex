@@ -96,10 +96,10 @@ export function Sidebar() {
               className="sidebar-logo"
               onClick={() => router.navigate({ to: "/" })}
               title="Home"
-              aria-label="hivebot — go to home"
+              aria-label="Hivex — go to home"
             >
               <img src="/hive-mark.svg" alt="" width={22} height={22} />
-              <span>hivebot</span>
+              <span>Hivex</span>
             </button>
             <TeamMemberBadge />
             <div className="sidebar-header-actions">
