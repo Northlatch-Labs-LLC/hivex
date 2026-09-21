@@ -580,6 +580,20 @@ html[data-theme="hive"]
   flex: 1;
   min-width: 0;
   text-align: left;
+  /* Developer-console micro-label: mono, uppercase, tracked — the section
+     titles read as terminal chrome, not prose. */
+  font-family: var(
+    --font-mono,
+    ui-monospace,
+    "SF Mono",
+    Menlo,
+    Consolas,
+    monospace
+  );
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
 }
 .sidebar-section-actions {
   display: flex;
