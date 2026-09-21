@@ -176,7 +176,14 @@ func normalizeMetadata(s string) string {
 		}
 		out = append(out, c)
 	}
-	return string(out)
+	normalized := string(out)
+	// Wire-compat alias: pre-rebrand installs still present the retired
+	// device family name; the OpenClaw gateway's v3 contract (gateway/
+	// device-auth.ts) only knows the wire identifier "hivex".
+	if normalized == "wuphf" {
+		return "hivex"
+	}
+	return normalized
 }
 
 func isASCIISpace(b byte) bool {
