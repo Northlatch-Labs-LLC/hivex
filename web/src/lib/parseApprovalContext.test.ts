@@ -20,7 +20,7 @@ const fullContext = `Why: Sending a welcome note to a new user.
 What this will do:
 • To: alex@northlatch.example
 • Subject: Welcome to Hive
-• Body: Hi Alex, welcome aboard! Looking forward to working with you. -Nazz
+• Body: Hi Alex, welcome aboard! Looking forward to working with you. -Team
 
 Action: GMAIL_SEND_EMAIL via Gmail
 Channel: #general`;
@@ -44,7 +44,7 @@ describe("parseApprovalContext / cross-side contract", () => {
       "Welcome to Hive",
     );
     expect(parsed.details.find((d) => d.label === "Body")?.value).toBe(
-      "Hi Alex, welcome aboard! Looking forward to working with you. -Nazz",
+      "Hi Alex, welcome aboard! Looking forward to working with you. -Team",
     );
     expect(parsed.footer.action).toBe("GMAIL_SEND_EMAIL via Gmail");
     expect(parsed.footer.account).toBeNull();
@@ -64,7 +64,7 @@ describe("parseApprovalContext", () => {
       {
         label: "Body",
         value:
-          "Hi Alex, welcome aboard! Looking forward to working with you. -Nazz",
+          "Hi Alex, welcome aboard! Looking forward to working with you. -Team",
         truncated: false,
       },
     ]);
