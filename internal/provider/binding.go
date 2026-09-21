@@ -24,6 +24,14 @@ const (
 	KindMLXLM  = "mlx-lm"
 	KindOllama = "ollama"
 	KindExo    = "exo"
+	// KindHiveAPI is the product's own inference distributor — the HiveAPI
+	// Gateway (the same deployment the customer portal sells). OpenAI-
+	// compatible; auth via HIVEX_HIVEAPI_API_KEY (one of the account's
+	// gateway keys). The model is operator-chosen from the gateway's
+	// catalog: HIVEX_HIVEAPI_MODEL (or config provider_endpoints) — there
+	// is deliberately no default model because the catalog depends on the
+	// operator's upstream providers.
+	KindHiveAPI = "hiveapi"
 )
 
 // ProviderBinding is the per-bot runtime selection persisted on an office
@@ -74,11 +82,11 @@ func ValidateKind(s string) error {
 	switch s {
 	case "",
 		KindClaudeCode, KindCodex, KindOpencode, KindOpenclaw, KindOpenclawHTTP, KindHermesBot,
-		KindSlack, KindMLXLM, KindOllama, KindExo:
+		KindSlack, KindMLXLM, KindOllama, KindExo, KindHiveAPI:
 		return nil
 	default:
-		return fmt.Errorf("unknown provider kind %q (valid: %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, or empty)",
-			s, KindClaudeCode, KindCodex, KindOpencode, KindOpenclaw, KindOpenclawHTTP, KindHermesBot, KindSlack, KindMLXLM, KindOllama, KindExo)
+		return fmt.Errorf("unknown provider kind %q (valid: %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, or empty)",
+			s, KindClaudeCode, KindCodex, KindOpencode, KindOpenclaw, KindOpenclawHTTP, KindHermesBot, KindSlack, KindMLXLM, KindOllama, KindExo, KindHiveAPI)
 	}
 }
 
