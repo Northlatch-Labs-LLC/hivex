@@ -98,7 +98,8 @@ export function Sidebar() {
               title="Home"
               aria-label="hivebot — go to home"
             >
-              hivebot
+              <img src="/hive-mark.svg" alt="" width={22} height={22} />
+              <span>hivebot</span>
             </button>
             <TeamMemberBadge />
             <div className="sidebar-header-actions">
