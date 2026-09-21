@@ -271,3 +271,37 @@ func resetTurnCapNoticeForTests() {
 	defer turnCapNoticeMu.Unlock()
 	turnCapNoticeLast = time.Time{}
 }
+
+// postProviderLockNotice reports a refused non-gateway turn into the office
+// feed (rate-limited like the cap notice) so a mis-bound bot is visible to
+// the operator, not silently parked.
+var (
+	providerLockNoticeMu   sync.Mutex
+	providerLockNoticeLast time.Time
+)
+
+const providerLockNoticeCooldown = 10 * time.Minute
+
+func postProviderLockNotice(b *Broker, slug, kind string) {
+	providerLockNoticeMu.Lock()
+	if time.Since(providerLockNoticeLast) < providerLockNoticeCooldown {
+		providerLockNoticeMu.Unlock()
+		return
+	}
+	providerLockNoticeLast = time.Now()
+	providerLockNoticeMu.Unlock()
+	if b == nil {
+		return
+	}
+	_, _, _ = b.PostAutomationMessage(
+		"hive", "", "Provider lock",
+		fmt.Sprintf("The account's plan pins inference to the Hivex Gateway, but %s is bound to %q. Rebind the bot to the hiveapi runtime to resume turns.", slug, kind),
+		"", "", "", nil, "",
+	)
+}
+
+func resetProviderLockNoticeForTests() {
+	providerLockNoticeMu.Lock()
+	defer providerLockNoticeMu.Unlock()
+	providerLockNoticeLast = time.Time{}
+}
