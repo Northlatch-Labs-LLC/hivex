@@ -29,7 +29,7 @@ Plan: `docs/plans/production-delivery-v2.md`. All numbers below were produced by
 
 ## Pre-existing vitest failures — triaged, not ours
 
-105 failures in 27 files, stable across S2 stash baselines (identical pre/post our edits). Categories: 57 AssertionError (upstream translator/kiro/cursor corpora asserting behavior the source has since changed), 4 network-dependent fetch failures, 2 timeouts, remainder assertion-level. One mechanical cause found and fixed: orphan `tests/unit/embeddings.cloud.test.js` imported a `cloud/` workspace absent from this tree — pruned. Recommendation: upstream test-corpus refresh is a separate slice; no product code implicated.
+105 failures in 27 files, stable across S2 stash baselines (identical pre/post our edits). Categories: 57 AssertionError (upstream translator/kiro/cursor corpora asserting behavior the source has since changed), 4 network-dependent fetch failures, 2 timeouts, remainder assertion-level. One mechanical cause found and fixed: orphan `tests/unit/embeddings.cloud.test.js` imported a `cloud/` workspace absent from this tree — pruned. Second config fix: four `node:test`-based files excluded from vitest collection (zero-suite file failures; verified runnable under `node --test`). Test-level counts unchanged by both. Recommendation: upstream test-corpus refresh is a separate slice; no product code implicated.
 
 ## Watch-items
 - internal/team suite flaked once (2026-09-21, under heavy parallel load); clean in 3 subsequent full runs. Documented in TESTING-WIKI.
