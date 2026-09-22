@@ -70,7 +70,7 @@ func TestBuildDeviceAuthPayloadV3WireFormat(t *testing.T) {
 		Token:        "tok",
 		Nonce:        "n1",
 		Platform:     " DARWIN ",
-		DeviceFamily: "WUPHF",
+		DeviceFamily: "HIVEX",
 	}))
 	want := "v3|abc123|gateway-client|backend|operator|operator.admin,operator.read|1776254522461|tok|n1|darwin|hivex"
 	if got != want {
