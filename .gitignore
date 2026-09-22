@@ -124,3 +124,6 @@ hivebot-testdrive.log
 
 # Compiled main binary (build artifact — do not commit)
 /hivebot
+
+# Harness tooling (dynamic-workflow scripts under .zcode/) — not product code
+/.zcode/
