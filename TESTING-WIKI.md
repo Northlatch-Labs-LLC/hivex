@@ -63,6 +63,8 @@ With `-race`:
 go test ./internal/team/... -run "TestE2EWiki" -race -count=1 -timeout 120s
 ```
 
+Known flake watch: `internal/team` failed **once** under heavy parallel load (2026-09-21, clean on immediate rerun; see carried-over state in `docs/plans/production-delivery-v2.md`). Not reproducible since: `go test ./internal/team -count=1 -parallel 64` → `ok ... 207.512s` (2026-09-22). If it recurs, capture the `--- FAIL` test names before rerunning rather than blind-fixing.
+
 ### Web (Vitest + React Testing Library)
 
 ```bash
