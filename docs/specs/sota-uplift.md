@@ -1,7 +1,7 @@
 # Spec — SOTA Uplift: Compounding, Coordination, Outcomes
 
 **Status:** ACTIVE — master tracker for the SOTA uplift lane
-**Author:** Najmuzzaman + Claude, 2026-06-09
+**Author:** Northlatch Labs + Claude, 2026-06-09
 **Source analysis:** 30-bot gap analysis vs SOTA (Anthropic multi-bot research system, Cognition/Devin, LangGraph/OpenAI Bots SDK/Magentic-One, Letta/Mem0/ACE/Voyager, Codex/Cursor/Factory). 14 claims adversarially verified against `main@b9d0c878`.
 **Supersedes:** the sequencing of the 2026-06-09 multi-bot overhaul plan. Its Phase 1 (chat-only tasks, PR #1052) lands independently; its Phases 2–4 are absorbed below (U3.4, U5.1).
 

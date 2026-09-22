@@ -1,7 +1,7 @@
 # Issue Execution Loop — Spec
 
 **Status:** Draft, in active build (2026-05-26)
-**Owner:** Najmuzzaman
+**Owner:** Northlatch Labs
 **Branch:** `mvp/v3-architecture-shape`
 
 ## North star

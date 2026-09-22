@@ -1,7 +1,7 @@
 # Spec — The Core Loop (v4): Subtraction-First Rebuild
 
 **Status:** ACTIVE — supersedes `sota-uplift.md` phasing (its shipped substrate — verification gate, context assembler, turn journal, auto-distill, eval harness — is the foundation this builds on). Supersedes all spec/plan-mode/skill-proposal surfaces.
-**Author:** Najmuzzaman (directive) + Claude (decisions), 2026-06-10
+**Author:** Northlatch Labs (directive) + Claude (decisions), 2026-06-10
 **Doctrine:** Everything that does not support the core loop is waste. Remove those surfaces from FE and BE. The system stays super focused on delivering this one loop excellently.
 
 ▶ **RESUME HERE (2026-06-12 ~01:00): 10/10 INVENTORY CLOSED — eval suite 145/145.** Round-2 fixes 1-3 + all six ten-out-of-ten waves (A task-integrity, B knowledge, C surface-honesty, D scheduler-truth, E human-boundary, F platform) shipped and integrated on PR #1062 (tip 9baf69c9). Key root causes: decision path never queued distillation (empty graph); ObsidianWatcher echo loop (= human attribution + commit storms); CEO not a coding bot → host-repo cwd; DoD checks in process cwd (false-pass); GET /tasks shallow-copy race (4 races proven); office-wide interview wake-drop. HONEST DEFERRALS (Wave F): git worktree subprocesses still under b.mu in MutateTask (the 4.5-min create hold — needs own slice), decision-packet write under lock (TODO'd). v4 LIVE RE-RUN: next action (protocol core-loop-icp-eval.md; baselines 5/5.5/6; artifacts .icp-eval/v4/). Then: PR screenshots + ready.
