@@ -10,7 +10,7 @@ rebrand, portal/commerce, SDK/MCP; see `git log` 2026-09-20). One product, three
 ## Carried-over state (mid-flight from previous session — verified green 2026-09-21)
 
 Uncommitted working tree, all coherent and test-green:
-- `identity.go` + tests: final wuphf residue purge (alias removed; test pin updated to HIVEX).
+- `identity.go` + tests: final residue purge of the retired pre-rebrand device-family alias (alias removed; test pin updated to HIVEX).
 - Slack test fixtures: personal-name purge (fictional persona now "Ada Okafor").
 - `docs/specs/*`: author → Northlatch Labs.
 - `9router` gitlink at f5fd41f (gateway admin consolidation) — needs pointer commit.
@@ -21,7 +21,7 @@ Uncommitted working tree, all coherent and test-green:
 ## Slices (agile: each = build → gate → commit; one build agent at a time)
 
 **S0 Reconcile the tree.** Commit the carried-over edits; remove `apps/9router` gitlink + dir; commit wiki runtime edits; record baseline (build/vet/lint/tests).
-Gate: `go build ./...`, `go vet ./...`, `go test ./internal/openclaw/ ./internal/team/`, residue greps (wuphf|najmuzzaman) = 0.
+Gate: `go build ./...`, `go vet ./...`, `go test ./internal/openclaw/ ./internal/team/`, residue greps (retired brand name | old personal name) = 0.
 
 **S1 Customer-facing web app (replaces the demo).** Rebuild `9router/src/app/landing/` into the real Hive storefront in the Hivex idiom (terminal-shell tokens from `164a1cd`: JetBrains Mono + Inter, amber #FFD44F/#FF9330 on charcoal #0A0F18, dot-grid, micro-labels): honest product story (Harness / Gateway / Portal), live pricing (Free / $49 Monthly / Business contact — verbatim strings only), CTAs wired to real routes (`/portal/signup`, `/portal/pricing`), SEO + mobile.
 Gate: `npm run lint` + `npx vitest run` in 9router, build green, dead-link check = 0.
@@ -29,7 +29,7 @@ Gate: `npm run lint` + `npx vitest run` in 9router, build green, dead-link check
 **S2 Gateway redesign in the Hivex idiom.** Complete the terminal-shell pass across operator dashboard surfaces and portal pages (consolidated theme tokens, mono micro-labels, status LEDs, WCAG AA), keeping function untouched.
 Gate: 9router lint + baseline tests green; portal regression (95/95) green.
 
-**S3 Harness hardening + residue.** Replace onboarding media that still shows "wuphf" in pixels (`web/public/media/onboarding/` — regenerate brand-correct or clean stills); code-quality audit per `docs/CODE-QUALITY.md` on touched modules; office evals green.
+**S3 Harness hardening + residue.** Replace onboarding media that still shows the pre-rebrand name in pixels (`web/public/media/onboarding/` — regenerate brand-correct or clean stills); code-quality audit per `docs/CODE-QUALITY.md` on touched modules; office evals green.
 Gate: `go test` critical packages, office evals, `bunx tsc --noEmit` + `bun run build` in `web/`.
 
 **S4 Final production matrix.** Full gate across all layers + residue greps + delivery report (what shipped, what is user-provisioned: Stripe `whsec_…`, hosting token).
