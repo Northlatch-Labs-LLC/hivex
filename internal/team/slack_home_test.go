@@ -103,7 +103,7 @@ func TestSlackHomeTabWithoutWebURL(t *testing.T) {
 // linked title, group tag, and a teaser snippet from the article body.
 func TestSlackWikiIndexParsingAndPreviewCards(t *testing.T) {
 	md := "# Team wiki index\n\n_Auto-generated._\n## team/people\n\n" +
-		"- [Nazz](../team/people/nazz.md) _(updated 2026-06-12T20:19:50Z)_\n" +
+		"- [Ada](../team/people/ada.md) _(updated 2026-06-12T20:19:50Z)_\n" +
 		"- [Hermes](../team/people/hermes.md) _(updated 2026-06-12T20:19:50Z)_\n" +
 		"## team/playbooks\n\n" +
 		"- [Billing](../team/playbooks/billing.md) _(updated 2026-06-13T00:00:00Z)_\n"
@@ -112,7 +112,7 @@ func TestSlackWikiIndexParsingAndPreviewCards(t *testing.T) {
 	if len(entries) != 3 {
 		t.Fatalf("want 3 entries, got %d: %+v", len(entries), entries)
 	}
-	if entries[0].Group != "team/people" || entries[0].Label != "Nazz" || entries[0].Path != "team/people/nazz.md" {
+	if entries[0].Group != "team/people" || entries[0].Label != "Ada" || entries[0].Path != "team/people/ada.md" {
 		t.Fatalf("first entry parsed wrong: %+v", entries[0])
 	}
 	if entries[0].Updated != "2026-06-12T20:19:50Z" {
@@ -135,8 +135,8 @@ func TestSlackWikiIndexParsingAndPreviewCards(t *testing.T) {
 	write("team/playbooks/billing.md",
 		"---\ntitle: Billing\n---\n\n# Billing\n\nReconcile invoices monthly and flag any mismatched ledger entries before close.[^1]\n\n[^1]: recorded by system.\n")
 	// A generated entity article (frontmatter fact count + Observations).
-	write("team/people/nazz.md",
-		"---\nlast_synthesized_ts: 2026-06-12T20:19:50Z\nfact_count_at_synthesis: 4\n---\n\n# Nazz\n\nNazz is a person in the team knowledge graph, with 4 recorded facts.\n\n## Observations\n\n- Full name: Najmuzzaman Mohammad.[^1]\n- Timezone: Europe/Amsterdam.[^2]\n")
+	write("team/people/ada.md",
+		"---\nlast_synthesized_ts: 2026-06-12T20:19:50Z\nfact_count_at_synthesis: 4\n---\n\n# Ada\n\nAda is a person in the team knowledge graph, with 4 recorded facts.\n\n## Observations\n\n- Full name: Ada Okafor.[^1]\n- Timezone: Europe/Amsterdam.[^2]\n")
 
 	// Fixed clock: Billing (06-13) is hours old, the people articles (06-12)
 	// are ~a day old — both inside the 48h New window.
@@ -162,23 +162,23 @@ func TestSlackWikiIndexParsingAndPreviewCards(t *testing.T) {
 
 	// The entity card surfaces the fact count + concrete observations, NOT the
 	// "in the team knowledge graph" boilerplate intro.
-	var nazz string
+	var ada string
 	for _, c := range cards {
-		if strings.Contains(c, "|Nazz>") {
-			nazz = c
+		if strings.Contains(c, "|Ada>") {
+			ada = c
 		}
 	}
-	if nazz == "" {
-		t.Fatalf("no Nazz card rendered: %+v", cards)
+	if ada == "" {
+		t.Fatalf("no Ada card rendered: %+v", cards)
 	}
-	if !strings.Contains(nazz, "4 facts") {
-		t.Fatalf("entity card missing fact count: %q", nazz)
+	if !strings.Contains(ada, "4 facts") {
+		t.Fatalf("entity card missing fact count: %q", ada)
 	}
-	if !strings.Contains(nazz, "Najmuzzaman Mohammad") || !strings.Contains(nazz, "Europe/Amsterdam") {
-		t.Fatalf("entity card missing observation teaser: %q", nazz)
+	if !strings.Contains(ada, "Ada Okafor") || !strings.Contains(ada, "Europe/Amsterdam") {
+		t.Fatalf("entity card missing observation teaser: %q", ada)
 	}
-	if strings.Contains(nazz, "knowledge graph") {
-		t.Fatalf("entity card leaked the boilerplate intro: %q", nazz)
+	if strings.Contains(ada, "knowledge graph") {
+		t.Fatalf("entity card leaked the boilerplate intro: %q", ada)
 	}
 
 	// Old article: outside the New window, no badge.

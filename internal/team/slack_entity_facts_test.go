@@ -24,9 +24,9 @@ func newEntitySyncFixture(t *testing.T) (*SlackTransport, *Broker, *Repo, *fakeS
 	api := newFakeSlackAPI()
 	api.users["U1HUMAN"] = &slack.User{
 		ID:      "U1HUMAN",
-		Name:    "naj",
+		Name:    "ada",
 		TZ:      "America/Los_Angeles",
-		Profile: slack.UserProfile{DisplayName: "Naj Mohammad", RealName: "Najmuzzaman Mohammad", Title: "Founder"},
+		Profile: slack.UserProfile{DisplayName: "Ada Okafor", RealName: "Ada Okafor", Title: "Founder"},
 	}
 	api.users["U2STRAYBOT"] = &slack.User{
 		ID: "U2STRAYBOT", IsBot: true,
@@ -71,11 +71,11 @@ func TestSlackEntityFactSyncBuildsPeopleArticles(t *testing.T) {
 	tr.syncEntityFactsOnce(context.Background())
 
 	// Human: profile facts + presence.
-	human := readEntityArticle(t, repo, "naj-mohammad")
+	human := readEntityArticle(t, repo, "ada-okafor")
 	for _, want := range []string{
 		"Human teammate on Slack",
 		"U1HUMAN",
-		"Najmuzzaman Mohammad",
+		"Ada Okafor",
 		"Founder",
 		"America/Los_Angeles",
 		`office channel "slack-general"`,
@@ -118,7 +118,7 @@ func TestSlackEntityFactSyncIsIdempotent(t *testing.T) {
 	defer teardown()
 
 	tr.syncEntityFactsOnce(context.Background())
-	factsPath := filepath.Join(repo.Root(), FactLogPath(EntityKindPeople, "naj-mohammad"))
+	factsPath := filepath.Join(repo.Root(), FactLogPath(EntityKindPeople, "ada-okafor"))
 	first, err := os.ReadFile(factsPath)
 	if err != nil {
 		t.Fatalf("read facts: %v", err)
