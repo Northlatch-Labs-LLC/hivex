@@ -22,6 +22,7 @@ package team
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"strings"
 	"sync"
@@ -243,7 +244,9 @@ func (b *Broker) handlePolicyRules(w http.ResponseWriter, r *http.Request) {
 		out := append([]policyRule(nil), b.policyRules...)
 		b.mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{"rules": out})
+		if err := json.NewEncoder(w).Encode(map[string]any{"rules": out}); err != nil {
+			log.Printf("broker: encode policy rules response: %v", err)
+		}
 	case http.MethodPost:
 		var body struct {
 			Action     string `json:"action"`

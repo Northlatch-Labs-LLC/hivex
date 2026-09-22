@@ -32,6 +32,7 @@ package team
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -294,7 +295,9 @@ func (b *Broker) handlePolicyGrants(w http.ResponseWriter, r *http.Request) {
 		}
 		b.mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{"grants": out})
+		if err := json.NewEncoder(w).Encode(map[string]any{"grants": out}); err != nil {
+			log.Printf("broker: encode policy grants response: %v", err)
+		}
 	case http.MethodPost:
 		var body struct {
 			Action     string `json:"action"`
