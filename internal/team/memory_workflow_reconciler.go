@@ -2,6 +2,7 @@ package team
 
 import (
 	"context"
+	"log"
 	"reflect"
 	"strings"
 	"time"
@@ -160,7 +161,9 @@ func (b *Broker) startMemoryWorkflowReconcilerLoop(ctx context.Context) {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				_, _ = b.ReconcileMemoryWorkflows(ctx)
+				if _, err := b.ReconcileMemoryWorkflows(ctx); err != nil {
+					log.Printf("broker: memory workflow reconcile failed: %v", err)
+				}
 			}
 		}
 	}()

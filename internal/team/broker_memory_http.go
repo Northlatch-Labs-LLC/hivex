@@ -2,6 +2,7 @@ package team
 
 import (
 	"encoding/json"
+	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -43,10 +44,12 @@ func (b *Broker) handleMemory(w http.ResponseWriter, r *http.Request) {
 				if raw, ok := entries[keyFilter]; ok {
 					payload = append(payload, brokerEntryFromNote(decodePrivateMemoryNote(keyFilter, raw)))
 				}
-				_ = json.NewEncoder(w).Encode(map[string]any{
+				if err := json.NewEncoder(w).Encode(map[string]any{
 					"namespace": namespace,
 					"entries":   payload,
-				})
+				}); err != nil {
+					log.Printf("broker: encode memory entries response: %v", err)
+				}
 				return
 			case query != "":
 				matches := searchPrivateMemory(entries, query, limit)
@@ -54,10 +57,12 @@ func (b *Broker) handleMemory(w http.ResponseWriter, r *http.Request) {
 				for _, note := range matches {
 					payload = append(payload, brokerEntryFromNote(note))
 				}
-				_ = json.NewEncoder(w).Encode(map[string]any{
+				if err := json.NewEncoder(w).Encode(map[string]any{
 					"namespace": namespace,
 					"entries":   payload,
-				})
+				}); err != nil {
+					log.Printf("broker: encode memory entries response: %v", err)
+				}
 				return
 			default:
 				matches := searchPrivateMemory(entries, "", len(entries))
@@ -65,14 +70,18 @@ func (b *Broker) handleMemory(w http.ResponseWriter, r *http.Request) {
 				for _, note := range matches {
 					payload = append(payload, brokerEntryFromNote(note))
 				}
-				_ = json.NewEncoder(w).Encode(map[string]any{
+				if err := json.NewEncoder(w).Encode(map[string]any{
 					"namespace": namespace,
 					"entries":   payload,
-				})
+				}); err != nil {
+					log.Printf("broker: encode memory entries response: %v", err)
+				}
 				return
 			}
 		}
-		_ = json.NewEncoder(w).Encode(map[string]any{"memory": mem})
+		if err := json.NewEncoder(w).Encode(map[string]any{"memory": mem}); err != nil {
+			log.Printf("broker: encode memory response: %v", err)
+		}
 	case http.MethodPost:
 		var body struct {
 			Namespace string `json:"namespace"`
@@ -117,7 +126,9 @@ func (b *Broker) handleMemory(w http.ResponseWriter, r *http.Request) {
 		}
 		b.mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "namespace": ns, "key": key})
+		if err := json.NewEncoder(w).Encode(map[string]any{"ok": true, "namespace": ns, "key": key}); err != nil {
+			log.Printf("broker: encode memory write response: %v", err)
+		}
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
