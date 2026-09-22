@@ -3,7 +3,7 @@
 ## Status
 - Track: notebook-wiki-promise series (PR 8 of 8)
 - Type: Design pass, not implementation
-- Author: Najmuzzaman Mohammad
+- Author: Northlatch Labs
 - Date: 2026-05-06
 - Supersedes: original "5-line filter removal" framing in `~/.gstack/projects/northlatch-labs-llc-hivex/northlatch-main-design-20260505-131620-notebook-wiki-promise.md` (Build Order row for PR 8)
 

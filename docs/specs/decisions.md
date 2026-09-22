@@ -2,7 +2,7 @@
 
 **Status:** Sub-spec, implementation deferred to post-MVP follow-up.
 **Parent spec:** [`docs/specs/issue-execution-loop.md`](./issue-execution-loop.md) (Slice 5).
-**Owner:** Najmuzzaman
+**Owner:** Northlatch Labs
 **Branch:** `mvp/v3-architecture-shape`
 
 ## What this fixes
