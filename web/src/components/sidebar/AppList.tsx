@@ -63,12 +63,12 @@ const NAV_SECTIONS: ReadonlyArray<{
 }> = [
   {
     label: "Work",
-    items: ["tasks", "routines", "activity"],
+    items: ["tasks", "digest", "routines", "activity"],
   },
   { label: "Build", items: ["agents", "skills", "integrations", "graph", "wiki"] },
   {
     label: "Govern",
-    items: ["policies", "health-check"],
+    items: ["approvals", "board", "compliance", "policies", "health-check"],
   },
 ];
 
