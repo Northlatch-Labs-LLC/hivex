@@ -18,6 +18,7 @@ import (
 	"github.com/Northlatch-Labs-LLC/hivex/internal/channel"
 	"github.com/Northlatch-Labs-LLC/hivex/internal/config"
 	"github.com/Northlatch-Labs-LLC/hivex/internal/gbrain"
+	"github.com/Northlatch-Labs-LLC/hivex/internal/gridframe"
 	"github.com/Northlatch-Labs-LLC/hivex/internal/onboarding"
 	"github.com/Northlatch-Labs-LLC/hivex/internal/workspace"
 )
@@ -855,6 +856,14 @@ func (b *Broker) StartOnPort(port int) error {
 	mux.HandleFunc("/marketplace", b.requireAuth(b.handleMarketplaceCatalog))
 	mux.HandleFunc("/marketplace/install", b.requireAuth(b.handleMarketplaceInstall))
 	mux.HandleFunc("/marketplace/uninstall", b.requireAuth(b.handleMarketplaceUninstall))
+	// Gridframe Principal surface (G4): the company ledgers + approval gate.
+	// Seeded from the shipped reference ledgers; appended rows live in the
+	// broker until ledger persistence lands.
+	gfStore := gridframe.NewStore()
+	if err := gfStore.SeedStore(filepath.Join(config.RuntimeHomeDir(), "GRIDFRAME", "reference", "ledgers")); err != nil {
+		log.Printf("gridframe: seed ledgers unavailable: %v", err)
+	}
+	gridframe.RegisterRoutes(mux, gfStore, gridframe.NewGate(gfStore), b.requireAuth)
 	mux.HandleFunc("/v1/logs", b.requireAuth(b.handleOTLPLogs))
 	mux.HandleFunc("/events", b.handleEvents)
 	mux.HandleFunc("/agent-stream/", b.requireAuth(b.handleBotStream))
