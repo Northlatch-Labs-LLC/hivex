@@ -41,11 +41,47 @@ const (
 	boxSigninStatusDone          = "done"
 	boxSigninStatusError         = "error"
 
-	boxCLIDownloadBase = "https://ascii.dev/api/box/cli/download"
-	boxCLIChannel      = "ascii-prod"
-	boxInstallCommand  = "curl -fsSL https://ascii.dev/api/box/install | sh"
-	boxKeyName         = "hivebot"
+	// Compile-time defaults, used only when no env var is set; the
+	// resolvers below are read at call time so tests and stubs can point
+	// the Box backend anywhere (pattern: config.ResolveProviderEndpoint).
+	boxCLIDownloadDefault = "https://ascii.dev/api/box/cli/download"
+	boxInstallURLDefault   = "https://ascii.dev/api/box/install"
+	boxCLIChannel          = "ascii-prod"
+	boxKeyName             = "hivebot"
 )
+
+// boxCLIDownloadURL is where the CLI binary is fetched from:
+// HIVEX_BOX_CLI_DOWNLOAD_URL wins, else the compile-time default.
+func boxCLIDownloadURL() string {
+	if u := strings.TrimSpace(os.Getenv("HIVEX_BOX_CLI_DOWNLOAD_URL")); u != "" {
+		return u
+	}
+	return boxCLIDownloadDefault
+}
+
+// boxInstallURL is the piped-sh install endpoint surfaced to the person:
+// HIVEX_BOX_INSTALL_URL wins, else the compile-time default.
+func boxInstallURL() string {
+	if u := strings.TrimSpace(os.Getenv("HIVEX_BOX_INSTALL_URL")); u != "" {
+		return u
+	}
+	return boxInstallURLDefault
+}
+
+// boxInstallCommandText renders the copy-paste install command from the
+// resolved install URL, so it never carries a hardcoded host.
+func boxInstallCommandText() string {
+	return "curl -fsSL " + boxInstallURL() + " | sh"
+}
+
+// boxBaseURL is the provider API base handed to the CLI as BOX_API_URL:
+// HIVEX_BOX_BASE_URL wins, else the compile-time default.
+func boxBaseURL() string {
+	if u := strings.TrimSpace(os.Getenv("HIVEX_BOX_BASE_URL")); u != "" {
+		return u
+	}
+	return box.DefaultAPI
+}
 
 var (
 	boxInstallTimeout = 3 * time.Minute
@@ -124,7 +160,7 @@ func boxCommand(ctx context.Context, args ...string) (*exec.Cmd, error) {
 	full = append(full, "--json", "--no-update")
 	cmd := exec.CommandContext(ctx, bin, full...)
 	cmd.Env = composioCommandEnv(filepath.Dir(bin))
-	if api := strings.TrimSpace(os.Getenv("HIVEX_BOX_API_URL")); api != "" {
+	if api := boxBaseURL(); api != "" {
 		cmd.Env = append(cmd.Env, "BOX_API_URL="+api)
 	}
 	return cmd, nil
@@ -158,7 +194,7 @@ func defaultBoxInstaller(ctx context.Context) error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, boxCLIDownloadBase+"?platform="+platform+"&channel="+boxCLIChannel, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, boxCLIDownloadURL()+"?platform="+platform+"&channel="+boxCLIChannel, nil)
 	if err != nil {
 		return err
 	}
@@ -239,7 +275,7 @@ func (b *Broker) handleBoxSigninStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if _, ok := boxCLIBinary(); !ok {
-		flow.state = boxSigninState{Status: boxSigninStatusInstalling, InstallCommand: boxInstallCommand}
+		flow.state = boxSigninState{Status: boxSigninStatusInstalling, InstallCommand: boxInstallCommandText()}
 		flow.deadline = time.Now().Add(boxInstallTimeout + 30*time.Second)
 		state := flow.state
 		flow.mu.Unlock()
@@ -273,7 +309,7 @@ func (b *Broker) handleBoxSigninStatus(w http.ResponseWriter, r *http.Request) {
 	if state.Status == boxSigninStatusInstalling && !deadline.IsZero() && time.Now().After(deadline) {
 		flow.mu.Lock()
 		if flow.state.Status == boxSigninStatusInstalling {
-			flow.state = boxSigninState{Status: boxSigninStatusCLIMissing, InstallCommand: boxInstallCommand,
+			flow.state = boxSigninState{Status: boxSigninStatusCLIMissing, InstallCommand: boxInstallCommandText(),
 				Reason: "the Box CLI install is taking too long — run the install command shown, then try again"}
 		}
 		state = flow.state
@@ -354,7 +390,7 @@ func (b *Broker) boxSigninAutoInstall() {
 			if runErr != nil {
 				reason = "could not install the Box CLI: " + runErr.Error()
 			}
-			flow.state = boxSigninState{Status: boxSigninStatusCLIMissing, InstallCommand: boxInstallCommand, Reason: reason}
+			flow.state = boxSigninState{Status: boxSigninStatusCLIMissing, InstallCommand: boxInstallCommandText(), Reason: reason}
 		}
 		flow.mu.Unlock()
 		return
