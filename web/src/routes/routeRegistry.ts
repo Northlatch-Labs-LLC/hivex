@@ -18,6 +18,10 @@ export const FIRST_CLASS_APP_IDS = [
   "inbox",
   "tasks",
   "agents",
+  "digest",
+  "approvals",
+  "compliance",
+  "board",
 ] as const;
 export type FirstClassAppId = (typeof FIRST_CLASS_APP_IDS)[number];
 
@@ -54,6 +58,10 @@ export const APP_LABELS: Record<AppPanelId | FirstClassAppId, string> = {
   inbox: "Inbox",
   tasks: "Task Board",
   agents: "Bots",
+  digest: "Digest",
+  approvals: "Approvals",
+  compliance: "Compliance",
+  board: "Board",
   // Routed app panels under `/apps/$appId`. The `activity` id keeps its
   // historical slug so existing /apps/activity URLs still resolve; the
   // human-facing label is "Dashboard" (renamed in #1002). The `calendar`
@@ -82,6 +90,10 @@ const SIDEBAR_TOOL_EMOJIS: Partial<
   tasks: "✓",
   agents: "🤖",
   wiki: "📖",
+  digest: "📰",
+  approvals: "✍",
+  compliance: "⚖",
+  board: "📊",
   graph: "🕸",
   policies: "🛡",
   routines: "🔁",
@@ -119,6 +131,10 @@ export const SIDEBAR_TOOLS: readonly SidebarTool[] = [
   { id: "tasks", kind: "first-class" },
   { id: "agents", kind: "first-class" },
   { id: "wiki", kind: "first-class" },
+  { id: "digest", kind: "first-class" },
+  { id: "approvals", kind: "first-class" },
+  { id: "board", kind: "first-class" },
+  { id: "compliance", kind: "first-class" },
   { id: "graph", kind: "app-panel" },
   { id: "policies", kind: "app-panel" },
   { id: "routines", kind: "app-panel" },
