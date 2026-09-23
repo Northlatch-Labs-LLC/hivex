@@ -1492,3 +1492,108 @@ export function connectTelegramChannel(
 ) {
   return post<TelegramConnectResponse>("/telegram/connect", opts, { signal });
 }
+
+// ── Gridframe G4: Principal digest + approval decide (gridframe api.go) ──
+
+export interface GridframeDigestItem {
+  row: {
+    item_id: string;
+    raised_date: string;
+    dept: string;
+    raised_by: string;
+    description: string;
+    tier: string;
+    status: string;
+    approver: string;
+    decision_date: string;
+  };
+  cost_of_delay_usd: number;
+  escalated: boolean;
+}
+
+export interface GridframeDigest {
+  date: string;
+  artifact: string;
+  decisions: GridframeDigestItem[];
+  open_exceptions: { exc_id: string; severity: string; description: string }[];
+}
+
+export function getGridframeDigest(signal?: AbortSignal) {
+  return get<GridframeDigest>("/gridframe/digest", undefined, { signal });
+}
+
+export type GridframeDecision = "approve" | "reject" | "defer";
+
+export function postGridframeDecide(
+  itemId: string,
+  decision: GridframeDecision,
+  opts: { signers?: string[]; human?: boolean; reason?: string } = {},
+  signal?: AbortSignal,
+) {
+  return post<{ item_id: string; status: string }>(
+    "/gridframe/approvals/decide",
+    { item_id: itemId, decision, ...opts },
+    { signal },
+  );
+}
+
+// ── Gridframe G4: compliance timeline (gridframe api.go) ──
+
+export interface GridframeComplianceItem {
+  row: {
+    item_id: string;
+    due_date: string;
+    obligation: string;
+    authority: string;
+    owner: string;
+    status: string;
+    recurrence: string;
+    evidence_ref: string;
+  };
+  overdue: boolean;
+}
+
+export interface GridframeCompliance {
+  items: GridframeComplianceItem[];
+  open_exceptions: { exc_id: string; severity: string; description: string }[];
+}
+
+export function getGridframeCompliance(signal?: AbortSignal) {
+  return get<GridframeCompliance>("/gridframe/compliance", undefined, { signal });
+}
+
+// ── Gridframe G4: Board register tabs (gridframe api.go) ──
+
+export interface GridframeRegisterTable {
+  table: string;
+  /** §5.1 headers, byte-exact order. */
+  headers: string[];
+  rows: Record<string, string>[];
+}
+
+export const GRIDFRAME_REGISTER_TABLES = [
+  "approval-queue",
+  "revenue-ledger",
+  "cost-ledger",
+  "exception-log",
+  "aei-monthly",
+] as const;
+export type GridframeRegisterTableName = (typeof GRIDFRAME_REGISTER_TABLES)[number];
+
+export function getGridframeRegister(table: GridframeRegisterTableName, signal?: AbortSignal) {
+  return get<GridframeRegisterTable>(`/gridframe/register/${table}`, undefined, { signal });
+}
+
+export function postGridframeRegisterRow(
+  table: GridframeRegisterTableName,
+  values: Record<string, string>,
+  opts: { reverse_of?: string } = {},
+  signal?: AbortSignal,
+) {
+  return post<unknown>(`/gridframe/register/${table}/rows`, { values, ...opts }, { signal });
+}
+
+/** Fetch a register's CSV (byte parity with §5.1 seeds) as a Blob. */
+export function getGridframeExport(table: GridframeRegisterTableName, signal?: AbortSignal) {
+  return getBlob(`/gridframe/register/${table}/export`, { signal });
+}

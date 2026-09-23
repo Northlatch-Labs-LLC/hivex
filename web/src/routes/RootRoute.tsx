@@ -191,6 +191,29 @@ const SkillDetailRoute = lazy(() =>
     default: m.SkillDetailRoute,
   })),
 );
+// Gridframe Principal digest — today's T2/T3 decisions as actionable items.
+const DigestRoute = lazy(() =>
+  import("../components/gridframe/DigestRoute").then((m) => ({
+    default: m.DigestRoute,
+  })),
+);
+// Gridframe approval queue + compliance timeline.
+const ApprovalsRoute = lazy(() =>
+  import("../components/gridframe/GovernanceRoutes").then((m) => ({
+    default: m.ApprovalsRoute,
+  })),
+);
+const ComplianceRoute = lazy(() =>
+  import("../components/gridframe/GovernanceRoutes").then((m) => ({
+    default: m.ComplianceRoute,
+  })),
+);
+// Gridframe Board — §5.1 register tabs, add-row forms, CSV export.
+const BoardRoute = lazy(() =>
+  import("../components/gridframe/BoardRoute").then((m) => ({
+    default: m.BoardRoute,
+  })),
+);
 
 function LazyPanelFallback() {
   return (
@@ -635,6 +658,14 @@ function MainContent() {
       return <BotDetail agentSlug={route.agentSlug} tab={route.tab} />;
     case "skill-detail":
       return <SkillDetailRoute skillName={route.skillName} />;
+    case "digest":
+      return <DigestRoute />;
+    case "approvals":
+      return <ApprovalsRoute />;
+    case "compliance":
+      return <ComplianceRoute />;
+    case "board":
+      return <BoardRoute />;
     case "routine-detail":
       return (
         <div className="app-panel active" data-testid="app-page-routines">

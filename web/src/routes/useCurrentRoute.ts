@@ -5,11 +5,15 @@ import { directChannelSlug } from "../lib/channels";
 import {
   appRoute,
   appTaskDetailRoute,
+  approvalsRoute,
   articleRoute,
+  boardRoute,
   botDetailRoute,
   botDetailTabRoute,
   botsRoute,
   channelRoute,
+  complianceRoute,
+  digestRoute,
   inboxRoute,
   indexRoute,
   routineDetailRoute,
@@ -56,6 +60,13 @@ export type CurrentRoute =
   | { kind: "skill-detail"; skillName: string }
   | { kind: "routine-detail"; routineSlug: string }
   | { kind: "routine-new" }
+  // Gridframe Principal digest (today's decisions as actionable items).
+  | { kind: "digest" }
+  // Gridframe approval queue (pending T2/T3) + compliance timeline.
+  | { kind: "approvals" }
+  | { kind: "compliance" }
+  // Gridframe Board — §5.1 register tabs.
+  | { kind: "board" }
   | { kind: "unknown" };
 
 interface ParamsShape {
@@ -95,7 +106,11 @@ type CurrentRouteId =
   | typeof botDetailTabRoute.id
   | typeof skillDetailRoute.id
   | typeof routineDetailRoute.id
-  | typeof routineNewRoute.id;
+  | typeof routineNewRoute.id
+  | typeof digestRoute.id
+  | typeof approvalsRoute.id
+  | typeof complianceRoute.id
+  | typeof boardRoute.id;
 
 const CURRENT_ROUTE_IDS = [
   indexRoute.id,
@@ -117,6 +132,10 @@ const CURRENT_ROUTE_IDS = [
   skillDetailRoute.id,
   routineDetailRoute.id,
   routineNewRoute.id,
+  digestRoute.id,
+  approvalsRoute.id,
+  complianceRoute.id,
+  boardRoute.id,
 ] as const satisfies readonly CurrentRouteId[];
 
 const CURRENT_ROUTE_ID_SET = new Set<string>(CURRENT_ROUTE_IDS);
@@ -188,6 +207,10 @@ const ROUTE_DERIVERS = {
     routineSlug: params.routineSlug ?? "",
   }),
   [routineNewRoute.id]: () => ({ kind: "routine-new" }),
+  [digestRoute.id]: () => ({ kind: "digest" }),
+  [approvalsRoute.id]: () => ({ kind: "approvals" }),
+  [complianceRoute.id]: () => ({ kind: "compliance" }),
+  [boardRoute.id]: () => ({ kind: "board" }),
 } satisfies Record<CurrentRouteId, RouteDeriver>;
 
 /**
@@ -333,6 +356,12 @@ export function useCurrentApp(): string | null {
     case "agents":
     case "bot-detail":
       return "agents";
+    case "digest":
+      return null;
+    case "approvals":
+    case "compliance":
+    case "board":
+      return null;
     case "home":
     case "channel":
     case "skill-detail":

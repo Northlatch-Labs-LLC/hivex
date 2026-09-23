@@ -218,6 +218,35 @@ export const botDetailTabRoute = createRoute({
   path: "$tab",
 });
 
+// /digest — Gridframe Principal digest: today's pending T2/T3 decisions
+// rendered as approve / reject / defer actions (decisions write
+// approval-queue rows via the gridframe decide handler).
+export const digestRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: ROUTE_PATHS.digest,
+});
+
+// /approvals — Gridframe approval queue: pending T2/T3 table; each decision
+// button is the authenticated human event (§4).
+export const approvalsRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: ROUTE_PATHS.approvals,
+});
+
+// /compliance — Gridframe compliance timeline: overdue rows red + open
+// exceptions (overdue → SEV2 per cadence job #9).
+export const complianceRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: ROUTE_PATHS.compliance,
+});
+
+// /board — Gridframe Board: the five §5.1 register tabs with add-row
+// forms, decision buttons (pending approval rows) and CSV export parity.
+export const boardRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: ROUTE_PATHS.board,
+});
+
 // Route tree
 export const routeTree = rootRoute.addChildren([
   indexRoute,
@@ -241,6 +270,11 @@ export const routeTree = rootRoute.addChildren([
   botsRoute.addChildren([botDetailRoute.addChildren([botDetailTabRoute])]),
   // Skill detail (full-screen edit + render with raw/preview toggle).
   skillDetailRoute,
+  // Gridframe Principal digest.
+  digestRoute,
+  approvalsRoute,
+  complianceRoute,
+  boardRoute,
 ]);
 
 export function createAppRouter(history: RouterHistory = createHashHistory()) {

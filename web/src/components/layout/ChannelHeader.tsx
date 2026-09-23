@@ -49,6 +49,14 @@ function headerTitleAndDesc(
       return { title: route.routineSlug, desc: "Routine" };
     case "routine-new":
       return { title: "New scheduled task", desc: "" };
+    case "digest":
+      return { title: "Principal digest", desc: "Gridframe" };
+    case "approvals":
+      return { title: "Approval queue", desc: "Gridframe" };
+    case "compliance":
+      return { title: "Compliance timeline", desc: "Gridframe" };
+    case "board":
+      return { title: "Board", desc: "Gridframe" };
     case "home":
       return { title: "", desc: "" };
     case "unknown":

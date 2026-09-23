@@ -167,6 +167,14 @@ export const ROUTE_PATHS = {
   botDetail: "/agents/$agentSlug",
   /** Full-screen skill SKILL.md detail editor + viewer. */
   skillDetail: "/skills/$skillName",
+  /** Gridframe Principal digest — today's decisions as actionable items. */
+  digest: "/digest",
+  /** Gridframe approval queue — pending T2/T3 table with human decisions. */
+  approvals: "/approvals",
+  /** Gridframe compliance timeline — overdue obligations + exception link. */
+  compliance: "/compliance",
+  /** Gridframe Board — §5.1 register tabs, add-row forms, CSV export. */
+  board: "/board",
 } as const;
 
 export type RouteKey = keyof typeof ROUTE_PATHS;
@@ -278,6 +286,10 @@ export const ROUTE_CONTRACTS: readonly RouteContract[] = [
     params: ["skillName"],
     search: [],
   },
+  { key: "digest", path: ROUTE_PATHS.digest, params: [], search: [] },
+  { key: "approvals", path: ROUTE_PATHS.approvals, params: [], search: [] },
+  { key: "compliance", path: ROUTE_PATHS.compliance, params: [], search: [] },
+  { key: "board", path: ROUTE_PATHS.board, params: [], search: [] },
 ] as const;
 
 export const SIDEBAR_APP_IDS: readonly string[] = SIDEBAR_TOOLS.map(

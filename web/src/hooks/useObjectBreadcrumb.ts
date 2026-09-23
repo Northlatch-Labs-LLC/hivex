@@ -143,6 +143,14 @@ export function deriveBreadcrumbs(
         { label: "Scheduled Tasks", href: "#/apps/routines" },
         { label: "New scheduled task", href: "#/routines/new" },
       ];
+    case "digest":
+      return [{ label: "Principal digest", href: "#/digest" }];
+    case "approvals":
+      return [{ label: "Approval queue", href: "#/approvals" }];
+    case "compliance":
+      return [{ label: "Compliance timeline", href: "#/compliance" }];
+    case "board":
+      return [{ label: "Board", href: "#/board" }];
     case "home":
       return [];
     case "unknown":
