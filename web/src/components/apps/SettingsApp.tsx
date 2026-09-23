@@ -7,6 +7,7 @@ import {
   type ConfigUpdate,
   getConfig,
   getLocalProvidersStatus,
+  type LLMProvider,
   type LLMRuntimeKind,
   type LocalProviderStatus,
   resetWorkspace,
@@ -117,8 +118,8 @@ function TeamLeadPicker({
 }
 
 function sameProviders(
-  a: readonly LLMRuntimeKind[] | null,
-  b: readonly LLMRuntimeKind[],
+  a: readonly string[] | null,
+  b: readonly string[],
 ) {
   if (a === null) return false;
   return a.length === b.length && a.every((provider, i) => provider === b[i]);
@@ -143,9 +144,9 @@ function GeneralSection({ cfg, save }: SectionProps) {
   const [blueprint, setBlueprint] = useState(cfg.blueprint ?? "");
   const [email, setEmail] = useState(cfg.email ?? "");
   const [connectedProviders, setConnectedProviders] = useState<
-    LLMRuntimeKind[] | null
+    string[] | null
   >(null);
-  const updateConnectedProviders = useCallback((next: LLMRuntimeKind[]) => {
+  const updateConnectedProviders = useCallback((next: string[]) => {
     setConnectedProviders((prev) => (sameProviders(prev, next) ? prev : next));
   }, []);
 
@@ -153,7 +154,7 @@ function GeneralSection({ cfg, save }: SectionProps) {
     const providerPriority =
       connectedProviders ?? normalizeProviderList(providers);
     const patch: ConfigUpdate = {
-      llm_provider: providerPriority[0] ?? "",
+      llm_provider: (providerPriority[0] ?? "") as LLMProvider,
       llm_provider_priority: providerPriority,
       default_format: format,
       blueprint,
