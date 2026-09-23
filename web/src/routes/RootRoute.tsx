@@ -488,7 +488,7 @@ function TasksRedirect() {
  */
 const FIRST_CLASS_APP_TARGETS: Record<
   FirstClassAppId,
-  "/wiki" | "/tasks" | "/agents"
+  "/wiki" | "/tasks" | "/agents" | "/digest" | "/approvals" | "/compliance" | "/board"
 > = {
   wiki: "/wiki",
   // The Inbox was consolidated into the board — send `/apps/inbox` straight
@@ -496,6 +496,10 @@ const FIRST_CLASS_APP_TARGETS: Record<
   inbox: "/tasks",
   tasks: "/tasks",
   agents: "/agents",
+  digest: "/digest",
+  approvals: "/approvals",
+  compliance: "/compliance",
+  board: "/board",
 };
 
 function FirstClassAppRedirect({ appId }: { appId: FirstClassAppId }) {
