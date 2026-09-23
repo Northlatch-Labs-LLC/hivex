@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/Northlatch-Labs-LLC/hivex/internal/config"
+	"github.com/Northlatch-Labs-LLC/hivex/internal/provider"
 )
 
 // handleCustomProviders manages user-defined OpenAI-compatible providers from
@@ -115,5 +116,8 @@ func saveCustomProviders(w http.ResponseWriter, cfg config.Config) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	// Re-register so a provider added from Settings is dispatchable on the
+	// very next turn — no broker restart.
+	provider.RegisterCustomProviders()
 	writeJSON(w, http.StatusOK, map[string]any{"providers": cfg.CustomProviders})
 }
