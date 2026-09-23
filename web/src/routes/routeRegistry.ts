@@ -3,6 +3,7 @@ export const APP_PANEL_IDS = [
   "graph",
   "health-check",
   "integrations",
+  "marketplace",
   "policies",
   "requests",
   "routines",
@@ -61,6 +62,7 @@ export const APP_LABELS: Record<AppPanelId | FirstClassAppId, string> = {
   graph: "Team Graph",
   "health-check": "Health",
   integrations: "Integrations",
+  marketplace: "Marketplace",
   policies: "Policies",
   requests: "Requests",
   routines: "Automations",
@@ -86,6 +88,7 @@ const SIDEBAR_TOOL_EMOJIS: Partial<
   skills: "⚡",
   "health-check": "📶",
   integrations: "🔌",
+  marketplace: "🛍",
   settings: "⚙",
 };
 
@@ -122,6 +125,7 @@ export const SIDEBAR_TOOLS: readonly SidebarTool[] = [
   { id: "skills", kind: "app-panel" },
   { id: "health-check", kind: "app-panel" },
   { id: "integrations", kind: "app-panel" },
+  { id: "marketplace", kind: "app-panel" },
   { id: "settings", kind: "app-panel" },
 ].map((entry) => ({
   ...entry,

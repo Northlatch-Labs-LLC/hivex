@@ -1350,11 +1350,41 @@ export function updateCustomProvider(cp: CustomProvider) {
 }
 
 export function deleteCustomProvider(id: string) {
-  return del<{ providers: CustomProvider[] }>("/custom-providers/delete/" + id);
+  return del<{ providers: CustomProvider[] }>(`/custom-providers/delete/${id}`);
 }
 
-export function testCustomProvider(opts: { base_url: string; api_key?: string }) {
-  return post<{ ok: boolean; status?: number; error?: string }>("/custom-providers/test", opts);
+export function testCustomProvider(opts: {
+  base_url: string;
+  api_key?: string;
+}) {
+  return post<{ ok: boolean; status?: number; error?: string }>(
+    "/custom-providers/test",
+    opts,
+  );
+}
+
+// ── Marketplace (skills, experts, plugins) ──
+
+export interface MarketplaceEntry {
+  id: string;
+  category: "skill" | "expert" | "plugin";
+  name: string;
+  description: string;
+  installed: boolean;
+}
+
+export function getMarketplace() {
+  return get<{ entries: MarketplaceEntry[] }>("/marketplace");
+}
+
+export function installMarketplaceEntry(id: string) {
+  return post<{ entries: MarketplaceEntry[] }>("/marketplace/install", { id });
+}
+
+export function uninstallMarketplaceEntry(id: string) {
+  return post<{ entries: MarketplaceEntry[] }>("/marketplace/uninstall", {
+    id,
+  });
 }
 
 // ── Workspace wipes (Danger Zone) ──

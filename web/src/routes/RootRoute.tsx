@@ -24,7 +24,6 @@ import {
 } from "../api/client";
 import { AppDetail } from "../appdetail/surfaces/AppDetail";
 import { CreateAppDialog } from "../components/apps/CreateAppDialog";
-import { CustomAppView } from "../components/apps/CustomAppView";
 import { TelegramConnectHost } from "../components/integrations/TelegramConnectModal";
 import { Shell } from "../components/layout/Shell";
 import { UpgradeBanner } from "../components/layout/UpgradeBanner";
@@ -134,6 +133,11 @@ const IntegrationsApp = lazy(() =>
 const SkillsApp = lazy(() =>
   import("../components/apps/SkillsApp").then((m) => ({
     default: m.SkillsApp,
+  })),
+);
+const MarketplaceApp = lazy(() =>
+  import("../components/apps/MarketplaceApp").then((m) => ({
+    default: m.MarketplaceApp,
   })),
 );
 const DecisionPacketRoute = lazy(() =>
@@ -330,6 +334,7 @@ const APP_PANELS = {
   activity: ArtifactsApp,
   "health-check": HealthCheckApp,
   integrations: IntegrationsApp,
+  marketplace: MarketplaceApp,
   settings: SettingsApp,
 } satisfies Record<AppPanelId, ComponentType>;
 
