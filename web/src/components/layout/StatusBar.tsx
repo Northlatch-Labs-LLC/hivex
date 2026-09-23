@@ -114,6 +114,14 @@ export function StatusBar() {
         return `Routine ${route.routineSlug}`;
       case "routine-new":
         return "New scheduled task";
+      case "digest":
+        return "Principal digest";
+      case "approvals":
+        return "Approval queue";
+      case "compliance":
+        return "Compliance timeline";
+      case "board":
+        return "Board";
       case "home":
         return "Home";
       case "unknown":
