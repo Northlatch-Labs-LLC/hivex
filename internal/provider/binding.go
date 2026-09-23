@@ -1,6 +1,9 @@
 package provider
 
-import "fmt"
+import (
+	"fmt"
+	"strings"
+)
 
 // Kind values for ProviderBinding.Kind. The empty string means "fall back to
 // the install-wide default" (config.ResolveLLMProvider at dispatch time), which
@@ -32,6 +35,10 @@ const (
 	// is deliberately no default model because the catalog depends on the
 	// operator's upstream providers.
 	KindHiveAPI = "hiveapi"
+	// KindCustomPrefix marks kinds that are Settings-managed custom
+	// providers (internal/config CustomProvider): the entry ID doubles as
+	// the kind, e.g. "custom-zai".
+	KindCustomPrefix = "custom-"
 )
 
 // ProviderBinding is the per-bot runtime selection persisted on an office
@@ -77,7 +84,9 @@ type SlackProviderBinding struct {
 }
 
 // ValidateKind reports whether s is an acceptable ProviderBinding.Kind value.
-// The empty string is valid and means "use install-wide default."
+// The empty string is valid and means "use install-wide default." Custom
+// providers added from Settings use their entry ID (custom-…) as the kind;
+// the slug shape is checked here, existence at registration/dispatch time.
 func ValidateKind(s string) error {
 	switch s {
 	case "",
@@ -85,6 +94,9 @@ func ValidateKind(s string) error {
 		KindSlack, KindMLXLM, KindOllama, KindExo, KindHiveAPI:
 		return nil
 	default:
+		if strings.HasPrefix(s, KindCustomPrefix) && len(s) > len(KindCustomPrefix) {
+			return nil
+		}
 		return fmt.Errorf("unknown provider kind %q (valid: %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, or empty)",
 			s, KindClaudeCode, KindCodex, KindOpencode, KindOpenclaw, KindOpenclawHTTP, KindHermesBot, KindSlack, KindMLXLM, KindOllama, KindExo, KindHiveAPI)
 	}
