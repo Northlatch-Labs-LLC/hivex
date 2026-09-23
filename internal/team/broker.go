@@ -860,7 +860,7 @@ func (b *Broker) StartOnPort(port int) error {
 	// The live ledgers directory is the source of truth (write-through
 	// persistence); first boot seeds it from the shipped reference ledgers.
 	gfStore := gridframe.NewStore()
-	gfHome := filepath.Join(config.RuntimeHomeDir(), "GRIDFRAME")
+	gfHome := filepath.Join(config.RuntimeHomeDir(), ".hivex", "GRIDFRAME")
 	if err := gfStore.PersistTo(filepath.Join(gfHome, "ledgers")); err != nil {
 		log.Printf("gridframe: ledger persistence unavailable: %v", err)
 	} else if err := gfStore.SeedFrom(filepath.Join(gfHome, "reference", "ledgers")); err != nil {
