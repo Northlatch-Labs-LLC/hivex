@@ -228,6 +228,12 @@ func resolveOpenAICompatAPIKey(kind string) string {
 	if v := strings.TrimSpace(os.Getenv("HIVEX_" + envKind + "_API_KEY")); v != "" {
 		return v
 	}
+	// Settings-managed custom providers carry their own key in config.
+	if strings.HasPrefix(kind, config.CustomProviderKindPrefix) {
+		if cp, err := config.FindCustomProviderByKey(kind); err == nil {
+			return strings.TrimSpace(cp.APIKey)
+		}
+	}
 	if kind == KindHermesBot {
 		if v := strings.TrimSpace(os.Getenv("API_SERVER_KEY")); v != "" {
 			return v

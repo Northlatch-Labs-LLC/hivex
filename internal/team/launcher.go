@@ -20,6 +20,7 @@ import (
 	"github.com/Northlatch-Labs-LLC/hivex/internal/company"
 	"github.com/Northlatch-Labs-LLC/hivex/internal/config"
 	"github.com/Northlatch-Labs-LLC/hivex/internal/operations"
+	"github.com/Northlatch-Labs-LLC/hivex/internal/provider"
 )
 
 const (
@@ -191,6 +192,9 @@ type Launcher struct {
 
 // NewLauncher creates a launcher for the given operation blueprint or legacy pack.
 func NewLauncher(packSlug string) (*Launcher, error) {
+	// Settings-managed custom providers become bindable kinds on every
+	// office path (startup, reconfigure) before any turn can dispatch.
+	provider.RegisterCustomProviders()
 	cfg, _ := config.Load()
 	explicitPack := packSlug != "" // true when user passed --pack explicitly
 	blankSlateLaunch := isBlankSlateLaunchSlug(packSlug) || strings.TrimSpace(os.Getenv("HIVEX_START_FROM_SCRATCH")) == "1"

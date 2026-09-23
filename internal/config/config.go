@@ -1074,6 +1074,35 @@ func ResolveOpenclawGatewayURL() string {
 	return "ws://127.0.0.1:18789"
 }
 
+// findCustomProvider returns the Settings-managed CustomProvider whose ID
+// equals kind (IDs carry the "custom-" prefix), for runtime resolution of
+// user-defined OpenAI-compatible providers.
+func findCustomProvider(cfg Config, kind string) (CustomProvider, bool) {
+	if !strings.HasPrefix(kind, CustomProviderKindPrefix) {
+		return CustomProvider{}, false
+	}
+	for _, cp := range cfg.CustomProviders {
+		if cp.ID == kind && cp.Enabled {
+			return cp, true
+		}
+	}
+	return CustomProvider{}, false
+}
+
+// FindCustomProviderByKey loads config and returns the enabled
+// Settings-managed custom provider with ID == kind.
+func FindCustomProviderByKey(kind string) (CustomProvider, error) {
+	cfg, err := Load()
+	if err != nil {
+		return CustomProvider{}, err
+	}
+	cp, ok := findCustomProvider(cfg, kind)
+	if !ok {
+		return CustomProvider{}, fmt.Errorf("no enabled custom provider %q", kind)
+	}
+	return cp, nil
+}
+
 // ResolveProviderEndpoint resolves the base URL and model for an OpenAI-
 // compatible local provider Kind (mlx-lm, ollama, exo). Resolution order:
 //
@@ -1096,6 +1125,17 @@ func ResolveProviderEndpoint(kind, defaultBaseURL, defaultModel string) (string,
 			}
 			if model == "" {
 				model = strings.TrimSpace(ep.Model)
+			}
+		}
+		// Custom providers managed from Settings: kind == the entry ID.
+		if baseURL == "" || model == "" {
+			if cp, ok := findCustomProvider(cfg, kind); ok {
+				if baseURL == "" {
+					baseURL = strings.TrimSpace(cp.BaseURL)
+				}
+				if model == "" {
+					model = strings.TrimSpace(cp.Model)
+				}
 			}
 		}
 	}
