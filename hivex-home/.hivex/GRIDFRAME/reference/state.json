@@ -1,0 +1,26 @@
+{
+  "company": "Gridframe Systems, LLC",
+  "state": "formation-pending",
+  "formation": {
+    "bizee_order": "541511",
+    "filed": "2026-09-22",
+    "certificate": "pending",
+    "ein": "pending",
+    "operating_agreement": "drafted-awaiting-signature",
+    "bank": "pending"
+  },
+  "infrastructure": {
+    "ovh": "ordered-pending-build",
+    "control_plane": "ADVANCE-1 (EPYC 4245P, 6c/32G, 2x960G NVMe)",
+    "env_node": "Scale class 32c/256G NVMe (exact SKU at cart)"
+  },
+  "current_sprint": "S-2026-W39",
+  "sprint_goal": "Formation complete + OVH provisioned + first paying self-serve cohort, zero SEV1/SEV2",
+  "next_milestones": [
+    {"id": "CMP-0005", "what": "EIN via IRS (free)", "due": "2026-09-24", "owner": "Principal+ Counsel prep"},
+    {"id": "CMP-0006", "what": "Sign operating agreement", "due": "2026-09-26", "owner": "Principal"},
+    {"id": "CMP-0007", "what": "Bank account", "due": "2026-09-30", "owner": "Principal"},
+    {"id": "OVH-PROV", "what": "Provision bare metal when delivered", "due": "on delivery", "owner": "ENG-04 Bastion"}
+  ],
+  "reappraisal": {"next_cycle": "2026-Q4", "method": "S/A/B/C/D + marginal-AEI rebalancing"}
+}

@@ -1,0 +1,6 @@
+item_id,raised_date,dept,raised_by,description,tier,status,approver,decision_date
+APP-20260908-02,2026-09-08,PE,Bastion,Increase compute pool reservation (+$60/mo),T1,approved,Forge,2026-09-08
+APP-20260919-03,2026-09-19,RG,Echo,"Publish ""Agent runtimes compared"" technical article",draft,T1,approved,Vector
+APP-20260922-04,2026-09-22,RL,Counsel,Engage registered-agent renewal + BOI status check memo,T2,approved,HOB-00 Principal,2026-09-22
+APP-20260922-05,2026-09-22,GOV,HOB-00 Principal,Form Gridframe Systems LLC via Bizee (Delaware; Silver + OA add-on with $100 rule; EIN direct IRS; agent year 1),T3,approved,HOB-00 Principal,2026-09-22
+APP-20260922-06,2026-09-22,PE,HOB-00 Principal,OVH bare metal (ADVANCE-1 control plane + Scale env node) ordered by Principal; invoice amount to be booked block-D on receipt,T2,approved,HOB-00 Principal,2026-09-22

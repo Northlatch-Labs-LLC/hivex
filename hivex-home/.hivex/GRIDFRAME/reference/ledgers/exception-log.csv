@@ -1,0 +1,3 @@
+exc_id,date,severity,dept,declared_by,description,status,resolution,postmortem_ref
+EXC-20260917-01,2026-09-17,SEV2,PE,Bastion,Env boot latency p95 210s (target <90s) for 40 min,resolved,Pool warm-up added; p95 back to 71s,PM-0027
+EXC-20260921-02,2026-09-21,SEV3,OF,Tally,Duplicate invoice draft INV-0002 raised twice in sandbox,resolved,Draft voided; dedupe rule added to runbook,

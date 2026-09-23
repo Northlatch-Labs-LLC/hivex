@@ -1,0 +1,8 @@
+item_id,due_date,obligation,authority,owner,status,recurrence,evidence_ref
+CMP-0001,2027-06-01,Delaware LLC annual franchise tax $300,DE Secretary of State,Counsel,planned,annual,Bizee order 541511 placed 2026-09-22
+CMP-0002,2026-10-15,Q3 estimated federal tax review (single-member LLC),IRS,Counsel,planned,quarterly,doc 04 §8
+CMP-0003,2027-03-01,FinCEN BOI status re-verification (exempt per final rule eff. 2026-08-14),FinCEN,Counsel,planned,semiannual,"Bizee order 541511; doc 04 §6 (exempt, re-verify semiannually)"
+CMP-0004,2027-09-22,Registered agent renewal ($149/yr after free year 1),Bizee,Counsel,planned,annual,Bizee order 541511 placed 2026-09-22
+CMP-0005,2026-09-24,Apply for federal EIN via IRS online assistant (free),IRS,Principal (types SSN) + Counsel (prep),planned,once,Session kit §6 step 2; order 541511
+CMP-0006,2026-09-26,Execute single-member operating agreement,Internal,Counsel -> Principal signature,drafted,once,09-operating-agreement-draft.md; order 541511
+CMP-0007,2026-09-30,Open business bank account (fintech shortlist ready),Bank,Principal (human-only),planned,once,Session kit §6 step 4; order 541511
