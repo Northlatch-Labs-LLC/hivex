@@ -857,10 +857,13 @@ func (b *Broker) StartOnPort(port int) error {
 	mux.HandleFunc("/marketplace/install", b.requireAuth(b.handleMarketplaceInstall))
 	mux.HandleFunc("/marketplace/uninstall", b.requireAuth(b.handleMarketplaceUninstall))
 	// Gridframe Principal surface (G4): the company ledgers + approval gate.
-	// Seeded from the shipped reference ledgers; appended rows live in the
-	// broker until ledger persistence lands.
+	// The live ledgers directory is the source of truth (write-through
+	// persistence); first boot seeds it from the shipped reference ledgers.
 	gfStore := gridframe.NewStore()
-	if err := gfStore.SeedStore(filepath.Join(config.RuntimeHomeDir(), "GRIDFRAME", "reference", "ledgers")); err != nil {
+	gfHome := filepath.Join(config.RuntimeHomeDir(), "GRIDFRAME")
+	if err := gfStore.PersistTo(filepath.Join(gfHome, "ledgers")); err != nil {
+		log.Printf("gridframe: ledger persistence unavailable: %v", err)
+	} else if err := gfStore.SeedFrom(filepath.Join(gfHome, "reference", "ledgers")); err != nil {
 		log.Printf("gridframe: seed ledgers unavailable: %v", err)
 	}
 	gridframe.RegisterRoutes(mux, gfStore, gridframe.NewGate(gfStore), b.requireAuth)

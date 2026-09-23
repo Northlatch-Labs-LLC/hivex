@@ -51,6 +51,9 @@ type TableData struct {
 type Store struct {
 	tables map[string]*TableData
 	locks  map[string]bool // locked months "YYYY-MM" (lock.go)
+	// persistDir, when armed via PersistTo (persist.go), is the directory
+	// every mutation is flushed to as byte-exact CSV.
+	persistDir string
 }
 
 // NewStore returns an empty store with all 8 tables initialized from schema.
@@ -169,6 +172,7 @@ func (s *Store) Append(name string, r Row) error {
 		return fmt.Errorf("%w: %s key %q", ErrEditExisting, name, k)
 	}
 	td.Rows = append(td.Rows, r)
+	s.persistTable(name)
 	return nil
 }
 
@@ -202,6 +206,7 @@ func (s *Store) AppendReversal(name, originalID string, rev Row) error {
 	}
 	td.Rows = append(td.Rows, rev)
 	td.Reversals = append(td.Reversals, Reversal{OriginalID: originalID, ReverseID: revID})
+	s.persistTable(name)
 	return nil
 }
 

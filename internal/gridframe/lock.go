@@ -30,6 +30,7 @@ func (s *Store) LockMonth(month string) {
 		s.locks = map[string]bool{}
 	}
 	s.locks[month] = true
+	s.persistLocks()
 }
 
 // IsLockedMonth reports whether a month is locked.
