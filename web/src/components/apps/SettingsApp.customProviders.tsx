@@ -33,6 +33,16 @@ const inputStyle = {
 
 const emptyForm = { id: "", name: "", base_url: "", model: "", api_key: "" };
 
+// providerId derives the technical ID from the name the user typed, so the
+// form never asks for one ("My provider" -> "custom-my-provider").
+function providerId(name: string): string {
+  const slug = name
+    .toLowerCase()
+    .replace(/[^a-z0-9-]+/g, "-")
+    .replace(/(^-+|-+$)/g, "");
+  return `custom-${slug || "provider"}`;
+}
+
 // CustomProvidersSection is the Settings surface for user-defined
 // OpenAI-compatible providers: add/list/test/delete, persisted by the broker.
 export function CustomProvidersSection() {
@@ -50,7 +60,8 @@ export function CustomProvidersSection() {
   };
 
   const add = useMutation({
-    mutationFn: () => addCustomProvider({ ...form, enabled: true }),
+    mutationFn: () =>
+      addCustomProvider({ ...form, id: providerId(form.name), enabled: true }),
     ...invalidate,
   });
   const remove = useMutation({
@@ -86,8 +97,8 @@ export function CustomProvidersSection() {
     <div>
       <h2>Custom providers</h2>
       <p style={{ fontSize: 13, color: "var(--text-secondary)" }}>
-        Any OpenAI-compatible endpoint: base URL, model, API key. Managed here,
-        used by the harness.
+        Connect any AI provider. Fill in the four fields exactly as your
+        provider gives them to you, then press Add.
       </p>
       <form
         onSubmit={submit}
@@ -112,25 +123,7 @@ export function CustomProvidersSection() {
           </label>
         </label>
         <label style={labelStyle}>
-          ID
-          <label
-            style={{
-              ...labelStyle,
-              textTransform: "none",
-              color: "var(--text)",
-            }}
-          >
-            <input
-              style={inputStyle}
-              value={form.id}
-              onChange={set("id")}
-              placeholder="custom-my-provider"
-              required={true}
-            />
-          </label>
-        </label>
-        <label style={labelStyle}>
-          Base URL
+          API address
           <label
             style={{
               ...labelStyle,
@@ -191,7 +184,7 @@ export function CustomProvidersSection() {
             onClick={() => test.mutate()}
             disabled={test.isPending || !form.base_url}
           >
-            Test
+            Check connection
           </button>
         </div>
         {testResult ? (
