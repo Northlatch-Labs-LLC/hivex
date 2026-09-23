@@ -1326,6 +1326,37 @@ export function setImageProviderConfig(opts: {
   return put<ImageProviderStatus[]>("/image-providers", opts);
 }
 
+// ── Custom providers (Settings) ──
+
+export interface CustomProvider {
+  id: string;
+  name: string;
+  base_url: string;
+  model: string;
+  api_key?: string;
+  enabled: boolean;
+}
+
+export function getCustomProviders() {
+  return get<{ providers: CustomProvider[] }>("/custom-providers");
+}
+
+export function addCustomProvider(cp: CustomProvider) {
+  return post<{ providers: CustomProvider[] }>("/custom-providers/add", cp);
+}
+
+export function updateCustomProvider(cp: CustomProvider) {
+  return put<{ providers: CustomProvider[] }>("/custom-providers/update", cp);
+}
+
+export function deleteCustomProvider(id: string) {
+  return del<{ providers: CustomProvider[] }>("/custom-providers/delete/" + id);
+}
+
+export function testCustomProvider(opts: { base_url: string; api_key?: string }) {
+  return post<{ ok: boolean; status?: number; error?: string }>("/custom-providers/test", opts);
+}
+
 // ── Workspace wipes (Danger Zone) ──
 
 // WorkspaceWipeResult shape mirrors internal/workspace.Result plus the flags

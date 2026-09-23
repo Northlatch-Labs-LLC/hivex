@@ -29,6 +29,7 @@ import {
 import { showNotice } from "../ui/Toast";
 import { WipeModal } from "../ui/WipeModal";
 import { ImageGenSection } from "./SettingsApp.imageGen";
+import { CustomProvidersSection } from "./SettingsApp.customProviders";
 import { BoxAccountSection } from "./settings/BoxAccountSection";
 import { Field, KeyField, SaveButton } from "./settings/components";
 import { SECTION_GROUPS } from "./settings/constants";
@@ -1376,6 +1377,7 @@ export function SettingsApp() {
           <LocalLLMsSection cfg={data} save={save} />
         )}
         {section === "image-gen" && <ImageGenSection />}
+        {section === "custom-providers" && <CustomProvidersSection />}
         {section === "company" && <CompanySection cfg={data} save={save} />}
         {section === "keys" && <KeysSection cfg={data} save={save} />}
         {section === "integrations" && (
