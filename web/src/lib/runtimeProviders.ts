@@ -53,6 +53,12 @@ export const RUNTIME_PROVIDER_OPTIONS: readonly RuntimeProviderOption[] = [
     desc: "Distributed local inference pool",
     kind: "local",
   },
+  {
+    id: "hiveapi",
+    label: "HiveAPI Gateway",
+    desc: "Your own inference distributor (OpenAI-compatible)",
+    kind: "local",
+  },
 ] as const;
 
 const OPTION_BY_ID = new Map(RUNTIME_PROVIDER_OPTIONS.map((p) => [p.id, p]));
@@ -106,6 +112,9 @@ export function runtimeProviderIsConnected(
     localStatuses?: Map<string, LocalProviderStatus>;
   },
 ): boolean {
+  // HiveAPI is a remote service rather than a local binary — reachability is
+  // reported by the turn runtime, so the picker keeps it selectable.
+  if (option.id === "hiveapi") return true;
   if (option.kind === "cli") {
     if (!option.binary) return false;
     const prereq = deps.prereqs?.get(option.binary);
