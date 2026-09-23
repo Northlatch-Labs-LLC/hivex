@@ -73,6 +73,9 @@ const CLOUD_MODELS: Record<
     "claude-opus-4-7",
     "gpt-5",
   ],
+  // HiveAPI's catalog is operator-configured (GET /v1/models with the
+  // account key) — no static list; users type the model id.
+  hiveapi: [],
 };
 
 // Empty model entry maps to "use the runtime's default" (broker leaves

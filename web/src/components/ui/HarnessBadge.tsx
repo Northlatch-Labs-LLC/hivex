@@ -168,6 +168,35 @@ const GLYPHS: Record<HarnessKind, GlyphDef> = {
       </>
     ),
   },
+  // HiveAPI Gateway — the product's own distributor; Hive amber with a
+  // monogram route glyph.
+  hiveapi: {
+    bg: "#FFD44F",
+    viewBox: "0 0 24 24",
+    body: (
+      <path
+        d="M4 18h16M7 18v-6M12 18V6M17 18v-9"
+        stroke="#0A0F18"
+        strokeWidth="2.4"
+        strokeLinecap="round"
+      />
+    ),
+  },
+  // Settings-managed custom providers — charcoal chip with a generic plug.
+  custom: {
+    bg: "#0A0F18",
+    viewBox: "0 0 24 24",
+    body: (
+      <path
+        d="M9 7v-3M15 7V4M7 11h10v3a5 5 0 0 1-10 0v-3z"
+        stroke="#FFD44F"
+        strokeWidth="2.2"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        fill="none"
+      />
+    ),
+  },
 };
 
 export function HarnessBadge({

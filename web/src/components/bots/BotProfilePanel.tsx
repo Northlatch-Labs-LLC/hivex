@@ -48,6 +48,7 @@ const PROVIDER_LABELS: Record<LLMRuntimeKind, string> = {
   "mlx-lm": "MLX-LM",
   ollama: "Ollama",
   exo: "Exo",
+  hiveapi: "HiveAPI Gateway",
 };
 
 const GATEWAY_LABELS: Record<string, string> = {
