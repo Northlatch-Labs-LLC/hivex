@@ -3,7 +3,6 @@ import { useQuery } from "@tanstack/react-query";
 
 import {
   get,
-  getCustomProviders,
   getLocalProvidersStatus,
   type LLMRuntimeKind,
 } from "../../../api/client";
@@ -41,11 +40,6 @@ export function RuntimeProviderChecklist({
     queryFn: getLocalProvidersStatus,
     staleTime: 10_000,
   });
-  const customProviders = useQuery({
-    queryKey: ["custom-providers"],
-    queryFn: getCustomProviders,
-    staleTime: 10_000,
-  });
 
   const prereqList = useMemo(
     () =>
@@ -73,23 +67,19 @@ export function RuntimeProviderChecklist({
     [runtimeKindSet],
   );
 
-  const connectedProviders = useMemo(() => {
-    const builtIn = selectedProviders.filter((id): id is LLMRuntimeKind => {
-      const option = RUNTIME_PROVIDER_OPTIONS.find((p) => p.id === id);
-      return option
-        ? runtimeProviderIsConnected(option, {
-            prereqs: prereqMap,
-            localStatuses: localStatusMap,
-          })
-        : false;
-    });
-    // Settings-managed custom providers are verified by the user at add
-    // time (Check connection) — enabled means selectable.
-    const customIds = (customProviders.data?.providers ?? [])
-      .filter((cp) => cp.enabled && selectedProviders.includes(cp.id))
-      .map((cp) => cp.id);
-    return [...builtIn, ...customIds];
-  }, [customProviders.data, localStatusMap, prereqMap, selectedProviders]);
+  const connectedProviders = useMemo(
+    () =>
+      selectedProviders.filter((id): id is LLMRuntimeKind => {
+        const option = RUNTIME_PROVIDER_OPTIONS.find((p) => p.id === id);
+        return option
+          ? runtimeProviderIsConnected(option, {
+              prereqs: prereqMap,
+              localStatuses: localStatusMap,
+            })
+          : false;
+      }),
+    [localStatusMap, prereqMap, selectedProviders],
+  );
 
   useEffect(() => {
     if (prereqs.isError || localStatuses.isError) return;
@@ -180,62 +170,10 @@ export function RuntimeProviderChecklist({
               </label>
             );
           })}
-          {(customProviders.data?.providers ?? []).map((cp) => {
-            const checked = selectedProviders.includes(cp.id);
-            return (
-              <label
-                key={cp.id}
-                style={{
-                  display: "flex",
-                  gap: 10,
-                  alignItems: "flex-start",
-                  padding: "10px 12px",
-                  border: "1px solid var(--border)",
-                  borderRadius: "var(--radius-sm)",
-                  background: checked ? "var(--accent-bg)" : "var(--bg-card)",
-                  opacity: cp.enabled ? 1 : 0.58,
-                }}
-              >
-                <input
-                  type="checkbox"
-                  checked={checked}
-                  disabled={!cp.enabled}
-                  onChange={() => toggleProvider(cp.id)}
-                  style={{ marginTop: 2 }}
-                />
-                <span>
-                  <span
-                    style={{ display: "block", fontSize: 13, fontWeight: 600 }}
-                  >
-                    {cp.name}
-                  </span>
-                  <span
-                    style={{
-                      display: "block",
-                      fontSize: 11,
-                      color: "var(--text-tertiary)",
-                      lineHeight: 1.4,
-                    }}
-                  >
-                    {cp.base_url} · {cp.model}
-                  </span>
-                </span>
-              </label>
-            );
-          })}
           {selectedProviders.length > 0 ? (
             <div style={{ fontSize: 12, color: "var(--text-secondary)" }}>
               Task creation will show:{" "}
-              {selectedProviders
-                .map((id) => {
-                  const cp = (customProviders.data?.providers ?? []).find(
-                    (c) => c.id === id,
-                  );
-                  return cp
-                    ? cp.name
-                    : runtimeProviderLabel(id as LLMRuntimeKind);
-                })
-                .join(", ")}
+              {selectedProviders.map(runtimeProviderLabel).join(", ")}
             </div>
           ) : null}
         </div>

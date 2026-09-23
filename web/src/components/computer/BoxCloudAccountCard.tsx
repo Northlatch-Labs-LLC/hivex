@@ -1,6 +1,6 @@
 /**
  * BoxCloudAccountCard — for a bot that runs on the cloud: who the account
- * is, whether ascii.dev will start a box at all, and a link to fix it.
+ * is, whether Gridframe Cloud will start a box at all, and a link to fix it.
  * Without this a valid key and a blocked account look identical until a
  * turn fails with a 402.
  */

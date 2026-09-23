@@ -13,8 +13,8 @@ export function BoxAccountSection() {
   const queryClient = useQueryClient();
   return (
     <Field
-      label="ascii.dev Box"
-      hint="Cloud computers for your bots. Env: HIVEX_BOX_API_KEY. Signing out revokes the hivebot key on your account and ends the CLI session."
+      label="Gridframe Cloud"
+      hint="Cloud computers for your bots, on your Gridframe (gridframes.app) account. Env: HIVEX_BOX_API_KEY. Signing out revokes the hivebot key on your account and ends the CLI session."
     >
       <BoxCloudConnect
         onChanged={() => {

@@ -1,6 +1,6 @@
 package team
 
-// broker_computer_box.go plugs the ascii.dev Box backend into the computer
+// broker_computer_box.go plugs the Gridframe Cloud (Box) backend into the computer
 // service: status for the panel, the per-turn mount, and the lifecycle
 // actions. A missing key leaves every hook nil, and the sandbox path is
 // untouched.
@@ -47,7 +47,7 @@ func (s *computerService) installBoxHooks() {
 	s.boxStatusFor = func(ctx context.Context, slug string) (*computerBoxView, string) {
 		c := s.boxClient()
 		if c == nil {
-			return nil, "Cloud computers need an ascii.dev Box API key in Settings"
+			return nil, "Cloud computers need an Gridframe Cloud API key in Settings"
 		}
 		b, err := c.Find(ctx, slug)
 		if err != nil {
@@ -65,7 +65,7 @@ func (s *computerService) installBoxHooks() {
 func (s *computerService) mountBoxForTurn(ctx context.Context, slug, turnID, taskID, controlURL, controlToken string) (*computerMount, error) {
 	c := s.boxClient()
 	if c == nil {
-		s.setState(slug, "unconfigured", "Cloud computers need an ascii.dev Box API key in Settings")
+		s.setState(slug, "unconfigured", "Cloud computers need an Gridframe Cloud API key in Settings")
 		return nil, nil
 	}
 	m, _ := s.member(slug)
@@ -124,7 +124,7 @@ func firstError(errs ...error) error {
 func (s *computerService) boxActionHandler(w http.ResponseWriter, r *http.Request, slug, action string) {
 	c := s.boxClient()
 	if c == nil {
-		writeJSON(w, http.StatusConflict, map[string]string{"error": "Cloud computers need an ascii.dev Box API key in Settings"})
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "Cloud computers need an Gridframe Cloud API key in Settings"})
 		return
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 4*time.Minute)

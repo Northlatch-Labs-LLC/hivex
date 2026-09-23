@@ -1,7 +1,7 @@
 /**
- * BoxPlanNotice — the one place the ascii.dev plan gate is explained.
+ * BoxPlanNotice — the one place the Gridframe Cloud plan gate is explained.
  *
- * A key can be valid and the account still unable to start a box: ascii.dev
+ * A key can be valid and the account still unable to start a box: Gridframe Cloud
  * answers subscription_required until a plan or the 7-day trial is started.
  * Nobody can know that without being told, so wherever the cloud shows up
  * (onboarding, the Computer tab, Settings) this notice names the block and
@@ -31,7 +31,7 @@ export function BoxPlanNotice({
       data-testid="box-plan-notice"
     >
       <p className="box-plan-notice-text">
-        <strong>Your ascii.dev account cannot start a box yet.</strong> {reason}
+        <strong>Your Gridframe Cloud account cannot start a box yet.</strong> {reason}
         {account.trialLine ? ` Trial limits: ${account.trialLine}.` : ""}
       </p>
       <a
@@ -41,7 +41,7 @@ export function BoxPlanNotice({
         className="btn btn-secondary btn-sm"
         data-testid="box-plan-notice-link"
       >
-        Start the trial or a plan on ascii.dev
+        Start the trial or a plan on Gridframe
       </a>
     </div>
   );
@@ -51,7 +51,7 @@ export function BoxPlanNotice({
 export function boxAccountLine(account: BoxAccount | null): string {
   if (!account) return "";
   if (account.signedIn && account.identifier) {
-    return `Signed in to ascii.dev as ${account.identifier}${account.plan ? ` (${account.plan})` : ""}.`;
+    return `Signed in to Gridframe Cloud as ${account.identifier}${account.plan ? ` (${account.plan})` : ""}.`;
   }
   if (account.keySet) return "A Box key is saved.";
   return "Not connected to ascii.dev.";

@@ -49,7 +49,7 @@ type Config struct {
 	ComposioUserAPIKey string `json:"composio_user_api_key,omitempty"`
 	ComposioOrgID      string `json:"composio_org_id,omitempty"`
 	ComposioProjectID  string `json:"composio_project_id,omitempty"`
-	// BoxAPIKey is the ascii.dev Box key that rents a bot its cloud
+	// BoxAPIKey is the Gridframe Cloud (gridframes.app) key that rents a bot its cloud
 	// computer. Resolved through ResolveBoxAPIKey (env wins).
 	BoxAPIKey      string `json:"box_api_key,omitempty"`
 	ActionProvider string `json:"action_provider,omitempty"`
@@ -698,7 +698,7 @@ func ResolveComposioProjectID() string {
 	return strings.TrimSpace(cfg.ComposioProjectID)
 }
 
-// ResolveBoxAPIKey resolves the ascii.dev Box API key.
+// ResolveBoxAPIKey resolves the Gridframe Cloud API key.
 // Resolution: HIVEX_BOX_API_KEY env > BOX_API_KEY env > config file.
 func ResolveBoxAPIKey() string {
 	if v := strings.TrimSpace(Getenv("HIVEX_BOX_API_KEY")); v != "" {

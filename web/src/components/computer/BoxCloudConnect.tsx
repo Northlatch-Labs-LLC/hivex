@@ -1,6 +1,6 @@
 /**
  * BoxCloudConnect — the cloud connection block shared by the Computer tab
- * and Settings: sign in to ascii.dev (primary), paste a key (fallback),
+ * and Settings: sign in to Gridframe Cloud (primary), paste a key (fallback),
  * the signed-in account line, the plan gate, and sign out.
  *
  * The onboarding step renders its own copy of this surface from the same
@@ -41,7 +41,7 @@ function SigninProgress({
   if (phase === "awaiting_login") {
     return (
       <span className="box-account-line" data-testid="box-signin-waiting">
-        Waiting for you to finish in the ascii.dev tab
+        Waiting for you to finish in the Gridframe tab
         {waitingSeconds >= 5
           ? ` (${waitingSeconds}s, checking every few seconds)`
           : ""}
@@ -114,7 +114,7 @@ function PasteKey({
       <input
         type="password"
         className="input computer-box-key-input"
-        aria-label="ascii.dev Box API key"
+        aria-label="Gridframe Cloud API key"
         placeholder="box_…"
         value={keyValue}
         onChange={(event) => onKeyChange(event.target.value)}
@@ -214,7 +214,7 @@ export function BoxCloudConnect({
             disabled={busy}
             data-testid="box-signin"
           >
-            Sign in to ascii.dev
+            Sign in to Gridframe Cloud
           </button>
         )}
         <SigninProgress
@@ -226,8 +226,8 @@ export function BoxCloudConnect({
       </div>
       {!signin.keySet ? (
         <p className="box-account-line" data-testid="box-plan-hint">
-          Boxes run on your own ascii.dev account and need a plan or the 7-day
-          trial; you pay ascii.dev directly.{" "}
+          Computers run on your own Gridframe account at gridframes.app; you
+          pay Gridframe directly.{" "}
           <a
             href={BOX_BILLING_URL}
             target="_blank"
@@ -255,7 +255,7 @@ export function BoxCloudConnect({
           className="computer-card-text computer-card-text--error"
           data-testid="box-signin-error"
         >
-          {signin.error} Use Sign in to ascii.dev to try again, or paste a key.
+          {signin.error} Use Sign in to Gridframe Cloud to try again, or paste a key.
         </p>
       ) : null}
       {!signin.keySet ? (
