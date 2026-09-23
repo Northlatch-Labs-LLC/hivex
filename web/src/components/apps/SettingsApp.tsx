@@ -821,6 +821,8 @@ function KeysSection({ cfg, save }: SectionProps) {
       ))}
 
       <SaveButton label="Save API keys" onSave={onSave} />
+
+      <CustomProvidersSection />
     </div>
   );
 }
@@ -1378,7 +1380,6 @@ export function SettingsApp() {
           <LocalLLMsSection cfg={data} save={save} />
         )}
         {section === "image-gen" && <ImageGenSection />}
-        {section === "custom-providers" && <CustomProvidersSection />}
         {section === "company" && <CompanySection cfg={data} save={save} />}
         {section === "keys" && <KeysSection cfg={data} save={save} />}
         {section === "integrations" && (

@@ -245,9 +245,9 @@ export function RuntimeMissingPaths({
           Use a cloud computer
         </div>
         <p className="computer-path-body">
-          Sign in to ascii.dev or paste a Box key. The desktop lives on a rented
-          machine with a persistent disk, so logins survive between turns. You
-          pay ascii.dev directly.
+          Sign in to Gridframe Cloud or paste a key. The desktop lives on a
+          rented machine with a persistent disk, so logins survive between
+          turns. You pay Gridframe directly.
         </p>
         <BoxCloudConnect
           compact={true}
@@ -312,7 +312,7 @@ export function BoxKeyField({ slug }: { slug: string }) {
       <input
         type="password"
         className="input computer-box-key-input"
-        aria-label="ascii.dev Box API key"
+        aria-label="Gridframe Cloud API key"
         placeholder={keySet ? "•••••••• (set)" : "box_…"}
         value={value}
         onChange={(e) => setValue(e.target.value)}

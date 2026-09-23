@@ -402,8 +402,7 @@ interface BoxAccountWire {
   billing_url?: string;
 }
 
-export const BOX_BILLING_URL =
-  "https://box.ascii.dev/box/dashboard?tab=billing";
+export const BOX_BILLING_URL = "https://gridframes.app";
 
 export function normalizeBoxAccount(wire: BoxAccountWire): BoxAccount {
   return {

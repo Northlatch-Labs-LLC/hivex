@@ -1125,8 +1125,7 @@ export type LLMRuntimeKind =
   | "codex"
   | "opencode"
   | "mlx-lm"
-  | "exo"
-  | "hiveapi";
+  | "exo";
 
 // GatewayKind names a runtime that is reached through an integration gateway
 // rather than dispatched directly. Gateway-bound bots are imported via the

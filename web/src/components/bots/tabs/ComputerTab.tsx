@@ -98,8 +98,8 @@ export function ComputerTab({ agent }: ComputerTabProps) {
       {phase === "unconfigured" ? (
         <div className="computer-card">
           <div className="computer-card-text computer-card-text--secondary">
-            Connect ascii.dev to give this bot a cloud computer. It spins up
-            right here on your account.
+            Connect Gridframe Cloud to give this bot a cloud computer. It spins
+            up right here on your account.
           </div>
           <BoxCloudConnect
             compact={true}

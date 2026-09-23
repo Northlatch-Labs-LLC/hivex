@@ -29,7 +29,7 @@ export function ComputerRunsOn({
         Pick where this bot's computer lives. <b>Local VM</b> is a
         Cua-controlled Linux desktop in a container on this machine, free and
         separate from your own desktop. <b>Cloud</b> rents a desktop from
-        ascii.dev Box with your key.
+        Gridframe Cloud computer with your key.
       </p>
       <fieldset className="computer-segmented" disabled={pending}>
         <legend className="sr-only">Where this bot's computer runs</legend>

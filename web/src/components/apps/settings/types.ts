@@ -9,7 +9,6 @@ import type { ConfigSnapshot, ConfigUpdate } from "../../../api/client";
 export type SectionId =
   | "general"
   | "local-llms"
-  | "custom-providers"
   | "image-gen"
   | "company"
   | "keys"

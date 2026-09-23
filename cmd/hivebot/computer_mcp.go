@@ -51,7 +51,7 @@ func runComputerMCP(args []string) int {
 	return 0
 }
 
-// runBoxMCP serves the cloud computer tools for an ascii.dev box.
+// runBoxMCP serves the cloud computer tools for a Gridframe Cloud box.
 func runBoxMCP(boxID string) int {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer cancel()

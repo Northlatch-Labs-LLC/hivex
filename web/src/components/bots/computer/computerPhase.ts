@@ -131,7 +131,7 @@ export function phaseCopy(phase: ComputerPhase, name: string): PhaseCopy {
     case "unconfigured":
       return {
         title: "No cloud computer configured",
-        hint: "Add an ascii.dev Box key below and it spins up right here.",
+        hint: "Add a Gridframe Cloud key below and it spins up right here.",
       };
     case "runtime_missing":
       return {

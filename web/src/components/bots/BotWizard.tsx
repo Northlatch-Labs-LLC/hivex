@@ -60,7 +60,6 @@ const PROVIDER_LABELS: Record<LLMRuntimeKind, string> = {
   "mlx-lm": "MLX-LM",
   ollama: "Ollama",
   exo: "Exo",
-  hiveapi: "HiveAPI Gateway",
 };
 
 function slugify(name: string): string {
