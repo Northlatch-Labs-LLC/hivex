@@ -1,0 +1,4 @@
+cycle,agent_id,kpi_pct,quality,cost_eff,collab,incidents,composite,action
+2026-Q3,ENG-04 Bastion,97,4.6,4.2,4.5,0,A,Maintain; stretch objective on cost/env
+2026-Q3,REV-01 Echo,88,4.1,4.4,4.0,0,A,Maintain
+2026-Q3,ENG-05 Tessellate,71,3.4,3.9,3.6,0,B,Coach: docs coverage curriculum via Mentor (30-day re-check)

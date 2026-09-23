@@ -1,0 +1,3 @@
+sprint_id,week,goal,items_committed,items_done,carryover,cost_usd,value_note
+S-2026-W38,2026-W38,Launch readiness: signup to first env boot <90s,18,17,1,412.00,Pilot converted; 2 self-serve signups
+S-2026-W39,2026-W39,First paying self-serve cohort with zero SEV1/SEV2,17,0,1,0.00,In progress

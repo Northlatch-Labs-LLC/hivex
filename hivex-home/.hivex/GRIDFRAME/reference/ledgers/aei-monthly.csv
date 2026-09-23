@@ -1,0 +1,3 @@
+month,revenue,pipeline,value_v,cost_d,cost_l,cost_a,cost_c,aei,status,action_ref
+2026-08,0.00,0.00,0.00,0.00,170.00,0.00,170.00,0.00,survival,MBR-2026-08; pre-revenue setup month
+2026-09,329.00,12000.00,1529.00,170.10,340.00,137.60,647.70,2.36,healthy,MBR-2026-09; baseline published

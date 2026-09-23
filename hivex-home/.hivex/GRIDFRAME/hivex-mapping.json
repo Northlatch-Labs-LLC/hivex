@@ -1,0 +1,21 @@
+{
+  "agent_primitive": "internal/team/broker_types.go:684 officeMember + internal/bot/types.go:24 BotConfig; dispatch internal/team/broker_governor.go:45 dispatchBotTurn(slug,prompt,channel)",
+  "scheduler_primitive": "internal/team/broker_types.go:792 schedulerJob; register internal/team/broker_scheduler.go:22 SetSchedulerJob; cron internal/calendar/cron.go:15 ParseCron (tz-naive; run broker under America/Los_Angeles)",
+  "store_primitive": "wiki FS hivex-home/.hivex/wiki/ + POST /wiki/write internal/team/broker.go:719; read /wiki/read /wiki/tree :732-743; agent files /agent-files/{read,write,generate} :724-726",
+  "table_primitive": "none native (rg datastore internal/ web/src -> 0 Go hits); 8 ledgers as custom append-only CSV store under GRIDFRAME/ (build in G1)",
+  "human_gate_primitive": "internal/team/policy_engine.go:135-169 PolicyDecision (irreversible=always human :169); blocking stdin back-channel internal/team/broker_approval_action.go:71,95; approve POST /execute/approve internal/team/broker_execute_approve.go:65 (route :703); grants internal/team/broker_action_grants.go (exact-capability, no wildcards)",
+  "notification_primitive": "POST /notifications/automation internal/team/broker_messages.go:25 handleAutomationNotifications (route :697); human inbox /inbox/items internal/team/broker_inbox.go (routes :686-692); digest internal/team/broker_chat_digest.go",
+  "office_ui_route_registry": "web/src/routes/routeRegistry.ts:1-19 APP_PANEL_IDS + FIRST_CLASS_APP_IDS; RootRoute.tsx; backend mux 138 routes internal/team/broker.go:681+",
+  "bindings_note": "values are officeMember slugs (to be created in G1 per roster; officeMember has no dept/tier/autonomy fields - carried in GRIDFRAME/roster.json + role cards at dispatch)",
+  "bindings": {
+    "EXE-00": "officeMember:exe-00", "EXE-01": "officeMember:exe-01",
+    "ENG-00": "officeMember:eng-00", "ENG-01": "officeMember:eng-01", "ENG-02": "officeMember:eng-02",
+    "ENG-03": "officeMember:eng-03", "ENG-04": "officeMember:eng-04", "ENG-05": "officeMember:eng-05",
+    "REV-00": "officeMember:rev-00", "REV-01": "officeMember:rev-01", "REV-02": "officeMember:rev-02",
+    "REV-03": "officeMember:rev-03", "REV-04": "officeMember:rev-04",
+    "OPS-00": "officeMember:ops-00", "OPS-01": "officeMember:ops-01", "OPS-02": "officeMember:ops-02", "OPS-03": "officeMember:ops-03",
+    "RSK-00": "officeMember:rsk-00", "RSK-01": "officeMember:rsk-01", "RSK-02": "officeMember:rsk-02", "RSK-03": "officeMember:rsk-03",
+    "PPL-00": "officeMember:ppl-00", "PPL-01": "officeMember:ppl-01", "PPL-02": "officeMember:ppl-02", "PPL-03": "officeMember:ppl-03",
+    "HOB-00": "principal human account (/humans internal/team/broker.go:727, broker_human.go)"
+  }
+}

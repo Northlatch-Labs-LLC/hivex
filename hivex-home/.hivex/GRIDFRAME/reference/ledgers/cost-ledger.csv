@@ -1,0 +1,7 @@
+txn_id,date,block,category,description,amount_usd,vendor,approval_ref
+CST-20260831-00,2026-08-31,L,human-labor,Principal supervision 2h @ $85 (pre-revenue setup),170.00,,
+CST-20260905-01,2026-09-05,A,agent-inference,GLM tier-A ops batch (Atlas+Forge+Counsel),96.40,zai-monthly,
+CST-20260905-02,2026-09-05,A,agent-inference,GLM tier-B ops batch (6 agents),41.20,zai-monthly,
+CST-20260910-03,2026-09-10,D,compute,Customer environment compute pool,142.10,cloud-vendor,APP-20260908-02
+CST-20260912-04,2026-09-12,D,tooling,Support desk + analytics stack,28.00,vendor-bundle,
+CST-20260915-05,2026-09-15,L,human-labor,Principal supervision 4h @ $85,340.00,,HOB-00
