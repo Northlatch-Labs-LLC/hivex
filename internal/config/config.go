@@ -122,6 +122,12 @@ type Config struct {
 	// this map.
 	ProviderEndpoints map[string]ProviderEndpoint `json:"provider_endpoints,omitempty"`
 	ImageEndpoints    map[string]ImageEndpoint    `json:"image_endpoints,omitempty"`
+	// CustomProviders are user-defined OpenAI-compatible providers managed from
+	// Settings. Each entry's ID doubles as its provider Kind (always
+	// CustomProviderKindPrefix-prefixed), so it can be selected as an
+	// install-wide LLMProvider or per-bot runtime once the provider layer
+	// registers it. See custom_provider.go.
+	CustomProviders []CustomProvider `json:"custom_providers,omitempty"`
 }
 
 // ProviderEndpoint configures one OpenAI-compatible HTTP backend.

@@ -1,5 +1,6 @@
 import {
   Building,
+  Cloud,
   Key,
   Lock,
   MediaImage,
@@ -22,6 +23,7 @@ export const SECTION_GROUPS: SectionGroup[] = [
     items: [
       { id: "general", Icon: SettingsIcon, name: "General" },
       { id: "local-llms", Icon: Terminal, name: "Local LLMs" },
+      { id: "custom-providers", Icon: Cloud, name: "Custom providers" },
       { id: "image-gen", Icon: MediaImage, name: "Image generation" },
       { id: "company", Icon: Building, name: "Company" },
     ],
