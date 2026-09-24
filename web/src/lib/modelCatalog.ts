@@ -30,6 +30,11 @@ const CLOUD_MODELS: Record<
   Exclude<LLMRuntimeKind, "mlx-lm" | "ollama" | "exo">,
   string[]
 > = {
+  zai: [
+    // First-class HTTP runtime over the Anthropic protocol. Only verified
+    // plan ids belong here; discovery fills the rest live.
+    "GLM-5.3",
+  ],
   "zai-code": [
     // The GLM Coding Plan catalog, current-first. Only ids verified against
     // the plan belong here — no speculative model names.

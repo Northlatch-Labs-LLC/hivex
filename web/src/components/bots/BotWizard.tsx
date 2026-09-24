@@ -17,8 +17,9 @@ import {
   CUSTOM_MODEL_VALUE,
   INHERIT_MODEL_VALUE,
   isCatalogModel,
-  modelOptionsForKind,
 } from "../../lib/modelCatalog";
+import { useProviderModels } from "../../lib/useProviderModels";
+import { FALLBACK_LLM_KINDS } from "../../lib/runtimeProviders";
 
 // "inherit" is the wizard-only sentinel that maps to an absent ProviderBinding
 // in the POST body (the broker then falls back to the install-wide default at
@@ -55,6 +56,7 @@ const INITIAL_FORM: BotFormData = {
 // they just fall back to the raw kind string.
 const PROVIDER_LABELS: Record<LLMRuntimeKind, string> = {
   "claude-code": "Claude Code",
+  zai: "Z.ai (GLM)",
   "zai-code": "Z.ai Code",
   codex: "Codex",
   opencode: "Opencode",
@@ -99,7 +101,7 @@ function WizardModelPicker({
   onChange: (next: string) => void;
   localStatuses: LocalProviderStatus[];
 }) {
-  const options = modelOptionsForKind(providerKind, localStatuses);
+  const { options } = useProviderModels(providerKind, localStatuses);
   const valueIsCatalog = isCatalogModel(providerKind, value, localStatuses);
   const [customMode, setCustomMode] = useState(!valueIsCatalog && value !== "");
   // Re-sync custom mode when the runtime kind switches under us.
@@ -140,7 +142,7 @@ function WizardModelPicker({
         }}
         style={{ flex: customMode ? "0 0 160px" : 1 }}
       >
-        {options.map((o) => (
+        {options.map((o: { value: string; label: string; discovered?: boolean }) => (
           <option key={o.value || "default"} value={o.value}>
             {o.label}
           </option>
@@ -195,14 +197,7 @@ export function BotWizard({ open, onClose, onCreated }: BotWizardProps) {
     staleTime: 30_000,
   });
   const localStatuses: LocalProviderStatus[] = localStatusQuery.data ?? [];
-  const llmKinds: LLMRuntimeKind[] = (configQuery.data?.llm_provider_kinds ?? [
-    "claude-code",
-    "codex",
-    "opencode",
-    "mlx-lm",
-    "ollama",
-    "exo",
-  ]) as LLMRuntimeKind[];
+  const llmKinds: LLMRuntimeKind[] = configQuery.data?.llm_provider_kinds ?? FALLBACK_LLM_KINDS;
 
   async function handleGenerate() {
     const trimmed = prompt.trim();

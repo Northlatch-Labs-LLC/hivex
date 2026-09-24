@@ -32,8 +32,9 @@ import {
   CUSTOM_MODEL_VALUE,
   INHERIT_MODEL_VALUE,
   isCatalogModel,
-  modelOptionsForKind,
 } from "../../lib/modelCatalog";
+import { useProviderModels } from "../../lib/useProviderModels";
+import { FALLBACK_LLM_KINDS } from "../../lib/runtimeProviders";
 import { router } from "../../lib/router";
 import { useAppStore } from "../../stores/app";
 import { HarnessBadge } from "../ui/HarnessBadge";
@@ -43,6 +44,7 @@ import { BotInstructionsSection } from "./BotInstructionsSection";
 
 const PROVIDER_LABELS: Record<LLMRuntimeKind, string> = {
   "claude-code": "Claude Code",
+  zai: "Z.ai (GLM)",
   "zai-code": "Z.ai Code",
   codex: "Codex",
   opencode: "Opencode",
@@ -429,7 +431,7 @@ function ModelPicker({
   onChange: (next: string) => void;
   localStatuses: LocalProviderStatus[];
 }) {
-  const options = modelOptionsForKind(kind, localStatuses);
+  const { options } = useProviderModels(kind, localStatuses);
   // Custom-mode is sticky once entered (selecting Custom… from the
   // dropdown stays in custom mode even after the underlying text matches
   // a catalog entry). That avoids the dropdown switching back mid-type
@@ -478,7 +480,7 @@ function ModelPicker({
         }}
         style={{ flex: customMode ? "0 0 130px" : 1 }}
       >
-        {options.map((o) => (
+        {options.map((o: { value: string; label: string; discovered?: boolean }) => (
           <option key={o.value || "default"} value={o.value}>
             {o.label}
           </option>
@@ -527,14 +529,7 @@ function RuntimeSection({
     staleTime: 30_000,
   });
   const localStatuses: LocalProviderStatus[] = localStatusQuery.data ?? [];
-  const llmKinds: LLMRuntimeKind[] = (configQuery.data?.llm_provider_kinds ?? [
-    "claude-code",
-    "codex",
-    "opencode",
-    "mlx-lm",
-    "ollama",
-    "exo",
-  ]) as LLMRuntimeKind[];
+  const llmKinds: LLMRuntimeKind[] = configQuery.data?.llm_provider_kinds ?? FALLBACK_LLM_KINDS;
   const globalDefault = configQuery.data?.llm_provider ?? "claude-code";
 
   const binding = bindingFromMember(agent.provider);

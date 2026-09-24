@@ -62,6 +62,19 @@ export const RUNTIME_PROVIDER_OPTIONS: readonly RuntimeProviderOption[] = [
   },
 ] as const;
 
+// Fallback kind list when /config has not reported llm_provider_kinds —
+// kept in one place so pickers never drift again.
+export const FALLBACK_LLM_KINDS: LLMRuntimeKind[] = [
+  "claude-code",
+  "zai-code",
+  "zai",
+  "codex",
+  "opencode",
+  "mlx-lm",
+  "ollama",
+  "exo",
+];
+
 const OPTION_BY_ID = new Map(RUNTIME_PROVIDER_OPTIONS.map((p) => [p.id, p]));
 
 export function runtimeProviderLabel(id: string): string {

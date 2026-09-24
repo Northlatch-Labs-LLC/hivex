@@ -63,7 +63,7 @@ export const AGENT_TABS: Array<{ id: BotTab; label: string }> = [
   { id: "knowledge", label: "Knowledge" },
   { id: "policies", label: "Policies" },
   { id: "live-stream", label: "Live Stream" },
-  { id: "config", label: "Config" },
+  { id: "config", label: "Runtime & Model" },
 ];
 
 // ── Props ────────────────────────────────────────────────────────

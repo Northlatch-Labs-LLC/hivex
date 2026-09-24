@@ -854,6 +854,7 @@ func (b *Broker) StartOnPort(port int) error {
 	mux.HandleFunc("/custom-providers/delete/", b.requireAuth(b.handleCustomProviderDelete))
 	mux.HandleFunc("/custom-providers/test", b.requireAuth(b.handleCustomProviderTest))
 	mux.HandleFunc("/zai-key/verify", b.requireAuth(b.handleZaiKeyVerify))
+	mux.HandleFunc("/provider-models", b.requireAuth(b.handleProviderModels))
 	mux.HandleFunc("/marketplace", b.requireAuth(b.handleMarketplaceCatalog))
 	mux.HandleFunc("/marketplace/install", b.requireAuth(b.handleMarketplaceInstall))
 	mux.HandleFunc("/marketplace/uninstall", b.requireAuth(b.handleMarketplaceUninstall))

@@ -980,6 +980,7 @@ export function setMemory(namespace: string, key: string, value: string) {
 // subset returned by provider.LLMProviderKinds in the Go layer.
 export type LLMRuntimeKind =
   | "claude-code"
+  | "zai"
   | "zai-code"
   | "ollama"
   | "codex"
@@ -1158,6 +1159,11 @@ export interface InferenceEntryDTO {
     total_tokens?: number;
     requests?: number;
   };
+}
+
+/** Live model ids a provider kind serves (best-effort discovery). */
+export function getProviderModels(kind: string) {
+  return get<{ kind: string; models: string[] }>("/provider-models", { kind });
 }
 
 /** Verify a Z.ai key with a real 1-token call; a fresh valid key is saved. */

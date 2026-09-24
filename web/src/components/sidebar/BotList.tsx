@@ -84,6 +84,10 @@ function SidebarBotRow({
   );
   const onComputer = working && computerReady;
   const harness = resolveHarness(agent.provider, defaultHarness);
+  const boundModel =
+    typeof agent.provider === "object"
+      ? agent.provider?.model?.trim()
+      : undefined;
   const displayName = agent.name || agent.slug;
 
   return (
@@ -157,6 +161,20 @@ function SidebarBotRow({
         </span>
         <div className="sidebar-bot-wrap">
           <span className="sidebar-bot-name">{displayName}</span>
+          {boundModel ? (
+            <span
+              className="sidebar-bot-model"
+              title={`Bound model: ${boundModel}`}
+              style={{
+                fontSize: 9,
+                color: "var(--text-tertiary)",
+                fontFamily: "var(--font-mono, monospace)",
+                marginLeft: 4,
+              }}
+            >
+              {boundModel}
+            </span>
+          ) : null}
           <BotEventPill
             slug={agent.slug}
             agentRole={agent.role}

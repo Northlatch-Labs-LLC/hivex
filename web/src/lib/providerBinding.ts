@@ -14,6 +14,7 @@ import type {
 // Human-readable labels for the directly-dispatchable runtimes.
 export const PROVIDER_LABELS: Record<LLMRuntimeKind, string> = {
   "claude-code": "Claude Code",
+  zai: "Z.ai (GLM)",
   "zai-code": "Z.ai Code",
   codex: "Codex",
   opencode: "Opencode",
