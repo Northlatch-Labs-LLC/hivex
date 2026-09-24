@@ -15,11 +15,11 @@ const (
 	Sev3 = "SEV3"
 )
 
-// PostLogWindow: a SEV1 emergency is acted on under L3 first; the log must
-// land within 15 minutes of the act (§4 "log within 15 min after", §6).
+// PostLogWindow bounds when a SEV1 emergency must be logged — action
+// happens under L3 first; the log follows (§4 "log within 15 min after", §6).
 const PostLogWindow = 15 * time.Minute
 
-// ErrBadSeverity: unknown severity is rejected fail-closed.
+// ErrBadSeverity reports an unknown severity; the gate rejects it fail-closed.
 var ErrBadSeverity = errNew("gridframe: severity must be SEV1, SEV2 or SEV3")
 
 // Exception is the fact set for a declaration.
@@ -90,7 +90,7 @@ func (s *Store) Resolve(excID, resolution string) error {
 	return ErrExcNotFound
 }
 
-// PostmortemDueWindow: every SEV1/SEV2 gets a postmortem ≤ 48h (§6).
+// PostmortemDueWindow is the deadline for a SEV1/SEV2 postmortem: ≤ 48h (§6).
 const PostmortemDueWindow = 48 * time.Hour
 
 // PostmortemDue lists open SEV1/SEV2 rows with no postmortem_ref whose

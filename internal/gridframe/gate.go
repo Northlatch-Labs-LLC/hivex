@@ -47,7 +47,7 @@ func IsReserve(category string) bool {
 	return false
 }
 
-// ErrHumanReserve: reserve actions require an authenticated human action
+// ErrHumanReserve reports that reserve actions require an authenticated human action
 // event; no agent action and no approval tier can authorize them.
 var ErrHumanReserve = errNew("gridframe: human-reserve action rejected; requires authenticated human action event")
 
@@ -88,7 +88,7 @@ func (g *Gate) Evaluate(a Action, date string) GateDecision {
 	return GateDecision{Decision: Block, Reason: tier + " blocks until human approval", ItemID: row[0]}
 }
 
-// refuses those outright. Human records the action as executed-by-human.
+// HumanExecute records a human-reserve action as executed by an authenticated human.
 func (g *Gate) HumanExecute(a Action, date string) error {
 	if a.Reserve == "" {
 		return errNew("gridframe: HumanExecute is for human-reserve actions only")
@@ -100,7 +100,7 @@ func (g *Gate) HumanExecute(a Action, date string) error {
 	return nil
 }
 
-// EscalationDue: undecided T2 items older than 48h auto-escalate to the
+// EscalationDue returns the undecided T2 items older than 48h, which auto-escalate to the
 // next MBR agenda with a "cost of delay" estimate (§4). Returns the pending
 // T2 rows whose raised_date is more than 48h before now.
 func (g *Gate) EscalationDue(now time.Time) []Row {
@@ -133,7 +133,7 @@ func CostOfDelay(a Action) float64 {
 	return c
 }
 
-// Reject: the action is refused outright — not blocked-for-approval.
+// Reject refuses the action outright — not blocked-for-approval.
 const Reject = "reject"
 
 // ApprovalEvent is the decision record for a pending queue row. Human=true

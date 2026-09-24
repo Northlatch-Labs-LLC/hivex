@@ -17,7 +17,7 @@ import (
 // (internal/onboarding/handlers.go:108). May be nil (tests).
 type AuthMiddleware func(http.HandlerFunc) http.HandlerFunc
 
-// ErrEngineOnly: aei-monthly appends are engine-only (G3 §5.3 constraint).
+// ErrEngineOnly reports that aei-monthly appends are engine-only (G3 §5.3 constraint).
 var ErrEngineOnly = errNew("gridframe: aei-monthly rows are appended by the AEI engine only")
 
 // RegisterRoutes wires the G4 surface onto mux (Go 1.22 method patterns).

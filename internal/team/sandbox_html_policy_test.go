@@ -1,7 +1,6 @@
 package team
 
 import (
-	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -20,7 +19,7 @@ func testSandboxPolicy() sandboxHTMLPolicy {
 			return "", false
 		},
 		newErr: func(format string, args ...any) error {
-			return errors.New(fmt.Sprintf(format, args...))
+			return fmt.Errorf(format, args...)
 		},
 	}
 }

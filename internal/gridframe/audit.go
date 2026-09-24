@@ -8,7 +8,7 @@ package gridframe
 
 import "sort"
 
-// MinSampleRate: at least 5% of executed T1+ actions per month.
+// MinSampleRate is the audit floor: at least 5% of executed T1+ actions per month.
 const MinSampleRate = 0.05
 
 // Verdict values.

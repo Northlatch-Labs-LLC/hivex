@@ -80,7 +80,7 @@ func ApproverFor(tier, dept string) string {
 	return ""
 }
 
-// ErrNoQueueRow: T0 is log-only — §4 creates queue rows for T1+ only.
+// ErrNoQueueRow reports that T0 is log-only — §4 creates queue rows for T1+ only.
 var ErrNoQueueRow = errNew("gridframe: tier T0 is log-only; no approval-queue row")
 
 // Raise creates the approval-queue row for a T1+ action BEFORE execution
