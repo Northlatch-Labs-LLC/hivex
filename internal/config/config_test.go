@@ -236,7 +236,7 @@ func TestResolveMemoryBackendDefaultsToGBrainWhenReady(t *testing.T) {
 	// key configured, an empty config resolves to gbrain rather than markdown.
 	withTempConfig(t, func(_ string) {
 		t.Setenv("HIVEX_MEMORY_BACKEND", "")
-		t.Setenv("HIVEX_OPENAI_API_KEY", "sk-test-openai")
+		t.Setenv("HIVEX_OPENAI_API_KEY", "sk-test-openai-0123456789abcdef")
 		t.Setenv("HIVEX_ANTHROPIC_API_KEY", "")
 		t.Setenv("ANTHROPIC_API_KEY", "")
 		fakeGBrainOnPath(t)
@@ -253,7 +253,7 @@ func TestResolveMemoryBackendExplicitCommandMissingDoesNotFallBack(t *testing.T)
 	// at the user-global one. Not installed → markdown default.
 	withTempConfig(t, func(_ string) {
 		t.Setenv("HIVEX_MEMORY_BACKEND", "")
-		t.Setenv("HIVEX_OPENAI_API_KEY", "sk-test-openai")
+		t.Setenv("HIVEX_OPENAI_API_KEY", "sk-test-openai-0123456789abcdef")
 		t.Setenv("HIVEX_ANTHROPIC_API_KEY", "")
 		t.Setenv("ANTHROPIC_API_KEY", "")
 		fakeGBrainOnPath(t)
@@ -323,7 +323,7 @@ func TestResolveMemoryBackendExplicitMarkdownOverridesGBrainDefault(t *testing.T
 	// when gbrain would otherwise be the default.
 	withTempConfig(t, func(_ string) {
 		t.Setenv("HIVEX_MEMORY_BACKEND", MemoryBackendMarkdown)
-		t.Setenv("HIVEX_OPENAI_API_KEY", "sk-test-openai")
+		t.Setenv("HIVEX_OPENAI_API_KEY", "sk-test-openai-0123456789abcdef")
 		fakeGBrainOnPath(t)
 		if got := ResolveMemoryBackend(""); got != MemoryBackendMarkdown {
 			t.Fatalf("expected explicit markdown to win over gbrain default, got %q", got)

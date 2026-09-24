@@ -97,8 +97,6 @@ type TurnMeter interface {
 	MeterTurn(bot, taskID string, failed bool)
 }
 
-// TurnBegin opens a turn in intake and persists the record. Nil-safe: a
-// brokerless launcher (tests, degraded modes) gets a record ID that no-ops.
 // StampTurnUsage records the turn's token usage from the runner's stream
 // close. Nil-safe and idempotent (last write wins while the turn is open).
 func (b *Broker) StampTurnUsage(id string, usage provider.ClaudeUsage) {
@@ -116,6 +114,8 @@ func (b *Broker) StampTurnUsage(id string, usage provider.ClaudeUsage) {
 	}
 }
 
+// TurnBegin opens a turn in intake and persists the record. Nil-safe: a
+// brokerless launcher (tests, degraded modes) gets a record ID that no-ops.
 func (b *Broker) TurnBegin(bot, taskID, channel string) string {
 	id := fmt.Sprintf("turn-%s-%d", strings.ToLower(strings.TrimSpace(bot)), time.Now().UnixNano())
 	if b == nil {

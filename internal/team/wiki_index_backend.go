@@ -26,10 +26,11 @@ package team
 import (
 	"context"
 	"fmt"
-	"github.com/Northlatch-Labs-LLC/hivex/internal/config"
 	"log"
 	"os"
 	"strings"
+
+	"github.com/Northlatch-Labs-LLC/hivex/internal/config"
 	"sync/atomic"
 	"testing"
 
