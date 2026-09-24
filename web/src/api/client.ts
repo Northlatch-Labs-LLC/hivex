@@ -1072,7 +1072,6 @@ export interface ConfigSnapshot {
   openai_key_set?: boolean;
   anthropic_key_set?: boolean;
   zai_key_set?: boolean;
-  hiveapi_key_set?: boolean;
   gemini_key_set?: boolean;
   minimax_key_set?: boolean;
   one_key_set?: boolean;
@@ -1118,7 +1117,6 @@ export type ConfigUpdate = Partial<{
   openai_api_key: string;
   anthropic_api_key: string;
   zai_api_key: string;
-  hiveapi_api_key: string;
   gemini_api_key: string;
   minimax_api_key: string;
   one_api_key: string;

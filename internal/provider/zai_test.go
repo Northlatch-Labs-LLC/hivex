@@ -54,19 +54,6 @@ func TestZaiRoutesToCompatRunner(t *testing.T) {
 	}
 }
 
-// HiveAPI keys resolve through the same env-first, config-second contract.
-func TestResolveHiveAPIKeyConfig(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "config.json")
-	if err := os.WriteFile(path, []byte(`{"hiveapi_api_key":"gw-key"}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("HIVEX_CONFIG_PATH", path)
-	t.Setenv("HIVEX_HIVEAPI_API_KEY", "")
-	if got := resolveOpenAICompatAPIKey(KindHiveAPI); got != "gw-key" {
-		t.Fatalf("gateway key must resolve from config, got %q", got)
-	}
-}
-
 // Z.ai Code is a CLI-class kind: validated, registered, and NOT routed to
 // the headless compat runner — it drives the claude engine instead.
 func TestZAICodeIsACLIRuntime(t *testing.T) {

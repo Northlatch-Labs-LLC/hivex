@@ -239,11 +239,6 @@ func resolveOpenAICompatAPIKey(kind string) string {
 			return v
 		}
 	}
-	if kind == KindHiveAPI {
-		if v := config.ResolveHiveAPIAPIKey(); v != "" {
-			return v
-		}
-	}
 	if kind == KindHermesBot {
 		if v := strings.TrimSpace(os.Getenv("API_SERVER_KEY")); v != "" {
 			return v
