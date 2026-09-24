@@ -53,7 +53,15 @@ test.describe("hivex web UI smoke (office)", () => {
     await expect(page.getByTestId("sidebar-section-agents")).toBeVisible({
       timeout: 10_000,
     });
-    await expect(page.getByTestId("sidebar-section-apps")).toBeVisible({
+    // The office IA is Work/Build/Govern since the action-oriented sidebar
+    // redesign; "apps" as one flat section no longer exists.
+    await expect(page.getByTestId("sidebar-section-work")).toBeVisible({
+      timeout: 10_000,
+    });
+    await expect(page.getByTestId("sidebar-section-build")).toBeVisible({
+      timeout: 10_000,
+    });
+    await expect(page.getByTestId("sidebar-section-govern")).toBeVisible({
       timeout: 10_000,
     });
 
