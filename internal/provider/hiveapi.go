@@ -27,9 +27,9 @@ const (
 
 func init() {
 	Register(&Entry{
-		Kind:         KindHiveAPI,
-		StreamFn:     NewOpenAICompatStreamFn(KindHiveAPI, defaultHiveAPIBaseURL, defaultHiveAPIModel),
-		OpenAICompat: true,
+		Kind:      KindHiveAPI,
+		StreamFn:  NewOpenAICompatStreamFn(KindHiveAPI, defaultHiveAPIBaseURL, defaultHiveAPIModel),
+		Transport: TransportOpenAICompat,
 		Capabilities: Capabilities{
 			// Headless HTTP runtime: no interactive pane.
 			PaneEligible:    false,

@@ -53,12 +53,12 @@ type Capabilities struct {
 type Entry struct {
 	Kind     string
 	StreamFn func(slug string) bot.StreamFn
-	// OpenAICompat marks StreamFn as the OpenAI-compatible HTTP transport
-	// (NewOpenAICompatStreamFn). Turn dispatch routes these kinds to the
-	// headless compat runner via IsOpenAICompatKind — derived from this
-	// flag so every compat runtime (zai, Settings-managed custom-*) is
-	// routable without a second hand-maintained kind list.
-	OpenAICompat bool
+	// Transport tags the headless HTTP wire protocol StreamFn speaks:
+	// TransportOpenAICompat or TransportAnthropic ("" = CLI/other, not a
+	// headless HTTP runtime). Turn dispatch and provider.NewStreamFnFor
+	// route on this — the single source of transport truth, so new kinds
+	// never need a hand-maintained list anywhere.
+	Transport    string
 	OneShot      func(systemPrompt, prompt, cwd string) (string, error)
 	OneShotCtx   func(ctx context.Context, systemPrompt, prompt, cwd string) (string, error)
 	Capabilities Capabilities
@@ -69,13 +69,58 @@ var (
 	registry   = map[string]*Entry{}
 )
 
-// IsOpenAICompatKind reports whether kind is a registered runtime whose
-// stream transport is the OpenAI-compatible HTTP client.
-func IsOpenAICompatKind(kind string) bool {
+// Transport tags for Entry.Transport.
+const (
+	TransportNone         = ""
+	TransportOpenAICompat = "openai-compat"
+	TransportAnthropic    = "anthropic"
+)
+
+// IsHeadlessHTTPKind reports whether kind is a registered runtime whose
+// StreamFn speaks a headless HTTP protocol (OpenAI-compat or Anthropic
+// messages) — the kinds turn dispatch routes to the headless stream runner.
+func IsHeadlessHTTPKind(kind string) bool {
 	registryMu.RLock()
 	defer registryMu.RUnlock()
 	e, ok := registry[kind]
-	return ok && e.OpenAICompat
+	return ok && e.Transport != TransportNone
+}
+
+// NewStreamFnFor is the single place a turn runner asks for a stream fn:
+// it picks the transport family from the kind's registry entry so no
+// caller hardcodes a protocol constructor. modelOverride (the member's
+// persisted binding model) wins over env/config/compile-time defaults.
+func NewStreamFnFor(ctx context.Context, kind, modelOverride, botSlug string) bot.StreamFn {
+	registryMu.RLock()
+	e, ok := registry[kind]
+	registryMu.RUnlock()
+	if !ok {
+		return streamFnError(fmt.Sprintf("provider: kind %q is not registered", kind))
+	}
+	switch e.Transport {
+	case TransportOpenAICompat:
+		return NewOpenAICompatStreamFnWithCtxModelAndBot(ctx, kind, modelOverride, botSlug)
+	case TransportAnthropic:
+		if baseURL, model := anthropicDefaultsFor(kind); baseURL == "" && model == "" {
+			return streamFnError(fmt.Sprintf("anthropic (%s): kind has no registered defaults — did its init() forget to call NewAnthropicMessagesStreamFn?", kind))
+		}
+		return func(msgs []bot.Message, tools []bot.BotTool) <-chan bot.StreamChunk {
+			ch := make(chan bot.StreamChunk, 64)
+			go runAnthropicMessagesStream(ctx, ch, kind, msgs, modelOverride, tools)
+			return ch
+		}
+	default:
+		return streamFnError(fmt.Sprintf("provider: kind %q has no headless HTTP transport (Transport=%q)", kind, e.Transport))
+	}
+}
+
+func streamFnError(msg string) bot.StreamFn {
+	return func([]bot.Message, []bot.BotTool) <-chan bot.StreamChunk {
+		ch := make(chan bot.StreamChunk, 1)
+		ch <- bot.StreamChunk{Type: "error", Content: msg}
+		close(ch)
+		return ch
+	}
 }
 
 // Register installs a provider Entry. It also teaches the config layer to

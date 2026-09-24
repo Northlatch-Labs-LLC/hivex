@@ -17,9 +17,9 @@ const (
 
 func init() {
 	Register(&Entry{
-		Kind:         KindOllama,
-		StreamFn:     NewOpenAICompatStreamFn(KindOllama, defaultOllamaBaseURL, defaultOllamaModel),
-		OpenAICompat: true,
+		Kind:      KindOllama,
+		StreamFn:  NewOpenAICompatStreamFn(KindOllama, defaultOllamaBaseURL, defaultOllamaModel),
+		Transport: TransportOpenAICompat,
 		Capabilities: Capabilities{
 			PaneEligible:    false,
 			SupportsOneShot: false,

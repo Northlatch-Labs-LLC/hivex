@@ -21,9 +21,9 @@ func RegisterCustomProviders() {
 		}
 		kind := cp.ID
 		Replace(&Entry{
-			Kind:         kind,
-			StreamFn:     NewOpenAICompatStreamFn(kind, "", ""),
-			OpenAICompat: true,
+			Kind:      kind,
+			StreamFn:  NewOpenAICompatStreamFn(kind, "", ""),
+			Transport: TransportOpenAICompat,
 			Capabilities: Capabilities{
 				// Headless HTTP runtime, same shape as hiveapi.
 				PaneEligible:    false,

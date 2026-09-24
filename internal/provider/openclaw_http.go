@@ -12,9 +12,9 @@ const (
 
 func init() {
 	Register(&Entry{
-		Kind:         KindOpenclawHTTP,
-		StreamFn:     NewOpenAICompatStreamFn(KindOpenclawHTTP, defaultOpenclawHTTPBaseURL, defaultOpenclawHTTPModel),
-		OpenAICompat: true,
+		Kind:      KindOpenclawHTTP,
+		StreamFn:  NewOpenAICompatStreamFn(KindOpenclawHTTP, defaultOpenclawHTTPBaseURL, defaultOpenclawHTTPModel),
+		Transport: TransportOpenAICompat,
 		Capabilities: Capabilities{
 			PaneEligible:    false,
 			SupportsOneShot: false,

@@ -137,7 +137,7 @@ func (l *Launcher) runHeadlessOpenAICompatTurn(ctx context.Context, slug string,
 	if modelOverride == "" {
 		modelOverride = strings.TrimSpace(l.broker.MemberProviderBinding(slug).Model)
 	}
-	streamFn := provider.NewOpenAICompatStreamFnWithCtxModelAndBot(ctx, kind, modelOverride, slug)
+	streamFn := provider.NewStreamFnFor(ctx, kind, modelOverride, slug)
 
 	// Live-chat relay streams the model's user-facing text to the channel
 	// at sentence/paragraph boundaries, so the room sees the bot's reply
@@ -350,11 +350,14 @@ func looksUnparsedToolCall(text string) bool {
 // Centralised here so the dispatcher in headless_codex.go and any future
 // caller stay in sync without duplicating the list.
 func isOpenAICompatKind(kind string) bool {
-	// Delegates to the provider registry so every OpenAI-compatible runtime
-	// — zai, Settings-managed custom-* entries, anything added later —
-	// routes to this runner by construction. The previous hand-maintained
-	// list silently fell compat-bound bots through to the claude runner.
-	return provider.IsOpenAICompatKind(kind)
+	// Delegates to the provider registry so every headless HTTP runtime —
+	// openai-compat kinds, zai (Anthropic messages protocol), anything
+	// added later — routes to this runner by construction. The previous
+	// hand-maintained list silently fell compat-bound bots through to the
+	// claude runner. The file keeps its openai-compat name for history; the
+	// runner is transport-agnostic (provider.NewStreamFnFor picks the wire
+	// protocol from the kind's Transport tag).
+	return provider.IsHeadlessHTTPKind(kind)
 }
 
 // openAICompatTextOnlyPrompt wraps the standard system prompt with a leading

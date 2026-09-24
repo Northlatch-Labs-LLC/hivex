@@ -16,9 +16,9 @@ const (
 
 func init() {
 	Register(&Entry{
-		Kind:         KindExo,
-		StreamFn:     NewOpenAICompatStreamFn(KindExo, defaultExoBaseURL, defaultExoModel),
-		OpenAICompat: true,
+		Kind:      KindExo,
+		StreamFn:  NewOpenAICompatStreamFn(KindExo, defaultExoBaseURL, defaultExoModel),
+		Transport: TransportOpenAICompat,
 		Capabilities: Capabilities{
 			PaneEligible:    false,
 			SupportsOneShot: false,
