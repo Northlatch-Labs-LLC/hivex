@@ -769,6 +769,27 @@ func ResolveTelegramBotToken() string {
 	return strings.TrimSpace(cfg.TelegramBotToken)
 }
 
+// KeyFingerprint renders a credential for display: first four and last
+// four characters only. Never place a full key in a response body or log.
+func KeyFingerprint(v string) string {
+	v = strings.TrimSpace(v)
+	if len(v) <= 8 {
+		return strings.Repeat("*", len(v))
+	}
+	return v[:4] + "…" + v[len(v)-4:]
+}
+
+// plausibleAPIKey reports whether v is long enough to be a real credential.
+// Short placeholders ("sk-", truncated pastes) must not count as configured:
+// they flip *_key_set flags and send bogus auth where "not configured" is
+// the truth.
+func plausibleAPIKey(v string) bool {
+	return len(strings.TrimSpace(v)) >= 20
+}
+
+// PlausibleAPIKey is the exported check for status surfaces.
+func PlausibleAPIKey(v string) bool { return plausibleAPIKey(v) }
+
 // ResolveZaiAPIKey returns the Z.ai coding-plan key (env HIVEX_ZAI_API_KEY
 // first, then config zai_api_key — the Settings → Credentials slot).
 func ResolveZaiAPIKey() string {
@@ -880,29 +901,39 @@ func ResolveGeminiAPIKey() string {
 }
 
 // ResolveAnthropicAPIKey resolves the Anthropic API key.
-// Resolution: HIVEX_ANTHROPIC_API_KEY env > ANTHROPIC_API_KEY env > config file.
+// Resolution: HIVEX_ANTHROPIC_API_KEY env > config file > ambient ANTHROPIC_API_KEY.
+// Config outranks the machine's ambient key so what the operator typed in
+// Settings is authoritative; the ambient variable is a last resort and
+// placeholder-grade values never qualify.
 func ResolveAnthropicAPIKey() string {
-	if v := strings.TrimSpace(Getenv("HIVEX_ANTHROPIC_API_KEY")); v != "" {
-		return v
-	}
-	if v := strings.TrimSpace(os.Getenv("ANTHROPIC_API_KEY")); v != "" {
+	if v := strings.TrimSpace(Getenv("HIVEX_ANTHROPIC_API_KEY")); plausibleAPIKey(v) {
 		return v
 	}
 	cfg, _ := Load()
-	return strings.TrimSpace(cfg.AnthropicAPIKey)
+	if v := strings.TrimSpace(cfg.AnthropicAPIKey); plausibleAPIKey(v) {
+		return v
+	}
+	if v := strings.TrimSpace(os.Getenv("ANTHROPIC_API_KEY")); plausibleAPIKey(v) {
+		return v
+	}
+	return ""
 }
 
 // ResolveOpenAIAPIKey resolves the OpenAI API key.
-// Resolution: HIVEX_OPENAI_API_KEY env > OPENAI_API_KEY env > config file.
+// Resolution: HIVEX_OPENAI_API_KEY env > config file > ambient OPENAI_API_KEY
+// (Settings is authoritative over the machine; placeholders never qualify).
 func ResolveOpenAIAPIKey() string {
-	if v := strings.TrimSpace(Getenv("HIVEX_OPENAI_API_KEY")); v != "" {
-		return v
-	}
-	if v := strings.TrimSpace(os.Getenv("OPENAI_API_KEY")); v != "" {
+	if v := strings.TrimSpace(Getenv("HIVEX_OPENAI_API_KEY")); plausibleAPIKey(v) {
 		return v
 	}
 	cfg, _ := Load()
-	return strings.TrimSpace(cfg.OpenAIAPIKey)
+	if v := strings.TrimSpace(cfg.OpenAIAPIKey); plausibleAPIKey(v) {
+		return v
+	}
+	if v := strings.TrimSpace(os.Getenv("OPENAI_API_KEY")); plausibleAPIKey(v) {
+		return v
+	}
+	return ""
 }
 
 // DefaultRealtimeModel is the OpenAI Realtime model used by the demo call when

@@ -156,6 +156,9 @@ func (b *Broker) handleConfig(w http.ResponseWriter, r *http.Request) {
 			// section, BotWizard provider field). Gateway kinds (openclaw,
 			// hermes-bot) are excluded; the Integrations app surfaces them.
 			"llm_provider_kinds": provider.LLMProviderKinds(),
+			// Inference truth: runtime → agents → endpoint/key fingerprint →
+			// tokens billed. The Settings Inference card renders this.
+			"inference": b.inferenceSnapshot(),
 			// gateway_kinds is the inverse — registered kinds that are
 			// gateway-controlled. Consumed by the Integrations app to
 			// enumerate which gateways are compiled in and connectable.
@@ -184,11 +187,11 @@ func (b *Broker) handleConfig(w http.ResponseWriter, r *http.Request) {
 			"task_reminder_minutes":  config.ResolveTaskReminderInterval(),
 			"task_recheck_minutes":   config.ResolveTaskRecheckInterval(),
 			// Integrations — secret fields as booleans
-			"openai_key_set":       config.ResolveOpenAIAPIKey() != "",
+			"openai_key_set":       config.PlausibleAPIKey(config.ResolveOpenAIAPIKey()),
 			"realtime_model":       config.ResolveRealtimeModel(),
-			"anthropic_key_set":    config.ResolveAnthropicAPIKey() != "",
-			"gemini_key_set":       config.ResolveGeminiAPIKey() != "",
-			"minimax_key_set":      config.ResolveMinimaxAPIKey() != "",
+			"anthropic_key_set":    config.PlausibleAPIKey(config.ResolveAnthropicAPIKey()),
+			"gemini_key_set":       config.PlausibleAPIKey(config.ResolveGeminiAPIKey()),
+			"minimax_key_set":      config.PlausibleAPIKey(config.ResolveMinimaxAPIKey()),
 			"one_key_set":          config.ResolveOneSecret() != "",
 			"composio_key_set":     config.IsComposioConfigured(),
 			"box_key_set":          config.ResolveBoxAPIKey() != "",
@@ -1290,6 +1293,81 @@ func (b *Broker) SurfaceChannels(provider string) []teamChannel {
 			cp.Surface = &s
 			out = append(out, cp)
 		}
+	}
+	return out
+}
+
+// inferenceSnapshot is the lock-taking wrapper the settings GET uses.
+func (b *Broker) inferenceSnapshot() []map[string]any {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.inferenceStatusLocked()
+}
+
+// inferenceStatusLocked builds the per-provider inference truth for the
+// Settings surface: which runtime every agent bills, the key fingerprint
+// (never the key), the endpoint, and tokens metered per kind. Called with
+// b.mu held.
+func (b *Broker) inferenceStatusLocked() []map[string]any {
+	agentsByKind := map[string]int{}
+	order := []string{}
+	for i := range b.members {
+		k := strings.TrimSpace(b.members[i].Provider.Kind)
+		if k == "" {
+			k = "(inherit)"
+		}
+		if _, seen := agentsByKind[k]; !seen {
+			order = append(order, k)
+		}
+		agentsByKind[k]++
+	}
+	usageFor := func(kind string) usageTotals {
+		return b.usage.ByKind[kind]
+	}
+	out := []map[string]any{}
+	for _, kind := range order {
+		entry := map[string]any{
+			"kind":   kind,
+			"agents": agentsByKind[kind],
+			"tokens": usageFor(kind),
+		}
+		switch {
+		case kind == "zai":
+			entry["label"] = "Z.ai (GLM) — Anthropic protocol"
+			entry["endpoint"] = provider.ZaiDefaultBaseURL() + "/v1/messages"
+			entry["default_model"] = provider.ZaiDefaultModel()
+			if k := config.ResolveZaiAPIKey(); config.PlausibleAPIKey(k) {
+				entry["key_fingerprint"] = config.KeyFingerprint(k)
+				entry["key_source"] = "Settings → Credentials (zai_api_key)"
+			} else {
+				entry["key_set"] = false
+			}
+		case kind == "zai-code":
+			entry["label"] = "Z.ai Code (CLI on the GLM Coding Plan)"
+			entry["endpoint"] = provider.ZaiDefaultBaseURL() + "/v1/messages"
+			entry["default_model"] = provider.ZaiDefaultModel()
+			if k := config.ResolveZaiAPIKey(); config.PlausibleAPIKey(k) {
+				entry["key_fingerprint"] = config.KeyFingerprint(k)
+				entry["key_source"] = "Settings → Credentials (zai_api_key)"
+			}
+		case kind == "claude-code":
+			entry["label"] = "Claude Code"
+			entry["auth"] = "Claude CLI login (machine credentials are neutralized)"
+		case strings.HasPrefix(kind, "custom-"):
+			entry["label"] = "Custom provider " + kind
+			if cp, err := config.FindCustomProviderByKey(kind); err == nil {
+				entry["endpoint"] = cp.BaseURL
+				entry["default_model"] = cp.Model
+				if config.PlausibleAPIKey(cp.APIKey) {
+					entry["key_fingerprint"] = config.KeyFingerprint(cp.APIKey)
+				}
+			}
+		case kind == "(inherit)":
+			entry["label"] = "Inherits install default (" + config.ResolveLLMProvider("") + ")"
+		default:
+			entry["label"] = kind
+		}
+		out = append(out, entry)
 	}
 	return out
 }

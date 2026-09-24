@@ -438,8 +438,13 @@ func TestBuildHeadlessClaudeEnvZaiCodeRouting(t *testing.T) {
 	l := &Launcher{broker: b}
 	plain := l.buildHeadlessClaudeEnv(context.Background(), "cos")
 	for _, e := range plain {
-		if strings.HasPrefix(e, "ANTHROPIC_BASE_URL=") || strings.HasPrefix(e, "ANTHROPIC_AUTH_TOKEN=") {
-			t.Fatalf("plain turns must not carry z.ai routing, got %q", e)
+		// Neutralized (present but empty) is the contract for plain turns —
+		// the CLI's own login authenticates; ambient machine keys cannot.
+		if v, ok := strings.CutPrefix(e, "ANTHROPIC_BASE_URL="); ok && v != "" {
+			t.Fatalf("plain turns must not carry endpoint routing, got %q", e)
+		}
+		if v, ok := strings.CutPrefix(e, "ANTHROPIC_AUTH_TOKEN="); ok && v != "" {
+			t.Fatalf("plain turns must not carry a token, got %q", e)
 		}
 	}
 	tagged := l.buildHeadlessClaudeEnv(withHeadlessTurnKind(context.Background(), provider.KindZAICode), "cos")
@@ -453,4 +458,32 @@ func TestBuildHeadlessClaudeEnvZaiCodeRouting(t *testing.T) {
 	if !strings.Contains(joined, "ANTHROPIC_API_KEY=") {
 		t.Fatal("ambient Anthropic keys must be neutralized on zai-code turns")
 	}
+}
+
+// Agent children must never inherit machine credentials, and a plain
+// claude-code turn must not silently authenticate with ambient Anthropic
+// variables — the CLI's own login (or zai-code's injected values) only.
+func TestBuildHeadlessClaudeEnvScrubsAmbientCredentials(t *testing.T) {
+	t.Setenv("OPENROUTER_API_KEY", "sk-or-victim")
+	t.Setenv("ANTHROPIC_API_KEY", "sk-ant-ambient")
+	b := newTestBroker(t)
+	l := &Launcher{broker: b}
+	env := l.buildHeadlessClaudeEnv(context.Background(), "cos")
+	joined := strings.Join(env, "\n")
+	if strings.Contains(joined, "sk-or-victim") {
+		t.Fatal("third-party machine key leaked into agent env")
+	}
+	if strings.Contains(joined, "sk-ant-ambient") {
+		t.Fatal("ambient Anthropic key leaked into agent env")
+	}
+	// Neutralized = present but empty, so the CLI cannot pick a machine key.
+	if !strings.Contains(joined, "ANTHROPIC_API_KEY=\n") && !strings.Contains(joined, "ANTHROPIC_API_KEY=") {
+		t.Fatal("ANTHROPIC_API_KEY must be neutralized explicitly")
+	}
+	for _, kv := range env {
+		if kv == "ANTHROPIC_API_KEY" || kv == "ANTHROPIC_API_KEY=" {
+			return
+		}
+	}
+	t.Fatalf("ANTHROPIC_API_KEY must resolve to empty, got env:\n%s", joined[:min(len(joined), 400)])
 }

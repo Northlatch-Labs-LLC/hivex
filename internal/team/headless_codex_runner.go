@@ -426,7 +426,7 @@ func (l *Launcher) buildHeadlessCodexEnv(slug string, workspaceDir string, chann
 	// gitexec.CleanEnv is prefix-match — the GIT_CONFIG_KEY_<n> family
 	// needs prefix-match, so we run gitexec.CleanEnv first and stripEnvKeys
 	// second.
-	env := stripEnvKeys(gitexec.CleanEnv(), headlessCodexEnvVarsToStrip)
+	env := stripEnvKeys(gitexec.AgentEnv(), headlessCodexEnvVarsToStrip)
 	if workspaceDir = normalizeHeadlessWorkspaceDir(workspaceDir); workspaceDir != "" {
 		env = setEnvValue(env, "PWD", workspaceDir)
 	}

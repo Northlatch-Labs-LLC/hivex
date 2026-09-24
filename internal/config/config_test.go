@@ -497,29 +497,59 @@ func TestResolveGeminiAPIKeyConfig(t *testing.T) {
 	})
 }
 
+// Fixtures are realistic lengths — resolver plausibility rejects
+// placeholder-grade values, and the resolution order is: explicit
+// HIVEX_* env > Settings config > the machine's ambient variable.
+const (
+	cfgAnthropicKey     = "sk-ant-config-0123456789abcdef"
+	ambientAnthropicKey = "sk-ant-ambient-0123456789abcdef"
+	cfgOpenAIKey        = "sk-openai-config-0123456789abcd"
+	ambientOpenAIKey    = "sk-openai-ambient-0123456789abcd"
+)
+
 func TestResolveAnthropicAPIKeyEnvOverride(t *testing.T) {
 	withTempConfig(t, func(_ string) {
-		t.Setenv("HIVEX_ANTHROPIC_API_KEY", "hivex-anthropic")
-		_ = Save(Config{AnthropicAPIKey: "file-anthropic"})
-		if got := ResolveAnthropicAPIKey(); got != "hivex-anthropic" {
-			t.Fatalf("expected hivebot env override, got %q", got)
+		t.Setenv("HIVEX_ANTHROPIC_API_KEY", "sk-ant-hivex-env-0123456789")
+		_ = Save(Config{AnthropicAPIKey: cfgAnthropicKey})
+		if got := ResolveAnthropicAPIKey(); got != "sk-ant-hivex-env-0123456789" {
+			t.Fatalf("expected explicit HIVEX_ env override, got %q", got)
 		}
 	})
 }
 
-func TestResolveAnthropicAPIKeyFallbackEnv(t *testing.T) {
+func TestResolveAnthropicAPIKeyConfigBeatsAmbientEnv(t *testing.T) {
 	withTempConfig(t, func(_ string) {
-		t.Setenv("ANTHROPIC_API_KEY", "generic-anthropic")
-		if got := ResolveAnthropicAPIKey(); got != "generic-anthropic" {
-			t.Fatalf("expected ANTHROPIC_API_KEY fallback, got %q", got)
+		t.Setenv("ANTHROPIC_API_KEY", ambientAnthropicKey)
+		_ = Save(Config{AnthropicAPIKey: cfgAnthropicKey})
+		if got := ResolveAnthropicAPIKey(); got != cfgAnthropicKey {
+			t.Fatalf("Settings config must beat the machine's ambient key, got %q", got)
+		}
+	})
+}
+
+func TestResolveAnthropicAPIKeyAmbientLastResort(t *testing.T) {
+	withTempConfig(t, func(_ string) {
+		t.Setenv("ANTHROPIC_API_KEY", ambientAnthropicKey)
+		if got := ResolveAnthropicAPIKey(); got != ambientAnthropicKey {
+			t.Fatalf("ambient key is the last resort when nothing else is set, got %q", got)
+		}
+	})
+}
+
+func TestResolveAnthropicAPIKeyIgnoresPlaceholders(t *testing.T) {
+	withTempConfig(t, func(_ string) {
+		_ = Save(Config{AnthropicAPIKey: "sk-"})
+		t.Setenv("ANTHROPIC_API_KEY", "sk-")
+		if got := ResolveAnthropicAPIKey(); got != "" {
+			t.Fatalf("placeholder-grade values must not count, got %q", got)
 		}
 	})
 }
 
 func TestResolveAnthropicAPIKeyConfig(t *testing.T) {
 	withTempConfig(t, func(_ string) {
-		_ = Save(Config{AnthropicAPIKey: "cfg-anthropic"})
-		if got := ResolveAnthropicAPIKey(); got != "cfg-anthropic" {
+		_ = Save(Config{AnthropicAPIKey: cfgAnthropicKey})
+		if got := ResolveAnthropicAPIKey(); got != cfgAnthropicKey {
 			t.Fatalf("expected config fallback, got %q", got)
 		}
 	})
@@ -527,27 +557,28 @@ func TestResolveAnthropicAPIKeyConfig(t *testing.T) {
 
 func TestResolveOpenAIAPIKeyEnvOverride(t *testing.T) {
 	withTempConfig(t, func(_ string) {
-		t.Setenv("HIVEX_OPENAI_API_KEY", "hivex-openai")
-		_ = Save(Config{OpenAIAPIKey: "file-openai"})
-		if got := ResolveOpenAIAPIKey(); got != "hivex-openai" {
-			t.Fatalf("expected hivebot env override, got %q", got)
+		t.Setenv("HIVEX_OPENAI_API_KEY", "sk-openai-hivex-env-012345678")
+		_ = Save(Config{OpenAIAPIKey: cfgOpenAIKey})
+		if got := ResolveOpenAIAPIKey(); got != "sk-openai-hivex-env-012345678" {
+			t.Fatalf("expected explicit HIVEX_ env override, got %q", got)
 		}
 	})
 }
 
-func TestResolveOpenAIAPIKeyFallbackEnv(t *testing.T) {
+func TestResolveOpenAIAPIKeyConfigBeatsAmbientEnv(t *testing.T) {
 	withTempConfig(t, func(_ string) {
-		t.Setenv("OPENAI_API_KEY", "generic-openai")
-		if got := ResolveOpenAIAPIKey(); got != "generic-openai" {
-			t.Fatalf("expected OPENAI_API_KEY fallback, got %q", got)
+		t.Setenv("OPENAI_API_KEY", ambientOpenAIKey)
+		_ = Save(Config{OpenAIAPIKey: cfgOpenAIKey})
+		if got := ResolveOpenAIAPIKey(); got != cfgOpenAIKey {
+			t.Fatalf("Settings config must beat the machine's ambient key, got %q", got)
 		}
 	})
 }
 
 func TestResolveOpenAIAPIKeyConfig(t *testing.T) {
 	withTempConfig(t, func(_ string) {
-		_ = Save(Config{OpenAIAPIKey: "cfg-openai"})
-		if got := ResolveOpenAIAPIKey(); got != "cfg-openai" {
+		_ = Save(Config{OpenAIAPIKey: cfgOpenAIKey})
+		if got := ResolveOpenAIAPIKey(); got != cfgOpenAIKey {
 			t.Fatalf("expected config fallback, got %q", got)
 		}
 	})

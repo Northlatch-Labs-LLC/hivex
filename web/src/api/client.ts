@@ -1072,6 +1072,7 @@ export interface ConfigSnapshot {
   openai_key_set?: boolean;
   anthropic_key_set?: boolean;
   zai_key_set?: boolean;
+  inference?: InferenceEntryDTO[];
   gemini_key_set?: boolean;
   minimax_key_set?: boolean;
   one_key_set?: boolean;
@@ -1137,6 +1138,34 @@ export type ConfigUpdate = Partial<{
 export interface ConfigStatus {
   openai_key_set?: boolean;
   realtime_model?: string;
+}
+
+export interface InferenceEntryDTO {
+  kind: string;
+  label?: string;
+  agents: number;
+  endpoint?: string;
+  default_model?: string;
+  key_fingerprint?: string;
+  key_source?: string;
+  key_set?: boolean;
+  auth?: string;
+  tokens?: {
+    input_tokens?: number;
+    output_tokens?: number;
+    cache_read_tokens?: number;
+    cache_creation_tokens?: number;
+    total_tokens?: number;
+    requests?: number;
+  };
+}
+
+/** Verify a Z.ai key with a real 1-token call; a fresh valid key is saved. */
+export function verifyZaiKey(apiKey: string) {
+  return post<{ ok: boolean; error?: string; status?: number; latency_ms?: number; model?: string; fingerprint?: string; saved?: boolean }>(
+    "/zai-key/verify",
+    { api_key: apiKey },
+  );
 }
 
 export function getConfig() {

@@ -105,6 +105,12 @@ func (b *Broker) recordUsageLocked(event usageEvent) {
 	if b.usage.Bots == nil {
 		b.usage.Bots = make(map[string]usageTotals)
 	}
+	if b.usage.ByKind == nil {
+		b.usage.ByKind = make(map[string]usageTotals)
+	}
+	kindTotal := b.usage.ByKind[b.usageKindForBotLocked(event.BotSlug)]
+	applyUsageEvent(&kindTotal, event)
+	b.usage.ByKind[b.usageKindForBotLocked(event.BotSlug)] = kindTotal
 	if b.usage.Since == "" {
 		b.usage.Since = time.Now().UTC().Format(time.RFC3339)
 	}
@@ -342,4 +348,19 @@ func otlpFloatValue(raw string) float64 {
 	}
 	v, _ := strconv.ParseFloat(raw, 64)
 	return v
+}
+
+// usageKindForBotLocked resolves the provider kind a bot's usage bills:
+// its explicit binding, or "(inherit)" when it rides the install default.
+// Called with b.mu held.
+func (b *Broker) usageKindForBotLocked(slug string) string {
+	for i := range b.members {
+		if b.members[i].Slug == slug {
+			if k := strings.TrimSpace(b.members[i].Provider.Kind); k != "" {
+				return k
+			}
+			return "(inherit)"
+		}
+	}
+	return "(unknown)"
 }

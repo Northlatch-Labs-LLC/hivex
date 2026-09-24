@@ -458,7 +458,16 @@ func (l *Launcher) buildHeadlessClaudeEnv(ctx context.Context, slug string) []st
 	// `git status/diff/commit` inside its sandbox. If hivex inherited
 	// GIT_DIR (e.g. launched from a git hook) every child `git` would
 	// silently retarget the outer repo.
-	env := gitexec.CleanEnv()
+	env := gitexec.AgentEnv()
+	// Credential hygiene: a claude-code turn authenticates via the CLI's own
+	// login (and a zai-code turn via the values set below) — never via
+	// whatever Anthropic-shaped variables happen to be exported on this
+	// machine. Neutralize all three; later appends win in exec.
+	env = append(env,
+		"ANTHROPIC_API_KEY=",
+		"ANTHROPIC_AUTH_TOKEN=",
+		"ANTHROPIC_BASE_URL=",
+	)
 	env = append(env,
 		"HIVEX_AGENT_SLUG="+slug,
 		"HIVEX_BROKER_TOKEN="+l.broker.Token(),

@@ -92,3 +92,37 @@ func RunOK(ctx context.Context, dir string, args ...string) error {
 	}
 	return nil
 }
+
+// AgentEnv returns the environment agent subprocesses may inherit: an
+// allowlist of process essentials plus every HIVEX_* variable. Everything
+// else the operator's machine exports — third-party API keys, cloud
+// tokens — stays out: an agent child must never see credentials the
+// harness did not explicitly hand it. Git's CleanEnv is a different, weaker
+// contract (used for git itself, which needs the ambient environment);
+// agents get this one.
+func AgentEnv() []string {
+	env := os.Environ()
+	out := make([]string, 0, len(env))
+	for _, kv := range env {
+		name, _, _ := strings.Cut(kv, "=")
+		if agentEnvAllowed(name) {
+			out = append(out, kv)
+		}
+	}
+	return out
+}
+
+func agentEnvAllowed(name string) bool {
+	switch name {
+	case "PATH", "HOME", "TMPDIR", "TMP", "TEMP", "TERM", "LANG", "LANGUAGE",
+		"USER", "LOGNAME", "SHELL", "SSH_AUTH_SOCK",
+		"SSL_CERT_FILE", "SSL_CERT_DIR", "CURL_CA_BUNDLE",
+		"NO_PROXY", "no_proxy", "HTTP_PROXY", "http_proxy",
+		"HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy",
+		"NODE_OPTIONS", "NODE_PATH", "NVM_DIR", "VOLTA_HOME", "ASDF_DIR":
+		return true
+	}
+	return strings.HasPrefix(name, "LC_") ||
+		strings.HasPrefix(name, "XDG_") ||
+		strings.HasPrefix(name, "HIVEX_")
+}

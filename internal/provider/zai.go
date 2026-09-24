@@ -34,3 +34,9 @@ func init() {
 		},
 	})
 }
+
+// ZaiDefaultBaseURL and ZaiDefaultModel expose the compile-time defaults for
+// status/verification surfaces. Runtime resolution (env/config overrides)
+// stays in ResolveProviderEndpoint.
+func ZaiDefaultBaseURL() string { return defaultZaiBaseURL }
+func ZaiDefaultModel() string   { return defaultZaiModel }

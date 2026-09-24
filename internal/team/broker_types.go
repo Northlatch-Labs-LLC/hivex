@@ -933,5 +933,9 @@ type teamUsageState struct {
 	Session usageTotals            `json:"session,omitempty"`
 	Total   usageTotals            `json:"total"`
 	Bots    map[string]usageTotals `json:"agents,omitempty"`
-	Since   string                 `json:"since,omitempty"`
+	// ByKind aggregates the same events by the bot's effective provider
+	// kind at usage time — the cost-per-runtime truth the Inference card
+	// renders. "(inherit)" bucket = members without an explicit binding.
+	ByKind map[string]usageTotals `json:"kinds,omitempty"`
+	Since  string                 `json:"since,omitempty"`
 }

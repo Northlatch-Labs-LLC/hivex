@@ -31,6 +31,7 @@ import { showNotice } from "../ui/Toast";
 import { WipeModal } from "../ui/WipeModal";
 import { ImageGenSection } from "./SettingsApp.imageGen";
 import { CustomProvidersSection } from "./SettingsApp.customProviders";
+import { InferenceCard, ZaiKeyVerifyRow } from "./settings/InferenceCard";
 import { BoxAccountSection } from "./settings/BoxAccountSection";
 import { Field, KeyField, SaveButton } from "./settings/components";
 import { SECTION_GROUPS } from "./settings/constants";
@@ -815,6 +816,8 @@ function KeysSection({ cfg, save }: SectionProps) {
         new value to update, or leave blank to keep the current key.
       </p>
 
+      <InferenceCard cfg={cfg} />
+
       <BoxAccountSection />
 
       {KEY_DEFS.map((def) => (
@@ -829,6 +832,8 @@ function KeysSection({ cfg, save }: SectionProps) {
       ))}
 
       <SaveButton label="Save API keys" onSave={onSave} />
+
+      <ZaiKeyVerifyRow enteredKey={values.zai_api_key} />
 
       <CustomProvidersSection />
     </div>
