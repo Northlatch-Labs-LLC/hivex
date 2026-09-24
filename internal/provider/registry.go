@@ -91,6 +91,28 @@ func Register(e *Entry) {
 	}
 }
 
+// Replace installs e over any existing registration for its Kind. Settings-
+// managed runtimes refresh through it: Register panics on the second save of
+// the same kind (by design — that catches init-time double registration —
+// while a Settings edit legitimately re-registers with new endpoint config.
+func Replace(e *Entry) {
+	if e == nil {
+		panic("provider: Replace requires non-nil Entry")
+	}
+	if e.Kind == "" {
+		panic("provider: Replace requires non-empty Entry.Kind")
+	}
+	if e.StreamFn == nil {
+		panic(fmt.Sprintf("provider: Replace Kind %q requires non-nil StreamFn", e.Kind))
+	}
+	registryMu.Lock()
+	defer registryMu.Unlock()
+	registry[e.Kind] = e
+	if !e.Capabilities.GatewayOnly {
+		config.AllowLLMProviderKind(e.Kind)
+	}
+}
+
 // RegisterTemporary installs e and returns a restore function. It is intended
 // for internal test support packages that need to inject fake providers without
 // importing testing from production provider code.

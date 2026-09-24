@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -251,5 +252,28 @@ func TestListRowsRoundTripAndExportHeaders(t *testing.T) {
 	res, _ = call(t, "GET", base+"/gridframe/register/aei-monthly", nil)
 	if res.StatusCode != 200 {
 		t.Fatalf("aei list should be readable: %d", res.StatusCode)
+	}
+}
+
+// Download CSVs neutralize spreadsheet formula injection; the stored table
+// stays byte-exact so persistence and §5.1 parity are unaffected.
+func TestExportForDownloadNeutralizesFormulas(t *testing.T) {
+	td := &TableData{
+		Headers:      []string{"txn_id", "customer"},
+		Rows:         []Row{{"=SUM(A1:A9)", "plain"}, {"+cmd|' /C calc'!A0", "-2"}, {"@hyperlink(\"x\")", "\tTAB"}},
+		Sep:          "\n",
+		FinalNewline: "\n",
+	}
+	out := string(exportForDownload(td))
+	for _, want := range []string{"'=SUM(A1:A9)", "'+cmd", "'-2", "'@hyperlink", "'\tTAB"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("download export must neutralize %q in:\n%s", want, out)
+		}
+	}
+	if !strings.Contains(out, "plain") || strings.Contains(out, "'plain") {
+		t.Fatal("plain cells must pass through untouched")
+	}
+	if raw := string(td.Export()); !strings.Contains(raw, "=SUM(A1:A9)") || strings.Contains(raw, "'=SUM") {
+		t.Fatal("the stored table must stay byte-exact")
 	}
 }

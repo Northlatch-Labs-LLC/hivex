@@ -20,7 +20,7 @@ func RegisterCustomProviders() {
 			continue
 		}
 		kind := cp.ID
-		Register(&Entry{
+		Replace(&Entry{
 			Kind:     kind,
 			StreamFn: NewOpenAICompatStreamFn(kind, "", ""),
 			Capabilities: Capabilities{

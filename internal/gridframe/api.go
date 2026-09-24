@@ -274,8 +274,32 @@ func makeHandleExport(s *Store) http.HandlerFunc {
 		w.Header().Set("Content-Type", "text/csv; charset=utf-8")
 		w.Header().Set("Content-Disposition", `attachment; filename="`+table+`.csv"`)
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(td.Export())
+		_, _ = w.Write(exportForDownload(td))
 	}
+}
+
+// exportForDownload neutralizes spreadsheet formula injection on the way out:
+// a cell starting with = + - @ tab or CR becomes executable when the CSV is
+// opened in Excel/Sheets, and ledger cells carry free-text (subjects,
+// exception notes). Only the download copy is altered — persistence stays
+// byte-exact via td.Export().
+func exportForDownload(td *TableData) []byte {
+	rows := make([]Row, len(td.Rows))
+	for i, r := range td.Rows {
+		rows[i] = make(Row, len(r))
+		for j, v := range r {
+			if v != "" {
+				switch v[0] {
+				case '=', '+', '-', '@', '\t', '\r':
+					v = "'" + v
+				}
+			}
+			rows[i][j] = v
+		}
+	}
+	cp := *td
+	cp.Rows = rows
+	return cp.Export()
 }
 
 // ── Compliance timeline (spec §9.4: overdue=red + exception link) ─────
