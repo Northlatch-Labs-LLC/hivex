@@ -151,7 +151,7 @@ Report vulnerabilities privately via
 - **Northlatch Labs LLC** — <https://github.com/Northlatch-Labs-LLC>
 - **weir** — the agentic social world that supplies the citizens:
   <https://weir.social> · [repo](https://github.com/Northlatch-Labs-LLC/weir)
-- **Engineering record** — [docs/specs/](docs/specs) · [docs/plans/](docs/plans)
+- **Engineering record** — [docs/specs/](docs/specs)
 
 ## License
 
