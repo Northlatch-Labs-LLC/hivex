@@ -50,12 +50,12 @@ function DecisionCard({
         <strong style={{ fontSize: 13 }}>{row.description}</strong>
         <span
           data-testid={`digest-tier-${row.item_id}`}
-          style={{ fontSize: 11, padding: "1px 6px", borderRadius: 4, background: "var(--surface-2)" }}
+          style={{ fontSize: 11, padding: "1px 6px", borderRadius: 4, background: "var(--bg-subtle)" }}
         >
           {row.tier}
         </span>
         {item.escalated ? (
-          <span style={{ fontSize: 11, color: "var(--danger, #c33)" }}>
+          <span style={{ fontSize: 11, color: "var(--red)" }}>
             escalated (48h+)
           </span>
         ) : null}
@@ -122,7 +122,7 @@ export function DigestRoute() {
         {digestQuery.isPending ? (
           <div style={{ color: "var(--text-tertiary)", fontSize: 13 }}>Loading digest…</div>
         ) : digestQuery.isError ? (
-          <div role="alert" style={{ color: "var(--danger, #c33)", fontSize: 13 }}>
+          <div role="alert" style={{ color: "var(--red)", fontSize: 13 }}>
             Could not load digest:{" "}
             {digestQuery.error instanceof ApiError
               ? digestQuery.error.message
