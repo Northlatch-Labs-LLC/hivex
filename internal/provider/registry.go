@@ -69,13 +69,6 @@ var (
 	registry   = map[string]*Entry{}
 )
 
-// Register installs a provider Entry. It also teaches the config layer to
-// accept e.Kind as a valid value for the HIVEX_LLM_PROVIDER env var, the
-// config file, and CLI --provider flags. Intended for use from package init().
-//
-// Panics if e is nil, e.Kind is empty, or e.Kind is already registered —
-// duplicate registration indicates a programming error (two init() calls for
-// the same Kind), not user input.
 // IsOpenAICompatKind reports whether kind is a registered runtime whose
 // stream transport is the OpenAI-compatible HTTP client.
 func IsOpenAICompatKind(kind string) bool {
@@ -85,6 +78,13 @@ func IsOpenAICompatKind(kind string) bool {
 	return ok && e.OpenAICompat
 }
 
+// Register installs a provider Entry. It also teaches the config layer to
+// accept e.Kind as a valid value for the HIVEX_LLM_PROVIDER env var, the
+// config file, and CLI --provider flags. Intended for use from package init().
+//
+// Panics if e is nil, e.Kind is empty, or e.Kind is already registered —
+// duplicate registration indicates a programming error (two init() calls for
+// the same Kind), not user input.
 func Register(e *Entry) {
 	if e == nil {
 		panic("provider: Register requires non-nil Entry")
