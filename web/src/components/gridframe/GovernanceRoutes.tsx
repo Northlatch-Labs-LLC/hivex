@@ -66,7 +66,7 @@ export function ApprovalsRoute() {
         {digestQuery.isPending ? (
           <div style={{ color: "var(--text-tertiary)", fontSize: 13 }}>Loading…</div>
         ) : digestQuery.isError ? (
-          <div role="alert" style={{ color: "var(--danger, #c33)", fontSize: 13 }}>
+          <div role="alert" style={{ color: "var(--red)", fontSize: 13 }}>
             Could not load the queue:{" "}
             {digestQuery.error instanceof ApiError
               ? digestQuery.error.message
@@ -151,7 +151,7 @@ export function ComplianceRoute() {
         {q.isPending ? (
           <div style={{ color: "var(--text-tertiary)", fontSize: 13 }}>Loading…</div>
         ) : q.isError ? (
-          <div role="alert" style={{ color: "var(--danger, #c33)", fontSize: 13 }}>
+          <div role="alert" style={{ color: "var(--red)", fontSize: 13 }}>
             Could not load the calendar:{" "}
             {q.error instanceof ApiError ? q.error.message : "broker unreachable"}
           </div>
@@ -164,10 +164,10 @@ export function ComplianceRoute() {
               data-testid={`compliance-item-${it.row.item_id}`}
               style={{
                 border: "1px solid var(--border)",
-                borderLeft: it.overdue ? "3px solid var(--danger, #c33)" : undefined,
+                borderLeft: it.overdue ? "3px solid var(--red)" : undefined,
                 borderRadius: 8,
                 padding: 10,
-                color: it.overdue ? "var(--danger, #c33)" : undefined,
+                color: it.overdue ? "var(--red)" : undefined,
                 fontSize: 12,
               }}
             >

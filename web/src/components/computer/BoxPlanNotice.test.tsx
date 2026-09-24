@@ -49,7 +49,7 @@ describe("BoxPlanNotice", () => {
 
   it("describes the account in one line", () => {
     expect(boxAccountLine(base)).toBe(
-      "Signed in to ascii.dev as sam@example.com (box_20).",
+      "Signed in to Gridframe Cloud as sam@example.com (box_20).",
     );
     expect(boxAccountLine({ ...base, signedIn: false, identifier: "" })).toBe(
       "A Box key is saved.",
@@ -61,6 +61,6 @@ describe("BoxPlanNotice", () => {
         identifier: "",
         keySet: false,
       }),
-    ).toBe("Not connected to ascii.dev.");
+    ).toBe("Not connected to Gridframe Cloud.");
   });
 });

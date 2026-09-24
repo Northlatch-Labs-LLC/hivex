@@ -144,7 +144,7 @@ function RegisterTab({ table }: { table: GridframeRegisterTableName }) {
       {q.isPending ? (
         <div style={{ color: "var(--text-tertiary)", fontSize: 13 }}>Loading {TAB_LABELS[table]}…</div>
       ) : q.isError ? (
-        <div role="alert" style={{ color: "var(--danger, #c33)", fontSize: 13 }}>
+        <div role="alert" style={{ color: "var(--red)", fontSize: 13 }}>
           {q.error instanceof ApiError ? q.error.message : "broker unreachable"}
         </div>
       ) : (

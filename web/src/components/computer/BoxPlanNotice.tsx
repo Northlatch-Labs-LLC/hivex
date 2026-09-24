@@ -54,5 +54,5 @@ export function boxAccountLine(account: BoxAccount | null): string {
     return `Signed in to Gridframe Cloud as ${account.identifier}${account.plan ? ` (${account.plan})` : ""}.`;
   }
   if (account.keySet) return "A Box key is saved.";
-  return "Not connected to ascii.dev.";
+  return "Not connected to Gridframe Cloud.";
 }
