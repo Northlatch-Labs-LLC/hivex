@@ -745,6 +745,13 @@ const KEY_DEFS: KeyDef[] = [
     env: "HIVEX_ZAI_API_KEY",
   },
   {
+    field: "hiveapi_api_key",
+    flag: "hiveapi_key_set",
+    label: "HiveAPI Gateway",
+    placeholder: "gateway key (sk-…)",
+    env: "HIVEX_HIVEAPI_API_KEY",
+  },
+  {
     field: "anthropic_api_key",
     flag: "anthropic_key_set",
     label: "Anthropic",

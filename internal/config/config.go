@@ -86,6 +86,7 @@ type Config struct {
 	TaskRecheckMinutes  int      `json:"task_recheck_minutes,omitempty"`
 	TelegramBotToken    string   `json:"telegram_bot_token,omitempty"`
 	ZaiAPIKey           string   `json:"zai_api_key,omitempty"`
+	HiveAPIAPIKey       string   `json:"hiveapi_api_key,omitempty"`
 	SlackBotToken       string   `json:"slack_bot_token,omitempty"`
 	SlackAppToken       string   `json:"slack_app_token,omitempty"`
 	CompanyName         string   `json:"company_name,omitempty"`
@@ -777,6 +778,16 @@ func ResolveZaiAPIKey() string {
 	}
 	cfg, _ := Load()
 	return strings.TrimSpace(cfg.ZaiAPIKey)
+}
+
+// ResolveHiveAPIAPIKey returns the HiveAPI Gateway key (env
+// HIVEX_HIVEAPI_API_KEY first, then config hiveapi_api_key).
+func ResolveHiveAPIAPIKey() string {
+	if v := strings.TrimSpace(Getenv("HIVEX_HIVEAPI_API_KEY")); v != "" {
+		return v
+	}
+	cfg, _ := Load()
+	return strings.TrimSpace(cfg.HiveAPIAPIKey)
 }
 
 // SaveTelegramBotToken persists the bot token to config.json.
