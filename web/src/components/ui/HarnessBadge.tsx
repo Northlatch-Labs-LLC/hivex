@@ -183,6 +183,22 @@ const GLYPHS: Record<HarnessKind, GlyphDef> = {
     ),
   },
   // Settings-managed custom providers — charcoal chip with a generic plug.
+  // Z.ai (GLM) — monogram glyph, same class as the claude/codex/opencode
+  // marks: no permissively-shippable official SVG in this repo.
+  zai: {
+    bg: "#18181B",
+    viewBox: "0 0 24 24",
+    body: (
+      <path
+        d="M7 7h10L7 17h10"
+        stroke="#FFFFFF"
+        strokeWidth="2.4"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        fill="none"
+      />
+    ),
+  },
   custom: {
     bg: "#0A0F18",
     viewBox: "0 0 24 24",

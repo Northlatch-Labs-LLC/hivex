@@ -7,6 +7,7 @@ export type HarnessKind =
   | "openclaw"
   | "hermes-agent"
   | "hiveapi"
+  | "zai"
   | "custom";
 
 // `openclaw-http` is the OpenAI-compat transport for OpenClaw; treat it as the
@@ -22,6 +23,7 @@ const VALID_KINDS: Record<string, HarnessKind> = {
   "hermes-agent": "hermes-agent",
   hermes: "hermes-agent",
   hiveapi: "hiveapi",
+  zai: "zai",
 };
 
 function normalize(raw: string | undefined | null): HarnessKind | null {
@@ -59,6 +61,8 @@ export function harnessLabel(kind: HarnessKind): string {
       return "Hermes";
     case "hiveapi":
       return "HiveAPI Gateway";
+    case "zai":
+      return "Z.ai (GLM)";
     case "custom":
       return "Custom provider";
   }

@@ -193,6 +193,7 @@ func (b *Broker) handleConfig(w http.ResponseWriter, r *http.Request) {
 			"composio_key_set":     config.IsComposioConfigured(),
 			"box_key_set":          config.ResolveBoxAPIKey() != "",
 			"telegram_token_set":   config.ResolveTelegramBotToken() != "",
+			"zai_key_set":          config.ResolveZaiAPIKey() != "",
 			"openclaw_token_set":   config.ResolveOpenclawToken() != "",
 			"openclaw_gateway_url": config.ResolveOpenclawGatewayURL(),
 			// Product analytics consent (PostHog). The two channels are
@@ -245,6 +246,7 @@ func (b *Broker) handleConfig(w http.ResponseWriter, r *http.Request) {
 			ComposioAPIKey  *string `json:"composio_api_key,omitempty"`
 			BoxAPIKey       *string `json:"box_api_key,omitempty"`
 			TelegramToken   *string `json:"telegram_bot_token,omitempty"`
+			ZaiKey          *string `json:"zai_api_key,omitempty"`
 			OpenclawToken   *string `json:"openclaw_token,omitempty"`
 			OpenclawGateway *string `json:"openclaw_gateway_url,omitempty"`
 			// Product analytics consent toggles. Pointer => nil means "not
@@ -490,6 +492,9 @@ func (b *Broker) handleConfig(w http.ResponseWriter, r *http.Request) {
 		}
 		if body.TelegramToken != nil {
 			cfg.TelegramBotToken = strings.TrimSpace(*body.TelegramToken)
+			if body.ZaiKey != nil {
+				cfg.ZaiAPIKey = strings.TrimSpace(*body.ZaiKey)
+			}
 			changed = true
 		}
 		if body.OpenclawToken != nil {

@@ -234,6 +234,11 @@ func resolveOpenAICompatAPIKey(kind string) string {
 			return strings.TrimSpace(cp.APIKey)
 		}
 	}
+	if kind == KindZAI {
+		if v := config.ResolveZaiAPIKey(); v != "" {
+			return v
+		}
+	}
 	if kind == KindHermesBot {
 		if v := strings.TrimSpace(os.Getenv("API_SERVER_KEY")); v != "" {
 			return v

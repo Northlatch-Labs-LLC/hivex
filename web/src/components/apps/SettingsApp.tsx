@@ -738,6 +738,13 @@ interface KeyDef {
 
 const KEY_DEFS: KeyDef[] = [
   {
+    field: "zai_api_key",
+    flag: "zai_key_set",
+    label: "Z.ai (GLM)",
+    placeholder: "z.ai API key",
+    env: "HIVEX_ZAI_API_KEY",
+  },
+  {
     field: "anthropic_api_key",
     flag: "anthropic_key_set",
     label: "Anthropic",

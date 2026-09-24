@@ -85,6 +85,7 @@ type Config struct {
 	TaskReminderMinutes int      `json:"task_reminder_minutes,omitempty"`
 	TaskRecheckMinutes  int      `json:"task_recheck_minutes,omitempty"`
 	TelegramBotToken    string   `json:"telegram_bot_token,omitempty"`
+	ZaiAPIKey           string   `json:"zai_api_key,omitempty"`
 	SlackBotToken       string   `json:"slack_bot_token,omitempty"`
 	SlackAppToken       string   `json:"slack_app_token,omitempty"`
 	CompanyName         string   `json:"company_name,omitempty"`
@@ -766,6 +767,16 @@ func ResolveTelegramBotToken() string {
 	}
 	cfg, _ := Load()
 	return strings.TrimSpace(cfg.TelegramBotToken)
+}
+
+// ResolveZaiAPIKey returns the Z.ai coding-plan key (env HIVEX_ZAI_API_KEY
+// first, then config zai_api_key — the Settings → Credentials slot).
+func ResolveZaiAPIKey() string {
+	if v := strings.TrimSpace(Getenv("HIVEX_ZAI_API_KEY")); v != "" {
+		return v
+	}
+	cfg, _ := Load()
+	return strings.TrimSpace(cfg.ZaiAPIKey)
 }
 
 // SaveTelegramBotToken persists the bot token to config.json.
