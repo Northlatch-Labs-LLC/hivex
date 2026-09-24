@@ -50,6 +50,10 @@ func noHostedKeys(t *testing.T) {
 	t.Setenv("HIVEX_OPENAI_API_KEY", "")
 	t.Setenv("ANTHROPIC_API_KEY", "")
 	t.Setenv("HIVEX_ANTHROPIC_API_KEY", "")
+	// A developer machine's real ~/.hivex/config.json can carry hosted keys
+	// (ResolveAnthropicAPIKey reads the file); point the loader at an empty
+	// scratch config so the keyless path is what these tests exercise.
+	t.Setenv("HIVEX_CONFIG_PATH", filepath.Join(t.TempDir(), "config.json"))
 }
 
 func TestConfigureNoKeyFallback(t *testing.T) {
