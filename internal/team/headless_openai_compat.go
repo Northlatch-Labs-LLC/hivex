@@ -350,12 +350,11 @@ func looksUnparsedToolCall(text string) bool {
 // Centralised here so the dispatcher in headless_codex.go and any future
 // caller stay in sync without duplicating the list.
 func isOpenAICompatKind(kind string) bool {
-	switch kind {
-	case provider.KindMLXLM, provider.KindOllama, provider.KindExo, provider.KindHermesBot, provider.KindOpenclawHTTP, provider.KindHiveAPI:
-		return true
-	default:
-		return false
-	}
+	// Delegates to the provider registry so every OpenAI-compatible runtime
+	// — zai, Settings-managed custom-* entries, anything added later —
+	// routes to this runner by construction. The previous hand-maintained
+	// list silently fell compat-bound bots through to the claude runner.
+	return provider.IsOpenAICompatKind(kind)
 }
 
 // openAICompatTextOnlyPrompt wraps the standard system prompt with a leading

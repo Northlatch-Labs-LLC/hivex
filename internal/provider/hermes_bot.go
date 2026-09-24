@@ -11,8 +11,9 @@ const (
 
 func init() {
 	Register(&Entry{
-		Kind:     KindHermesBot,
-		StreamFn: NewOpenAICompatStreamFn(KindHermesBot, defaultHermesBotBaseURL, defaultHermesBotModel),
+		Kind:         KindHermesBot,
+		StreamFn:     NewOpenAICompatStreamFn(KindHermesBot, defaultHermesBotBaseURL, defaultHermesBotModel),
+		OpenAICompat: true,
 		Capabilities: Capabilities{
 			PaneEligible:    false,
 			SupportsOneShot: false,

@@ -24,8 +24,9 @@ const (
 
 func init() {
 	Register(&Entry{
-		Kind:     KindZAI,
-		StreamFn: NewOpenAICompatStreamFn(KindZAI, defaultZaiBaseURL, defaultZaiModel),
+		Kind:         KindZAI,
+		StreamFn:     NewOpenAICompatStreamFn(KindZAI, defaultZaiBaseURL, defaultZaiModel),
+		OpenAICompat: true,
 		Capabilities: Capabilities{
 			// Headless HTTP runtime, same shape as hiveapi.
 			PaneEligible:    false,

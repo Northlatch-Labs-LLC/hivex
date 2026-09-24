@@ -51,8 +51,14 @@ type Capabilities struct {
 // = false and leave both one-shot hooks nil; RunConfiguredOneShot then falls
 // back to claude-code.
 type Entry struct {
-	Kind         string
-	StreamFn     func(slug string) bot.StreamFn
+	Kind     string
+	StreamFn func(slug string) bot.StreamFn
+	// OpenAICompat marks StreamFn as the OpenAI-compatible HTTP transport
+	// (NewOpenAICompatStreamFn). Turn dispatch routes these kinds to the
+	// headless compat runner via IsOpenAICompatKind — derived from this
+	// flag so every compat runtime (zai, Settings-managed custom-*) is
+	// routable without a second hand-maintained kind list.
+	OpenAICompat bool
 	OneShot      func(systemPrompt, prompt, cwd string) (string, error)
 	OneShotCtx   func(ctx context.Context, systemPrompt, prompt, cwd string) (string, error)
 	Capabilities Capabilities
@@ -70,6 +76,15 @@ var (
 // Panics if e is nil, e.Kind is empty, or e.Kind is already registered —
 // duplicate registration indicates a programming error (two init() calls for
 // the same Kind), not user input.
+// IsOpenAICompatKind reports whether kind is a registered runtime whose
+// stream transport is the OpenAI-compatible HTTP client.
+func IsOpenAICompatKind(kind string) bool {
+	registryMu.RLock()
+	defer registryMu.RUnlock()
+	e, ok := registry[kind]
+	return ok && e.OpenAICompat
+}
+
 func Register(e *Entry) {
 	if e == nil {
 		panic("provider: Register requires non-nil Entry")

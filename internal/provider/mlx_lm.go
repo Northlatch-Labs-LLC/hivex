@@ -20,8 +20,9 @@ const (
 
 func init() {
 	Register(&Entry{
-		Kind:     KindMLXLM,
-		StreamFn: NewOpenAICompatStreamFn(KindMLXLM, defaultMLXLMBaseURL, defaultMLXLMModel),
+		Kind:         KindMLXLM,
+		StreamFn:     NewOpenAICompatStreamFn(KindMLXLM, defaultMLXLMBaseURL, defaultMLXLMModel),
+		OpenAICompat: true,
 		Capabilities: Capabilities{
 			PaneEligible:    false,
 			SupportsOneShot: false,

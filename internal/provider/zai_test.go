@@ -37,3 +37,19 @@ func TestResolveZaiAPIKeyFromConfig(t *testing.T) {
 		t.Fatalf("config key must resolve, got %q", got)
 	}
 }
+
+// The compat-routing predicate must be registry-derived: zai routes to the
+// headless OpenAI-compat runner, CLI kinds do not. A hand-maintained list in
+// the turn dispatcher previously fell compat-bound bots to the claude runner.
+func TestZaiRoutesToCompatRunner(t *testing.T) {
+	for _, kind := range []string{KindZAI, KindHiveAPI, KindOllama, KindMLXLM, KindExo} {
+		if !IsOpenAICompatKind(kind) {
+			t.Errorf("IsOpenAICompatKind(%q) = false, want true", kind)
+		}
+	}
+	for _, kind := range []string{KindClaudeCode, KindCodex, KindOpencode} {
+		if IsOpenAICompatKind(kind) {
+			t.Errorf("IsOpenAICompatKind(%q) = true, want false", kind)
+		}
+	}
+}
