@@ -249,10 +249,10 @@ function KnowledgeArticle({
 }) {
   const sections = useMemo(
     () =>
-      page.sections.map((section, si) => ({
+      (page.sections ?? []).map((section, si) => ({
         key: `${page.id}-s${si}`,
         heading: section.heading,
-        paras: section.paras.map((text, pi) => ({
+        paras: (section.paras ?? []).map((text, pi) => ({
           key: `${page.id}-s${si}p${pi}`,
           text,
         })),

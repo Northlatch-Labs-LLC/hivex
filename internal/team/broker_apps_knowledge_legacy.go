@@ -256,6 +256,18 @@ func legacyPageFromFile(path, id, category string) (appKnowledgePage, bool) {
 		return appKnowledgePage{}, false
 	}
 	title, lead, sections := parseLegacyMarkdown(string(raw))
+	// A page with a lead but no recognized section structure keeps a nil
+	// Sections here — marshalled as JSON null, which crashed the reader
+	// (page.sections.map). Nil and empty are the same fact; empty is the
+	// only wire shape. Same for paras inside each section.
+	for i := range sections {
+		if sections[i].Paras == nil {
+			sections[i].Paras = []string{}
+		}
+	}
+	if sections == nil {
+		sections = []appKnowledgeSection{}
+	}
 	if title == "" {
 		title = humanizeLegacyName(strings.TrimSuffix(base, filepath.Ext(base)))
 	}
