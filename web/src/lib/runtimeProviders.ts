@@ -22,6 +22,13 @@ export const RUNTIME_PROVIDER_OPTIONS: readonly RuntimeProviderOption[] = [
     binary: "claude",
   },
   {
+    id: "zai-code",
+    label: "Z.ai Code",
+    desc: "Claude Code engine on the Z.ai GLM Coding Plan",
+    kind: "cli",
+    binary: "claude",
+  },
+  {
     id: "codex",
     label: "Codex",
     desc: "OpenAI Codex CLI bot",
@@ -104,10 +111,15 @@ export function runtimeProviderIsConnected(
   deps: {
     prereqs?: Map<string, PrereqResult>;
     localStatuses?: Map<string, LocalProviderStatus>;
+    /** Z.ai credential present (Settings → Credentials). Z.ai Code is the
+     *  only CLI runtime whose engine needs a second credential, so only it
+     *  gates on this flag; absent means "no key" and it stays unchecked. */
+    zaiKeySet?: boolean;
   },
 ): boolean {
   if (option.kind === "cli") {
     if (!option.binary) return false;
+    if (option.id === "zai-code" && !deps.zaiKeySet) return false;
     const prereq = deps.prereqs?.get(option.binary);
     if (!prereq?.found) return false;
     if (prereq.session_probed === true) return prereq.signed_in === true;

@@ -44,6 +44,20 @@ func withHeadlessTurnTaskID(ctx context.Context, taskID string) context.Context 
 
 // headlessTurnTaskID reads the executing turn's task id off ctx, or "" when the
 // caller is not on a tagged headless turn.
+type headlessTurnKindCtxKey struct{}
+
+// withHeadlessTurnKind tags the dispatched provider kind onto the turn
+// context so the shared claude env builder can route the engine's endpoint
+// (zai-code → z.ai's Anthropic-protocol endpoint) without forking runners.
+func withHeadlessTurnKind(ctx context.Context, kind string) context.Context {
+	return context.WithValue(ctx, headlessTurnKindCtxKey{}, kind)
+}
+
+func headlessTurnKind(ctx context.Context) string {
+	v, _ := ctx.Value(headlessTurnKindCtxKey{}).(string)
+	return v
+}
+
 func headlessTurnTaskID(ctx context.Context) string {
 	if ctx == nil {
 		return ""

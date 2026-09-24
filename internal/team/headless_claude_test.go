@@ -424,3 +424,33 @@ func TestTurnParkedOnInterview_RequiresALiveTurn(t *testing.T) {
 		t.Fatalf("another bot with no interview must never be held")
 	}
 }
+
+// buildHeadlessClaudeEnv routes the shared claude engine through z.ai's
+// Anthropic-protocol endpoint only when the turn is dispatched as zai-code,
+// and neutralizes any ambient Anthropic key so providers cannot mix.
+func TestBuildHeadlessClaudeEnvZaiCodeRouting(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("HIVEX_CONFIG_PATH", filepath.Join(dir, "config.json"))
+	if err := os.WriteFile(filepath.Join(dir, "config.json"), []byte(`{"zai_api_key":"zk-1"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	b := newTestBroker(t)
+	l := &Launcher{broker: b}
+	plain := l.buildHeadlessClaudeEnv(context.Background(), "cos")
+	for _, e := range plain {
+		if strings.HasPrefix(e, "ANTHROPIC_BASE_URL=") || strings.HasPrefix(e, "ANTHROPIC_AUTH_TOKEN=") {
+			t.Fatalf("plain turns must not carry z.ai routing, got %q", e)
+		}
+	}
+	tagged := l.buildHeadlessClaudeEnv(withHeadlessTurnKind(context.Background(), provider.KindZAICode), "cos")
+	joined := strings.Join(tagged, "\n")
+	if !strings.Contains(joined, "ANTHROPIC_BASE_URL=https://api.z.ai/api/anthropic") {
+		t.Fatal("zai-code turns must route ANTHROPIC_BASE_URL to z.ai")
+	}
+	if !strings.Contains(joined, "ANTHROPIC_AUTH_TOKEN=zk-1") {
+		t.Fatal("zai-code turns must authenticate with the z.ai credential")
+	}
+	if !strings.Contains(joined, "ANTHROPIC_API_KEY=") {
+		t.Fatal("ambient Anthropic keys must be neutralized on zai-code turns")
+	}
+}

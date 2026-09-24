@@ -93,7 +93,15 @@ func defaultHeadlessCodexRunTurn(l *Launcher, ctx context.Context, slug, notific
 		l.broker.TurnTransition(turnID, TurnContextAssembly, "packet assembled inside the runner")
 		l.broker.TurnTransition(turnID, TurnDispatch, "openai-compat runner")
 		err = l.runHeadlessOpenAICompatTurn(ctx, slug, notification, channel...)
+	case kind == provider.KindZAICode:
+		// The GLM Coding Plan on the claude engine: same runner, endpoint
+		// routed by the env builder from the turn-kind tag.
+		ctx = withHeadlessTurnKind(ctx, kind)
+		l.broker.TurnTransition(turnID, TurnContextAssembly, "packet assembled inside the runner")
+		l.broker.TurnTransition(turnID, TurnDispatch, "zai-code runner (claude engine on the GLM Coding Plan)")
+		err = l.runHeadlessClaudeTurn(ctx, slug, notification, channel...)
 	default:
+		ctx = withHeadlessTurnKind(ctx, provider.KindClaudeCode)
 		l.broker.TurnTransition(turnID, TurnContextAssembly, "packet assembled inside the runner")
 		l.broker.TurnTransition(turnID, TurnDispatch, "claude runner")
 		err = l.runHeadlessClaudeTurn(ctx, slug, notification, channel...)

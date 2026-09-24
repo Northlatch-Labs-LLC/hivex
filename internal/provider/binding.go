@@ -39,6 +39,10 @@ const (
 	// https://api.z.ai/api/coding/paas/v4, default model GLM-5.3). Key via
 	// HIVEX_ZAI_API_KEY or Settings → Credentials (config zai_api_key).
 	KindZAI = "zai"
+	// KindZAICode is the GLM Coding Plan driven through the Claude Code
+	// CLI engine (Anthropic protocol at https://api.z.ai/api/anthropic).
+	// Key: the z.ai credential (zai_api_key), never an Anthropic key.
+	KindZAICode = "zai-code"
 	// KindCustomPrefix marks kinds that are Settings-managed custom
 	// providers (internal/config CustomProvider): the entry ID doubles as
 	// the kind, e.g. "custom-zai".
@@ -95,14 +99,14 @@ func ValidateKind(s string) error {
 	switch s {
 	case "",
 		KindClaudeCode, KindCodex, KindOpencode, KindOpenclaw, KindOpenclawHTTP, KindHermesBot,
-		KindSlack, KindMLXLM, KindOllama, KindExo, KindHiveAPI, KindZAI:
+		KindSlack, KindMLXLM, KindOllama, KindExo, KindHiveAPI, KindZAI, KindZAICode:
 		return nil
 	default:
 		if strings.HasPrefix(s, KindCustomPrefix) && len(s) > len(KindCustomPrefix) {
 			return nil
 		}
-		return fmt.Errorf("unknown provider kind %q (valid: %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, or empty)",
-			s, KindClaudeCode, KindCodex, KindOpencode, KindOpenclaw, KindOpenclawHTTP, KindHermesBot, KindSlack, KindMLXLM, KindOllama, KindExo, KindHiveAPI, KindZAI)
+		return fmt.Errorf("unknown provider kind %q (valid: %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, or empty)",
+			s, KindClaudeCode, KindCodex, KindOpencode, KindOpenclaw, KindOpenclawHTTP, KindHermesBot, KindSlack, KindMLXLM, KindOllama, KindExo, KindHiveAPI, KindZAI, KindZAICode)
 	}
 }
 

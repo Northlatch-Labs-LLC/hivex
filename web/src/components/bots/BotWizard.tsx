@@ -55,6 +55,7 @@ const INITIAL_FORM: BotFormData = {
 // they just fall back to the raw kind string.
 const PROVIDER_LABELS: Record<LLMRuntimeKind, string> = {
   "claude-code": "Claude Code",
+  "zai-code": "Z.ai Code",
   codex: "Codex",
   opencode: "Opencode",
   "mlx-lm": "MLX-LM",

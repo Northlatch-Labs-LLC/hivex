@@ -18,6 +18,8 @@ import { Field } from "./components";
 
 interface RuntimeProviderChecklistProps {
   configuredKinds?: readonly string[];
+  /** True when a Z.ai key is configured — gates the Z.ai Code runtime. */
+  zaiKeySet?: boolean;
   selectedProviders: string[];
   onSelectedProvidersChange: (providers: string[]) => void;
   onConnectedProvidersChange: (providers: string[]) => void;
@@ -25,6 +27,7 @@ interface RuntimeProviderChecklistProps {
 
 export function RuntimeProviderChecklist({
   configuredKinds,
+  zaiKeySet,
   selectedProviders,
   onSelectedProvidersChange,
   onConnectedProvidersChange,
@@ -75,6 +78,7 @@ export function RuntimeProviderChecklist({
           ? runtimeProviderIsConnected(option, {
               prereqs: prereqMap,
               localStatuses: localStatusMap,
+              zaiKeySet,
             })
           : false;
       }),
@@ -127,6 +131,7 @@ export function RuntimeProviderChecklist({
             const connected = runtimeProviderIsConnected(option, {
               prereqs: prereqMap,
               localStatuses: localStatusMap,
+              zaiKeySet,
             });
             const checked = selectedProviders.includes(option.id);
             return (

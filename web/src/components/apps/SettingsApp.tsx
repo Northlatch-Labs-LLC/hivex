@@ -176,6 +176,7 @@ function GeneralSection({ cfg, save }: SectionProps) {
 
       <RuntimeProviderChecklist
         configuredKinds={cfg.llm_provider_kinds}
+        zaiKeySet={cfg.zai_key_set === true}
         selectedProviders={providers}
         onSelectedProvidersChange={setProviders}
         onConnectedProvidersChange={updateConnectedProviders}

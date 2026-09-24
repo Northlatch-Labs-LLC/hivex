@@ -97,7 +97,7 @@ func (l *Launcher) runHeadlessClaudeTurn(ctx context.Context, slug string, notif
 		cmd.Dir = botScratchDir(slug)
 	}
 	configureHeadlessProcess(cmd)
-	env := l.buildHeadlessClaudeEnv(slug)
+	env := l.buildHeadlessClaudeEnv(ctx, slug)
 	if worktreeDir != "" {
 		env = append(env, "HIVEX_WORKTREE_PATH="+worktreeDir)
 	}
@@ -453,7 +453,7 @@ func claudeUsageToTokenUsage(u provider.ClaudeUsage) *headlessTokenUsage {
 	return &headlessTokenUsage{InputTokens: u.InputTokens, OutputTokens: u.OutputTokens}
 }
 
-func (l *Launcher) buildHeadlessClaudeEnv(slug string) []string {
+func (l *Launcher) buildHeadlessClaudeEnv(ctx context.Context, slug string) []string {
 	// gitexec.CleanEnv: a spawned claude bot will run
 	// `git status/diff/commit` inside its sandbox. If hivex inherited
 	// GIT_DIR (e.g. launched from a git hook) every child `git` would
@@ -467,6 +467,21 @@ func (l *Launcher) buildHeadlessClaudeEnv(slug string) []string {
 		"HIVEX_MEMORY_BACKEND="+config.ResolveMemoryBackend(""),
 		"ANTHROPIC_PROMPT_CACHING=1",
 	)
+	if headlessTurnKind(ctx) == provider.KindZAICode {
+		// Route the shared claude engine through z.ai's Anthropic-protocol
+		// endpoint; inference and billing land on the GLM Coding Plan. The
+		// token is the z.ai credential, and any ambient Anthropic key is
+		// neutralized so the CLI cannot mix providers.
+		base := strings.TrimSpace(config.Getenv("HIVEX_ZAI_ANTHROPIC_BASE_URL"))
+		if base == "" {
+			base = "https://api.z.ai/api/anthropic"
+		}
+		env = append(env,
+			"ANTHROPIC_BASE_URL="+base,
+			"ANTHROPIC_AUTH_TOKEN="+config.ResolveZaiAPIKey(),
+			"ANTHROPIC_API_KEY=",
+		)
+	}
 	if l.isOneOnOne() {
 		env = append(env,
 			"HIVEX_ONE_ON_ONE=1",

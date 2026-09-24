@@ -14,6 +14,7 @@ import type {
 // Human-readable labels for the directly-dispatchable runtimes.
 export const PROVIDER_LABELS: Record<LLMRuntimeKind, string> = {
   "claude-code": "Claude Code",
+  "zai-code": "Z.ai Code",
   codex: "Codex",
   opencode: "Opencode",
   "mlx-lm": "MLX-LM",
@@ -24,6 +25,7 @@ export const PROVIDER_LABELS: Record<LLMRuntimeKind, string> = {
 // Fallback runtime-kind list when /config has not reported llm_provider_kinds.
 export const DEFAULT_LLM_KINDS: LLMRuntimeKind[] = [
   "claude-code",
+  "zai-code",
   "codex",
   "opencode",
   "mlx-lm",

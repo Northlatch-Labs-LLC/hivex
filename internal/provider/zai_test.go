@@ -66,3 +66,14 @@ func TestResolveHiveAPIKeyConfig(t *testing.T) {
 		t.Fatalf("gateway key must resolve from config, got %q", got)
 	}
 }
+
+// Z.ai Code is a CLI-class kind: validated, registered, and NOT routed to
+// the headless compat runner — it drives the claude engine instead.
+func TestZAICodeIsACLIRuntime(t *testing.T) {
+	if err := ValidateKind(KindZAICode); err != nil {
+		t.Fatalf("ValidateKind(zai-code): %v", err)
+	}
+	if IsOpenAICompatKind(KindZAICode) {
+		t.Fatal("zai-code is a CLI runtime, not the HTTP compat runner")
+	}
+}

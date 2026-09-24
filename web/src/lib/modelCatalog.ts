@@ -30,6 +30,11 @@ const CLOUD_MODELS: Record<
   Exclude<LLMRuntimeKind, "mlx-lm" | "ollama" | "exo">,
   string[]
 > = {
+  "zai-code": [
+    // The GLM Coding Plan catalog, current-first. Only ids verified against
+    // the plan belong here — no speculative model names.
+    "GLM-5.3",
+  ],
   "claude-code": [
     // Current / recommended
     "claude-opus-4-8",

@@ -37,7 +37,7 @@ func (l *Launcher) connectOpenAICompatMCPBridge(
 	}
 
 	cmd := exec.CommandContext(ctx, hivexBin, "mcp-team")
-	cmd.Env = l.buildHeadlessClaudeEnv(slug)
+	cmd.Env = l.buildHeadlessClaudeEnv(ctx, slug)
 	cmd.Env = setEnvValue(cmd.Env, "HIVEX_HEADLESS_PROVIDER", "openai-compat")
 	if ch := strings.TrimSpace(channel); ch != "" {
 		cmd.Env = setEnvValue(cmd.Env, "HIVEX_CHANNEL", ch)

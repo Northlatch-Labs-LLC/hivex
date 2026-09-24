@@ -43,6 +43,7 @@ import { BotInstructionsSection } from "./BotInstructionsSection";
 
 const PROVIDER_LABELS: Record<LLMRuntimeKind, string> = {
   "claude-code": "Claude Code",
+  "zai-code": "Z.ai Code",
   codex: "Codex",
   opencode: "Opencode",
   "mlx-lm": "MLX-LM",
