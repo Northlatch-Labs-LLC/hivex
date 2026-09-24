@@ -138,7 +138,7 @@ func runAnthropicMessagesStream(
 	system, wireMsgs := botMsgsToAnthropic(msgs)
 	body := anthropicRequest{
 		Model:     model,
-		MaxTokens: anthropicMaxTokens("HIVEX_ZAI_MAX_TOKENS", 1024),
+		MaxTokens: anthropicMaxTokens("HIVEX_ZAI_MAX_TOKENS", 16384),
 		System:    system,
 		Stream:    true,
 		Messages:  wireMsgs,
