@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/Northlatch-Labs-LLC/hivex/internal/bot"
@@ -141,5 +142,31 @@ func TestZaiAnthropicMessagesStream(t *testing.T) {
 	}
 	if usage == nil || usage.InputTokens != 12 || usage.OutputTokens != 7 {
 		t.Fatalf("usage = %+v", usage)
+	}
+}
+
+// A thinking model that exhausts max_tokens before emitting any text must
+// surface an error, not settle as a silent empty turn.
+func TestZaiAnthropicStreamTruncatedInThinking(t *testing.T) {
+	ch := make(chan bot.StreamChunk, 8)
+	go func() {
+		defer close(ch)
+		parseAnthropicSSEStream(ch, KindZAI, strings.NewReader(
+			"data: {\"type\":\"message_start\",\"usage\":{\"input_tokens\":5}}\n\n"+
+				"data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"text\":\"pondering deeply\"}}\n\n"+
+				"data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"max_tokens\"},\"usage\":{\"output_tokens\":32768}}\n\n"+
+				"data: {\"type\":\"message_stop\"}\n\n"))
+	}()
+	var sawErr bool
+	for c := range ch {
+		if c.Type == "error" && strings.Contains(c.Content, "max_tokens") {
+			sawErr = true
+		}
+		if c.Type == "text" {
+			t.Fatal("no text should arrive in this scenario")
+		}
+	}
+	if !sawErr {
+		t.Fatal("thinking-only truncation must surface an error chunk")
 	}
 }

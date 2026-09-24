@@ -121,7 +121,7 @@ func runAnthropicMessagesStream(
 	system, wireMsgs := botMsgsToAnthropic(msgs)
 	body := anthropicRequest{
 		Model:     model,
-		MaxTokens: 8192,
+		MaxTokens: 32768,
 		System:    system,
 		Stream:    true,
 		Messages:  wireMsgs,
@@ -175,6 +175,8 @@ type anthropicSSEEvent struct {
 	Delta struct {
 		Type string `json:"type"`
 		Text string `json:"text"`
+		// message_delta carries the terminal stop_reason inside delta.
+		StopReason string `json:"stop_reason"`
 	} `json:"delta"`
 	Usage struct {
 		InputTokens  int `json:"input_tokens"`
@@ -192,6 +194,8 @@ type anthropicSSEEvent struct {
 func parseAnthropicSSEStream(ch chan<- bot.StreamChunk, kind string, body io.Reader) {
 	reader := bufio.NewReaderSize(body, 64<<10)
 	var inTokens, outTokens int
+	var gotText bool
+	var stopReason string
 	for {
 		line, err := reader.ReadString('\n')
 		if line != "" {
@@ -206,6 +210,7 @@ func parseAnthropicSSEStream(ch chan<- bot.StreamChunk, kind string, body io.Rea
 						switch ev.Delta.Type {
 						case "text_delta":
 							if ev.Delta.Text != "" {
+								gotText = true
 								ch <- bot.StreamChunk{Type: "text", Content: ev.Delta.Text}
 							}
 						case "thinking_delta":
@@ -217,6 +222,9 @@ func parseAnthropicSSEStream(ch chan<- bot.StreamChunk, kind string, body io.Rea
 						inTokens = ev.Usage.InputTokens
 					case ev.Type == "message_delta":
 						outTokens = ev.Usage.OutputTokens
+						if ev.Delta.StopReason != "" {
+							stopReason = ev.Delta.StopReason
+						}
 					}
 				}
 			}
@@ -224,6 +232,14 @@ func parseAnthropicSSEStream(ch chan<- bot.StreamChunk, kind string, body io.Rea
 		if err != nil {
 			break
 		}
+	}
+	// A thinking-heavy model that exhausts max_tokens inside its thinking
+	// phase ends the stream with no text at all — the old behaviour was a
+	// silent, empty turn ("running" then nothing). Surface it loudly instead.
+	if !gotText && stopReason == "max_tokens" {
+		ch <- bot.StreamChunk{Type: "error", Content: fmt.Sprintf(
+			"anthropic (%s): response hit max_tokens during thinking before any text — increase the output budget", kind)}
+		return
 	}
 	if inTokens > 0 || outTokens > 0 {
 		ch <- bot.StreamChunk{Type: "usage", InputTokens: inTokens, OutputTokens: outTokens}
