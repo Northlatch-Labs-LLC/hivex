@@ -128,6 +128,21 @@ func TestParseOcrFindingsToleratesVariants(t *testing.T) {
 // posts its summary into the office feed; a failing run posts the failure.
 func TestOcrReviewAsyncPostsToOffice(t *testing.T) {
 	b := newTestBroker(t)
+	// b.messages is guarded by b.mu — the async goroutine appends under the
+	// lock, so every poll from the test goroutine must take it too.
+	msgCount := func() int {
+		b.mu.Lock()
+		defer b.mu.Unlock()
+		return len(b.messages)
+	}
+	lastContent := func() string {
+		b.mu.Lock()
+		defer b.mu.Unlock()
+		if len(b.messages) == 0 {
+			return ""
+		}
+		return b.messages[len(b.messages)-1].Content
+	}
 
 	t.Setenv("HIVEX_OCR_BINARY", fakeOcrBinary(t, `{"findings":[
 	  {"path":"x.go","line":9,"severity":"high","message":"unchecked error","rule":"E1"},
@@ -137,13 +152,13 @@ func TestOcrReviewAsyncPostsToOffice(t *testing.T) {
 	  {"path":"v.go","line":1,"severity":"low","message":"order"},
 	  {"path":"u.go","line":5,"severity":"low","message":"extra"}
 	]}`))
-	before := len(b.messages)
+	before := msgCount()
 	b.runOcrReviewAsync(".", "HEAD~1", "HEAD")
 	deadline := time.Now().Add(5 * time.Second)
 	summary := ""
 	for time.Now().Before(deadline) {
-		if len(b.messages) > before {
-			summary = b.messages[len(b.messages)-1].Content
+		if msgCount() > before {
+			summary = lastContent()
 			break
 		}
 		time.Sleep(10 * time.Millisecond)
@@ -157,15 +172,15 @@ func TestOcrReviewAsyncPostsToOffice(t *testing.T) {
 
 	// A failing run reports the failure loudly into the feed.
 	t.Setenv("HIVEX_OCR_BINARY", fakeOcrBinary(t, `{not-json`))
-	before = len(b.messages)
+	before = msgCount()
 	b.runOcrReviewAsync(".", "", "")
 	for time.Now().Before(deadline) {
-		if len(b.messages) > before {
+		if msgCount() > before {
 			break
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	if len(b.messages) == before {
+	if msgCount() == before {
 		t.Fatal("a failing review must post the failure to the office feed")
 	}
 }

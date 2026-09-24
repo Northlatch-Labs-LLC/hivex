@@ -74,8 +74,8 @@ var allowedFiles = map[string]string{
 	"internal/workspaces/doctor_fix.go":  "symlinkPaths — ~/.hivex compatibility symlink lives at real HOME",
 	"internal/workspaces/paths.go":       "realHomeDir — cross-workspace token + symlink paths must live at real HOME",
 	"internal/team/broker_workspaces.go": "workspaceTokenDir — same shared spaces directory rationale",
-	"cmd/hivebot/workspaces_adapter.go":  "listTrashEntries — ~/.hivex-spaces/.backups, shared cross-workspace root",
-	"cmd/hivebot/main.go":                "HIVEX_GLOBAL_HOME captures real HOME before any HIVEX_RUNTIME_HOME override",
+	"cmd/hivex/workspaces_adapter.go":    "listTrashEntries — ~/.hivex-spaces/.backups, shared cross-workspace root",
+	"cmd/hivex/main.go":                  "HIVEX_GLOBAL_HOME captures real HOME before any HIVEX_RUNTIME_HOME override",
 }
 
 // repoRoot returns the absolute path to the repository root by walking up from

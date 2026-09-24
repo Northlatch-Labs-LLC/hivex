@@ -138,9 +138,7 @@ func (r *Registry) Trigger(slug string, at time.Time) (TriggerResult, error) {
 	art := RenderArtifact(j.Artifact, at)
 	res := TriggerResult{Job: j.Slug, Label: j.Label,
 		At: at.In(CadenceLoc()).Format(time.RFC3339), Artifact: art}
-	for _, role := range j.Roles {
-		res.Runs = append(res.Runs, role)
-	}
+	res.Runs = append(res.Runs, j.Roles...)
 	if b := r.bodies[slug]; b != nil {
 		if err := b(TriggerContext{Job: j, At: at.In(CadenceLoc()), Artifact: art}); err != nil {
 			return res, fmt.Errorf("gridframe: job %s body: %w", slug, err)

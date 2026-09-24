@@ -530,7 +530,7 @@ jobs:
           cat > "$HOME/.hivex/onboarded.json" <<'JSON'
           {"version":1,"completed_at":"2026-01-01T00:00:00Z","company_name":"e2e-ci"}
           JSON
-          ./hivex --no-open --broker-port 7890 --web-port 7891 --no-hive </dev/null > hivex.log 2>&1 &
+          ./hivex --no-open --broker-port 7890 --web-port 7891 </dev/null > hivex.log 2>&1 &
           echo $! > hivex.pid
           for i in $(seq 1 30); do
             if curl -sf http://localhost:7891/onboarding/state -o /dev/null; then
