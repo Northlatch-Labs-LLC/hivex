@@ -120,6 +120,14 @@ func (b *Broker) writeCompiledSkillLocked(spec teamSkill) (*teamSkill, error) {
 	if !skillSlugRegex.MatchString(slug) {
 		return nil, fmt.Errorf("writeCompiledSkillLocked: slug %q does not match ^[a-z0-9][a-z0-9-]*$", slug)
 	}
+	// A skill may never share a slug with a member: the office prompt
+	// directs bots to invoke materially-matching skills, so a role playbook
+	// compiled under the lead's own name made the bot invoke itself in a
+	// loop ("Run skill: cos"). Role playbooks are runbooks for the ROLE,
+	// not invocable team skills — reject at the chokepoint.
+	if b.findMemberLocked(slug) != nil {
+		return nil, fmt.Errorf("writeCompiledSkillLocked: slug %q collides with a team member — role playbooks are not invocable skills", slug)
+	}
 
 	// --- Step 2: System-author check ---
 	createdBy := strings.TrimSpace(spec.CreatedBy)

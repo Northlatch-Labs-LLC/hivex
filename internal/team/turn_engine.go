@@ -29,6 +29,8 @@ import (
 	"log"
 	"strings"
 	"time"
+
+	"github.com/Northlatch-Labs-LLC/hivex/internal/provider"
 )
 
 // TurnState is one stage of the canonical turn lifecycle.
@@ -80,6 +82,9 @@ type TurnRecord struct {
 	StartedAt   string           `json:"started_at"`
 	UpdatedAt   string           `json:"updated_at"`
 	Transitions []TurnTransition `json:"transitions,omitempty"`
+	// Usage is the turn's token truth, stamped by the runner as the stream
+	// closes. Per-turn cost attribution and the live-work surface read it.
+	Usage *provider.ClaudeUsage `json:"usage,omitempty"`
 }
 
 // TurnMeter is the settle-phase usage meter hook (tier enforcement, P6).
@@ -94,6 +99,23 @@ type TurnMeter interface {
 
 // TurnBegin opens a turn in intake and persists the record. Nil-safe: a
 // brokerless launcher (tests, degraded modes) gets a record ID that no-ops.
+// StampTurnUsage records the turn's token usage from the runner's stream
+// close. Nil-safe and idempotent (last write wins while the turn is open).
+func (b *Broker) StampTurnUsage(id string, usage provider.ClaudeUsage) {
+	if usage.InputTokens == 0 && usage.OutputTokens == 0 && usage.CacheReadTokens == 0 && usage.CacheCreationTokens == 0 {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for i := range b.turnRecords {
+		if b.turnRecords[i].ID == id {
+			u := usage
+			b.turnRecords[i].Usage = &u
+			return
+		}
+	}
+}
+
 func (b *Broker) TurnBegin(bot, taskID, channel string) string {
 	id := fmt.Sprintf("turn-%s-%d", strings.ToLower(strings.TrimSpace(bot)), time.Now().UnixNano())
 	if b == nil {

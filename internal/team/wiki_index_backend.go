@@ -26,6 +26,7 @@ package team
 import (
 	"context"
 	"fmt"
+	"github.com/Northlatch-Labs-LLC/hivex/internal/config"
 	"log"
 	"os"
 	"strings"
@@ -85,6 +86,14 @@ func newWikiIndexForBackend(ctx context.Context, root string) (*WikiIndex, error
 		if explicit {
 			log.Printf("wiki: using in-memory index (%s=%s)", WikiBackendEnv, WikiBackendMemory)
 		}
+		return NewWikiIndex(root), nil
+	}
+
+	// The gbrain index is only for hosts whose memory backend IS gbrain.
+	// A markdown/none host never asked for it: attempting it anyway made
+	// every boot log "facts will NOT persist" for a backend that was never
+	// in play.
+	if mb := config.ResolveMemoryBackend(""); mb != "gbrain" {
 		return NewWikiIndex(root), nil
 	}
 

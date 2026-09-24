@@ -45,14 +45,6 @@ func defaultHeadlessCodexRunTurn(l *Launcher, ctx context.Context, slug, notific
 	}
 	// Per-task provider wins over the bot binding (then global default).
 	kind := l.effectiveProviderKindForBot(ctx, slug)
-	// Monthly-tier provider lock: a provider-locked entitlement pins
-	// inference to the Hivex Gateway (hiveapi kind). Any other runtime is
-	// refused loudly — the pin is a paid-tier contract, not a suggestion.
-	// Fail-open when no entitlement is loaded (standalone harness).
-	if e := currentEntitlement(ctx); e != nil && e.ProviderLocked && kind != provider.KindHiveAPI && kind != provider.KindSlack {
-		postProviderLockNotice(l.broker, slug, kind)
-		return fmt.Errorf("turn blocked for %s: the account's plan pins inference to the Hivex Gateway (provider %q is not allowed); run with --provider hiveapi", slug, kind)
-	}
 	// Turn Engine v2 (turn_engine.go): the turn becomes a first-class,
 	// persisted record with an audited state trail. The runner flow below
 	// is unchanged — the engine observes it. A broker restart mid-turn

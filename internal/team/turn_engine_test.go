@@ -5,6 +5,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/Northlatch-Labs-LLC/hivex/internal/provider"
 )
 
 // countingTurnMeter is a TurnMeter that counts calls; safe for concurrent
@@ -169,4 +171,22 @@ func TestTurnEngineJournalIsBounded(t *testing.T) {
 	if len(records) < maxTurnRecords {
 		t.Fatalf("journal lost records early: %d", len(records))
 	}
+}
+
+// A runner's stream usage lands on the turn record — per-turn cost
+// attribution reads the record, not a nearest-message heuristic.
+func TestStampTurnUsage(t *testing.T) {
+	b := newTestBroker(t)
+	id := b.TurnBegin("cos", "", "cos__human")
+	b.StampTurnUsage(id, provider.ClaudeUsage{InputTokens: 11, OutputTokens: 7})
+	b.TurnSettle(id, "done")
+	for _, rec := range b.TurnRecords() {
+		if rec.ID == id {
+			if rec.Usage == nil || rec.Usage.InputTokens != 11 || rec.Usage.OutputTokens != 7 {
+				t.Fatalf("usage not stamped: %+v", rec.Usage)
+			}
+			return
+		}
+	}
+	t.Fatal("turn record not found")
 }

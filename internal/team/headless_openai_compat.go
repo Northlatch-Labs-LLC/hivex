@@ -225,6 +225,7 @@ func (l *Launcher) runHeadlessOpenAICompatTurn(ctx context.Context, slug string,
 	// $ cost so the broker's cost_usd column correctly remains untouched.
 	if (turnUsage.InputTokens > 0 || turnUsage.OutputTokens > 0) && l.broker != nil {
 		l.broker.RecordBotUsage(slug, kind, turnUsage)
+		l.broker.StampTurnUsage(turnID, turnUsage)
 	}
 	if err != nil {
 		metrics.TotalMs = time.Since(startedAt).Milliseconds()

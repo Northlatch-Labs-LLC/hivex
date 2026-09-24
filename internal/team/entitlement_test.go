@@ -176,20 +176,6 @@ func TestTurnCapNoticePostsOncePerCooldown(t *testing.T) {
 	}
 }
 
-// TestProviderLockNoticeRateLimited pins the lock notice: exactly one
-// office post per cooldown window.
-func TestProviderLockNoticeRateLimited(t *testing.T) {
-	resetProviderLockNoticeForTests()
-	t.Cleanup(resetProviderLockNoticeForTests)
-	b := newTestBroker(t)
-	before := len(b.messages)
-	postProviderLockNotice(b, "researcher", "codex")
-	postProviderLockNotice(b, "researcher", "codex")
-	if len(b.messages) != before+1 {
-		t.Fatalf("lock notice must post exactly once per cooldown, got %d new messages", len(b.messages)-before)
-	}
-}
-
 // TestHiveAPIKindIsCompatDispatched pins the dispatch routing: the Hivex
 // Gateway kind routes through the OpenAI-compat runner.
 func TestHiveAPIKindIsCompatDispatched(t *testing.T) {

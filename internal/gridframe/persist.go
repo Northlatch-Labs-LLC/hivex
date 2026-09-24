@@ -35,6 +35,11 @@ func (s *Store) SeedFrom(seedDir string) error {
 	if s.persistDir == "" {
 		return fmt.Errorf("gridframe: PersistTo before SeedFrom")
 	}
+	// Only tables that had NO file get seeded; books already on disk were
+	// loaded by PersistTo and must not be re-imported — append-only rejects
+	// duplicates, which used to turn every re-boot into a spurious
+	// "seed ledgers unavailable" error.
+	seeded := false
 	for _, t := range Tables() {
 		dst := filepath.Join(s.persistDir, t.Name+".csv")
 		if _, err := os.Stat(dst); err == nil {
@@ -50,6 +55,10 @@ func (s *Store) SeedFrom(seedDir string) error {
 		if err := atomicWrite(dst, raw); err != nil {
 			return err
 		}
+		seeded = true
+	}
+	if !seeded {
+		return nil
 	}
 	return s.loadFrom(s.persistDir)
 }

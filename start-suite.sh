@@ -12,6 +12,12 @@ if [ ! -x ./hivex ]; then
   echo "Building the office binary (cmd/hivex)..."
   go build -o hivex ./cmd/hivex || exit 1
 fi
+# Rotate a bloated engine log before appending (keep 3 generations).
+if [ -f logs/harness.log ] && [ "$(stat -f%z logs/harness.log 2>/dev/null || echo 0)" -gt 5242880 ]; then
+  mv logs/harness.log.2 logs/harness.log.3 2>/dev/null
+  mv logs/harness.log.1 logs/harness.log.2 2>/dev/null
+  mv logs/harness.log logs/harness.log.1
+fi
 (nohup ./hivex --broker-port 7910 --web-port 7911 > logs/harness.log 2>&1 & echo $! > logs/harness.pid)
 
 sleep 6
