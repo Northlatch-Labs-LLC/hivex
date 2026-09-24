@@ -19,6 +19,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -27,6 +29,21 @@ import (
 )
 
 const anthropicAPIVersion = "2023-06-01"
+
+// anthropicMaxTokens reads the output budget from env, defaulting to def.
+// The default is deliberately small (operator-set): every zai turn pays for
+// thinking AND text out of this budget, and a thinking model that exhausts
+// it fails loudly in the stream rather than answering at half length.
+func anthropicMaxTokens(envName string, def int) int {
+	raw := strings.TrimSpace(os.Getenv(envName))
+	if raw == "" {
+		return def
+	}
+	if n, err := strconv.Atoi(raw); err == nil && n > 0 && n <= 200000 {
+		return n
+	}
+	return def
+}
 
 type anthropicMessage struct {
 	Role    string `json:"role"`
@@ -121,7 +138,7 @@ func runAnthropicMessagesStream(
 	system, wireMsgs := botMsgsToAnthropic(msgs)
 	body := anthropicRequest{
 		Model:     model,
-		MaxTokens: 32768,
+		MaxTokens: anthropicMaxTokens("HIVEX_ZAI_MAX_TOKENS", 1024),
 		System:    system,
 		Stream:    true,
 		Messages:  wireMsgs,
