@@ -9,7 +9,7 @@ rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
 # Single self-contained binary: web/dist is embedded at compile time.
-go build -o "$APP/Contents/MacOS/Hive" ./cmd/hivebot
+go build -o "$APP/Contents/MacOS/Hive" ./cmd/hivex
 
 # Launcher: keeps the office in the foreground (Dock shows it running),
 # opens the office once the web server is up.

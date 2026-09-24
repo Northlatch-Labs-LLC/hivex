@@ -53,7 +53,7 @@ ship inside a single binary that binds to loopback and nothing else.
 Requirements: Go ≥ 1.25 (Node ≥ 20 only if you touch `web/`).
 
 ```bash
-go build ./cmd/hivebot
+go build ./cmd/hivex
 ./hivebot                       # office opens at http://127.0.0.1:7891
 ```
 
@@ -90,7 +90,7 @@ Live books live under `~/.hivex/GRIDFRAME/ledgers/`; the reference canon
 ## Project layout
 
 ```
-cmd/hivebot/        entrypoint: broker, office, TUI, workspace commands
+cmd/hivex/         entrypoint: broker, office, TUI, workspace commands
 internal/team/      broker, tasks, agents, marketplace, auth
 internal/provider/  runtime registry: CLI loops + OpenAI-compat HTTP
 internal/gridframe/ governance: gates, ledgers, cadence, AEI, Principal API

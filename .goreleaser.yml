@@ -2,7 +2,7 @@ version: 2
 
 builds:
   - id: hivex
-    main: ./cmd/hivebot
+    main: ./cmd/hivex
     binary: hivebot
     goos:
       - darwin

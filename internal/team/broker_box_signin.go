@@ -45,9 +45,9 @@ const (
 	// resolvers below are read at call time so tests and stubs can point
 	// the Box backend anywhere (pattern: config.ResolveProviderEndpoint).
 	boxCLIDownloadDefault = "https://ascii.dev/api/box/cli/download"
-	boxInstallURLDefault   = "https://ascii.dev/api/box/install"
-	boxCLIChannel          = "ascii-prod"
-	boxKeyName             = "hivebot"
+	boxInstallURLDefault  = "https://ascii.dev/api/box/install"
+	boxCLIChannel         = "ascii-prod"
+	boxKeyName            = "hivebot"
 )
 
 // boxCLIDownloadURL is where the CLI binary is fetched from:
