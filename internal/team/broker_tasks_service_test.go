@@ -577,3 +577,36 @@ func assertTaskIDs(t *testing.T, tasks []teamTask, want []string) {
 		}
 	}
 }
+
+// A task whose home channel was retired after creation must stay
+// actionable: lifecycle actions used to die on "channel not found" and
+// left unclosable zombies (task-skill-255 returned it on every button).
+func TestMutateTaskSurvivesRetiredChannel(t *testing.T) {
+	b := newTestBroker(t)
+	b.channels = []teamChannel{
+		{Slug: "general", Name: "general", Members: []string{"cos"}},
+	}
+	created, err := b.MutateTask(TaskPostRequest{
+		Action:    "create",
+		Channel:   "general",
+		Title:     "Stale-home task",
+		Owner:     "alice",
+		CreatedBy: "cos",
+	})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	// The channel is retired after the task exists.
+	b.channels = nil
+	res, err := b.MutateTask(TaskPostRequest{
+		Action:    "cancel",
+		ID:        created.Task.ID,
+		CreatedBy: "human",
+	})
+	if err != nil {
+		t.Fatalf("cancel on a retired channel must succeed: %v", err)
+	}
+	if res.Task.Status() != "canceled" {
+		t.Fatalf("status: want canceled, got %q", res.Task.Status())
+	}
+}

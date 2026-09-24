@@ -852,14 +852,16 @@ func (b *Broker) MutateTask(body TaskPostRequest) (TaskResponse, error) {
 		if taskChannel == "" {
 			taskChannel = channel
 		}
-		// A task with no home at all is legal; there is nothing to look up or
-		// authorize against, so skip rather than 404.
-		if taskChannel != "" && b.findChannelLocked(taskChannel) == nil {
-			return TaskResponse{}, taskMutationError(TaskMutationNotFound, "channel not found", nil)
-		}
-		// Authorize against the task's actual channel, not caller-supplied body.Channel.
-		if taskChannel != "" && !b.canAccessChannelLocked(actor, taskChannel) {
-			return TaskResponse{}, taskMutationError(TaskMutationForbidden, "channel access denied", nil)
+		// A task with no home — or whose home channel was retired/deleted
+		// after creation — is still legal and must stay actionable: the
+		// channel's absence is a fact about the room, not the task, and
+		// refusing here made such tasks unclosable zombies (task-skill-255
+		// returned "channel not found" on every lifecycle button).
+		// Authorization still applies whenever the home exists.
+		if taskChannel != "" && b.findChannelLocked(taskChannel) != nil {
+			if !b.canAccessChannelLocked(actor, taskChannel) {
+				return TaskResponse{}, taskMutationError(TaskMutationForbidden, "channel access denied", nil)
+			}
 		}
 		appendDetails := false
 		reassignPrevOwner := ""

@@ -679,7 +679,14 @@ func (b *Broker) handleInvokeSkill(w http.ResponseWriter, r *http.Request) {
 		channel = normalizeChannelSlug(sk.Channel)
 	}
 	if channel == "" {
-		channel = "general"
+		// The retired shared room ("general") is not a home. Prefer the
+		// office lead's DM; a channel-less task is legal, so fall through
+		// to "" rather than pinning work to a room that no longer exists.
+		if lead := strings.TrimSpace(officeLeadSlugFrom(b.members)); lead != "" {
+			if dm := b.findChannelLocked(normalizeChannelSlug(lead + "__human")); dm != nil {
+				channel = dm.Slug
+			}
+		}
 	}
 
 	invoker := strings.TrimSpace(body.InvokedBy)
@@ -690,17 +697,19 @@ func (b *Broker) handleInvokeSkill(w http.ResponseWriter, r *http.Request) {
 	sk.LastExecutionStatus = "invoked"
 	sk.UpdatedAt = now
 
-	b.counter++
-	b.appendMessageLocked(channelMessage{
-		ID:        fmt.Sprintf("msg-%d", b.counter),
-		From:      invoker,
-		Channel:   channel,
-		Kind:      "skill_invocation",
-		Title:     sk.Title,
-		Content:   fmt.Sprintf("Skill %q invoked by @%s (usage #%d)", sk.Name, invoker, sk.UsageCount),
-		Timestamp: now,
-	})
-	b.appendActionLocked("skill_invocation", "office", channel, invoker, truncateSummary(sk.Title+" [invoked]", 140), sk.ID)
+	if channel != "" {
+		b.counter++
+		b.appendMessageLocked(channelMessage{
+			ID:        fmt.Sprintf("msg-%d", b.counter),
+			From:      invoker,
+			Channel:   channel,
+			Kind:      "skill_invocation",
+			Title:     sk.Title,
+			Content:   fmt.Sprintf("Skill %q invoked by @%s (usage #%d)", sk.Name, invoker, sk.UsageCount),
+			Timestamp: now,
+		})
+		b.appendActionLocked("skill_invocation", "office", channel, invoker, truncateSummary(sk.Title+" [invoked]", 140), sk.ID)
+	}
 
 	// Dispatch a real task so a bot picks up and executes the skill.
 	// This is best-effort: if task creation fails we log and carry on —
