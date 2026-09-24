@@ -127,3 +127,6 @@ hivebot-testdrive.log
 
 # Harness tooling (dynamic-workflow scripts under .zcode/) — not product code
 /.zcode/
+
+# runtime workspace logs stay local
+hivex-home/.hivex/logs/
