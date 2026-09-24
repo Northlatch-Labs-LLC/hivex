@@ -15,16 +15,16 @@ office UI, the broker, the governance engine, and the runtime providers all
 ship inside a single binary that binds to loopback and nothing else.
 
 ```
-┌────────────────────────── one binary: hivebot ──────────────────────────┐
+┌────────────────────────── one binary: hivex ───────────────────────────┐
 │                                                                          │
 │  Office UI (React, embedded via go:embed) ── http://127.0.0.1:7891      │
 │      │  tasks · digest · approvals · board · compliance · skills        │
 │      ▼                                                                   │
 │  Broker (loopback) ── auth, task planning, metering, marketplace        │
 │      │                                                                   │
-│      ├── CLI runtimes: claude-code · codex · opencode                   │
-│      ├── HTTP runtimes: hiveapi · ollama · mlx-lm · exo                 │
-│      └── custom-*: any OpenAI-compatible endpoint (e.g. z.ai GLM)       │
+│      ├── CLI runtimes: claude-code · zai-code · codex · opencode        │
+│      ├── HTTP runtimes: zai (GLM) · hiveapi · ollama · mlx-lm · exo     │
+│      └── custom-*: any OpenAI-compatible endpoint added in Settings     │
 │      ▼                                                                   │
 │  Gridframe engine ── T0–T3 approval gates · append-only ledgers         │
 │                      month locks · cadence jobs · AEI health metric     │
@@ -32,6 +32,21 @@ ship inside a single binary that binds to loopback and nothing else.
 │  Runtime home: ~/.hivex   (config, workspaces, ledgers)                 │
 └──────────────────────────────────────────────────────────────────────────┘
 ```
+
+## The office
+
+![The Hivex office — home](docs/screenshots/office-home.png)
+
+*One binary, one loopback page: the whole company. Work, Build, and Govern
+in the sidebar; every agent, task, and approval behind it.*
+
+| Credentials — Z.ai as a first-class provider | Runtimes — Z.ai Code beside the CLIs |
+| :---: | :---: |
+| <img src="docs/screenshots/credentials-zai.png" width="430" alt="Settings → Credentials → API Keys with the Z.ai (GLM) row first"> | <img src="docs/screenshots/runtimes-zai-code.png" width="430" alt="Runtime checklist with Z.ai Code beside Claude Code, Codex, Opencode"> |
+
+| Tasks | Gridframe board |
+| :---: | :---: |
+| <img src="docs/screenshots/tasks.png" width="430" alt="Task list"> | <img src="docs/screenshots/gridframe-board.png" width="430" alt="Gridframe governance board"> |
 
 ## Why
 

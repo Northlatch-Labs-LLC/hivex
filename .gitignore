@@ -15,6 +15,8 @@
 !/docs/specs/
 !/docs/specs/**
 !/docs/evals/
+!/docs/screenshots/
+!/docs/screenshots/**
 !/docs/evals/**
 !/docs/experiments/
 !/docs/experiments/**
