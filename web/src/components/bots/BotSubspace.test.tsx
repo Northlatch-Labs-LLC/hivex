@@ -188,7 +188,7 @@ describe("<AgentSubspace>", () => {
       "Knowledge",
       "Policies",
       "Live Stream",
-      "Config",
+      "Runtime & Model",
     ]);
   });
 
