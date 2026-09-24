@@ -132,3 +132,12 @@ hivebot-testdrive.log
 
 # runtime workspace logs stay local
 hivex-home/.hivex/logs/
+
+# Internal working material — dev plans, agent memory, tracking docs.
+# Never tracked: internal plans must not reach the public repo (see the
+# 2026-09-24 history purge). Local copies live on disk only.
+/docs/plans/
+/MEMORY.md
+/TODOS.md
+/CLAUDE.md
+/TESTING-WIKI.md
