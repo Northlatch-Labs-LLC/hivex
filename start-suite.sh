@@ -8,7 +8,11 @@ echo "[1/2] Starting containers (cognee + headroom)..."
 (cd 9router && docker compose start cognee headroom > /dev/null 2>&1 && docker compose stop hiveapi-gateway > /dev/null 2>&1)
 
 echo "[2/2] Starting the Hivex office..."
-(nohup ./hivebot --broker-port 7910 --web-port 7911 > logs/harness.log 2>&1 & echo $! > logs/harness.pid)
+if [ ! -x ./hivex ]; then
+  echo "Building the office binary (cmd/hivex)..."
+  go build -o hivex ./cmd/hivex || exit 1
+fi
+(nohup ./hivex --broker-port 7910 --web-port 7911 > logs/harness.log 2>&1 & echo $! > logs/harness.pid)
 
 sleep 6
 echo ""

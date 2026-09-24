@@ -18,7 +18,7 @@ const (
 // Entry is one catalog item. Payload is the file body written on install.
 type Entry struct {
 	ID          string   `json:"id"`
-	Category     Category `json:"category"`
+	Category    Category `json:"category"`
 	Name        string   `json:"name"`
 	Description string   `json:"description"`
 	Payload     string   `json:"payload"`
