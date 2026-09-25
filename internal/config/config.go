@@ -129,6 +129,21 @@ type Config struct {
 	// install-wide LLMProvider or per-bot runtime once the provider layer
 	// registers it. See custom_provider.go.
 	CustomProviders []CustomProvider `json:"custom_providers,omitempty"`
+	// CitizenKeys are the synthetic inference keys minted by the citizen
+	// provisioning primitive (POST /citizens): one agent-citizen = one machine
+	// + one inference key. Stored plain exactly like zai_api_key above —
+	// config.json is the operator's local secret store. The key is returned
+	// to the caller ONCE in the provision response and never again; surfaces
+	// that need to reference it later show config.KeyFingerprint only.
+	CitizenKeys []CitizenKey `json:"citizen_keys,omitempty"`
+}
+
+// CitizenKey is one provisioned citizen's inference key record, keyed by the
+// office member slug the citizen was provisioned as.
+type CitizenKey struct {
+	Slug      string `json:"slug"`
+	APIKey    string `json:"api_key"`
+	CreatedAt string `json:"created_at,omitempty"`
 }
 
 // ProviderEndpoint configures one OpenAI-compatible HTTP backend.

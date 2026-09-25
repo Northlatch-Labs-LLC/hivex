@@ -271,6 +271,15 @@ type Broker struct {
 	// second sweep reading tombstone content (written by the first) into the
 	// .archive/ copy — silently destroying the original.
 	archiveSweepMu sync.Mutex
+	// gridframeStore is the live Gridframe ledger store armed by StartOnPort
+	// and served by the /gridframe routes. Kept as a Broker field (rather
+	// than the former local in StartOnPort) so the citizen provisioning
+	// primitive (broker_citizens.go) appends to the SAME instance — two
+	// stores over one ledger directory would lose updates whenever each
+	// rewrote the CSV without the other's rows. gridframeMu guards the field
+	// itself (gridframe.Store is not internally synchronized).
+	gridframeStore *gridframe.Store
+	gridframeMu    sync.Mutex
 	server         *http.Server
 	listener       net.Listener
 	// webUIServer/webUIListener are the web-UI-port counterparts of
@@ -871,7 +880,9 @@ func (b *Broker) StartOnPort(port int) error {
 	// Gridframe Principal surface (G4): the company ledgers + approval gate.
 	// The live ledgers directory is the source of truth (write-through
 	// persistence); first boot seeds it from the shipped reference ledgers.
-	gfStore := gridframe.NewStore()
+	// The store lives on the Broker (b.gridframeStore) so the citizens
+	// provisioning primitive books into the same ledgers this surface serves.
+	gfStore := b.ensureGridframeStore()
 	gfHome := filepath.Join(config.RuntimeHomeDir(), ".hivex", "GRIDFRAME")
 	if err := gfStore.PersistTo(filepath.Join(gfHome, "ledgers")); err != nil {
 		log.Printf("gridframe: ledger persistence unavailable: %v", err)
@@ -879,6 +890,12 @@ func (b *Broker) StartOnPort(port int) error {
 		log.Printf("gridframe: seed ledgers unavailable: %v", err)
 	}
 	gridframe.RegisterRoutes(mux, gfStore, gridframe.NewGate(gfStore), b.requireAuth)
+	// Citizen provisioning primitive: the unit Gridframe sells — one
+	// agent-citizen = one machine + one inference key, metered into the
+	// ledgers. See broker_citizens.go. Method+wildcard patterns (same style
+	// as the /gridframe routes above) so {slug} populates r.PathValue.
+	mux.HandleFunc("POST /citizens", b.requireAuth(b.handleCitizens))
+	mux.HandleFunc("DELETE /citizens/{slug}", b.requireAuth(b.handleCitizensSubpath))
 	mux.HandleFunc("/v1/logs", b.requireAuth(b.handleOTLPLogs))
 	mux.HandleFunc("/events", b.handleEvents)
 	mux.HandleFunc("/agent-stream/", b.requireAuth(b.handleBotStream))
