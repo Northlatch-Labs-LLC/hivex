@@ -651,6 +651,33 @@ export function getOfficeMembers() {
   return get<OfficeMembersResponse>("/office-members");
 }
 
+/**
+ * One agent's latest turn from the turn-engine journal (GET /turns/live).
+ * The live-work surface: `state` is the engine stage (intake → … → settled
+ * | failed — anything not terminal means the agent is on a turn right now);
+ * `usage` appears only once the runner stamps the stream close, so a
+ * mid-turn poll simply has no tokens yet.
+ */
+export interface LiveTurn {
+  agent: string;
+  state: string;
+  task_id?: string;
+  started_at: string;
+  updated_at: string;
+  model?: string;
+  usage?: {
+    input_tokens?: number;
+    output_tokens?: number;
+    cache_read_tokens?: number;
+    cache_creation_tokens?: number;
+    cost_usd?: number;
+  };
+}
+
+export function getTurnsLive() {
+  return get<{ turns: LiveTurn[] }>("/turns/live");
+}
+
 export interface GeneratedBotTemplate {
   slug?: string;
   name?: string;

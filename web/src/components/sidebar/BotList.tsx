@@ -5,6 +5,7 @@ import { useBotEventPeek } from "../../hooks/useBotEventPeek";
 import { useDefaultHarness } from "../../hooks/useConfig";
 import { useFirstRunNudge } from "../../hooks/useFirstRunNudge";
 import { useOfficeMembers } from "../../hooks/useMembers";
+import { isTurnInFlight, useTurnsLive } from "../../hooks/useTurnsLive";
 import { useOverflow } from "../../hooks/useOverflow";
 import { AVATAR_MODE } from "../../lib/avatarMode";
 import { type HarnessKind, resolveHarness } from "../../lib/harness";
@@ -42,13 +43,18 @@ function classifyActivity(member: OfficeMember | undefined) {
 }
 
 /**
- * "Working" means processing right now, derived from `status`. It is NOT
- * `online`, which only says an adapter session is reachable. The two were
- * conflated in the UI before: both rendered as a green dot, and the louder of
- * the two meant the less useful thing.
+ * "Working" means processing right now, derived from `status` OR from the
+ * turn engine's journal (`turnLive`: the agent's latest turn is still in
+ * flight — intake through verifying). `status` is the adapter's claim;
+ * the turn record is the engine's, and either vouching is enough. It is
+ * NOT `online`, which only says an adapter session is reachable. The two
+ * were conflated in the UI before: both rendered as a green dot, and the
+ * louder of the two meant the less useful thing.
  */
-function isWorking(member: OfficeMember): boolean {
-  return (member.status || "").toLowerCase() === "active";
+function isWorking(member: OfficeMember, turnLive: boolean): boolean {
+  return (
+    (member.status || "").toLowerCase() === "active" || turnLive
+  );
 }
 
 interface SidebarBotRowProps {
@@ -57,6 +63,8 @@ interface SidebarBotRowProps {
   isFirst: boolean;
   showNudge: boolean;
   defaultHarness: HarnessKind;
+  /** The turn engine says this agent's latest turn is still in flight. */
+  turnLive: boolean;
   onSelect: (slug: string) => void;
 }
 
@@ -71,12 +79,13 @@ function SidebarBotRow({
   isFirst,
   showNudge,
   defaultHarness,
+  turnLive,
   onSelect,
 }: SidebarBotRowProps) {
   const peek = useBotEventPeek(agent.slug);
   const anchorRef = useRef<HTMLDivElement>(null);
   const ac = classifyActivity(agent);
-  const working = isWorking(agent);
+  const working = isWorking(agent, turnLive);
   // "On its computer": the desktop is up AND the bot is mid-turn. Both
   // facts are required so an idle bot with a sleeping VM shows nothing.
   const computerReady = useAppStore(
@@ -266,6 +275,9 @@ export function BotList() {
   const defaultHarness = useDefaultHarness();
   const { showNudge } = useFirstRunNudge();
   const isReconnecting = useAppStore((s) => s.isReconnecting);
+  // One poller for the whole rail: the turn journal answers for every
+  // agent at once, so each row just reads its slice of the map.
+  const { data: liveTurns = {} } = useTurnsLive();
 
   const agents = members.filter((m) => m.slug && m.slug !== "human");
   // v3 MVP — split CEO out of the flat bot list so the sidebar can
@@ -319,6 +331,7 @@ export function BotList() {
                     isFirst={cos.slug === firstBotSlug}
                     showNudge={showNudge}
                     defaultHarness={defaultHarness}
+                    turnLive={isTurnInFlight(liveTurns[cos.slug])}
                     onSelect={handleSelect}
                   />
                 </div>
@@ -344,6 +357,7 @@ export function BotList() {
                           isFirst={agent.slug === firstBotSlug}
                           showNudge={showNudge}
                           defaultHarness={defaultHarness}
+                          turnLive={isTurnInFlight(liveTurns[agent.slug])}
                           onSelect={handleSelect}
                         />
                       </div>

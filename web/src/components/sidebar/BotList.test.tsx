@@ -17,6 +17,20 @@ vi.mock("../../hooks/useFirstRunNudge", () => ({
   useFirstRunNudge: vi.fn(),
 }));
 
+// The turn-journal poller is mocked so no fetch leaves the test; the real
+// isTurnInFlight predicate is kept (importActual) so the dot's contract is
+// still exercised against the shipped logic.
+vi.mock("../../hooks/useTurnsLive", async () => {
+  const actual =
+    await vi.importActual<typeof import("../../hooks/useTurnsLive")>(
+      "../../hooks/useTurnsLive",
+    );
+  return {
+    ...actual,
+    useTurnsLive: vi.fn(() => ({ data: {} })),
+  };
+});
+
 vi.mock("../../hooks/useOverflow", () => ({
   useOverflow: () => ({ current: null }),
 }));
@@ -92,12 +106,14 @@ vi.mock("../../hooks/useBotEventPeek", () => {
 import { useBotEventPeek } from "../../hooks/useBotEventPeek";
 import { useFirstRunNudge } from "../../hooks/useFirstRunNudge";
 import { useOfficeMembers } from "../../hooks/useMembers";
+import { useTurnsLive } from "../../hooks/useTurnsLive";
 import { router } from "../../lib/router";
 import { BotList } from "./BotList";
 
 const useOfficeMembersMock = vi.mocked(useOfficeMembers);
 const useFirstRunNudgeMock = vi.mocked(useFirstRunNudge);
 const useBotEventPeekMock = vi.mocked(useBotEventPeek);
+const useTurnsLiveMock = vi.mocked(useTurnsLive);
 
 function setMembers(members: OfficeMember[]) {
   useOfficeMembersMock.mockReturnValue({
@@ -143,6 +159,9 @@ function renderList() {
 beforeEach(() => {
   useFirstRunNudgeMock.mockReturnValue({ showNudge: false });
   useBotEventPeekMock.mockImplementation(() => defaultPeekState());
+  useTurnsLiveMock.mockReturnValue({ data: {} } as unknown as ReturnType<
+    typeof useTurnsLive
+  >);
   useAppStore.setState({ botActivitySnapshots: {}, computerStates: {} });
 });
 
@@ -512,6 +531,47 @@ describe("<BotList> presence and activity", () => {
     expect(
       container.querySelector('[data-testid="working-badge-ava"]'),
     ).toBeNull();
+  });
+
+  it("lights the working badge from a live turn even when the adapter reports idle", () => {
+    // The turn engine is the second source of "working": the journal says
+    // dispatch, so the dot lights even before the adapter's status flips.
+    // A settled latest turn must NOT light it — terminal is not working.
+    setMembers([
+      { slug: "tess", name: "Tess", role: "engineer", online: true },
+      { slug: "ava", name: "Ava", role: "designer", online: true },
+    ]);
+    useTurnsLiveMock.mockReturnValue({
+      data: {
+        tess: {
+          agent: "tess",
+          state: "dispatch",
+          started_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
+        },
+        ava: {
+          agent: "ava",
+          state: "settled",
+          started_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
+        },
+      },
+    } as unknown as ReturnType<typeof useTurnsLive>);
+
+    const { container } = renderList();
+    expect(
+      container.querySelector('[data-testid="working-badge-tess"]'),
+    ).not.toBeNull();
+    expect(
+      container.querySelector('[data-testid="online-badge-tess"]'),
+    ).toBeNull();
+    // Terminal turn + idle adapter: still just the muted presence dot.
+    expect(
+      container.querySelector('[data-testid="working-badge-ava"]'),
+    ).toBeNull();
+    expect(
+      container.querySelector('[data-testid="online-badge-ava"]'),
+    ).not.toBeNull();
   });
 
   it("animates only the working bot's avatar", () => {

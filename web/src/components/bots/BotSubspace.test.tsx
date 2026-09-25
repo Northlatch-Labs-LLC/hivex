@@ -15,6 +15,9 @@ const listBotLogTasksMock = vi.hoisted(() => vi.fn());
 const getPoliciesMock = vi.hoisted(() => vi.fn());
 const getConfigMock = vi.hoisted(() => vi.fn());
 const getLocalProvidersStatusMock = vi.hoisted(() => vi.fn());
+// The header's Latest turn line polls the turn journal; mock the poller so
+// no fetch leaves the test, keeping the real in-flight predicate.
+const useTurnsLiveMock = vi.hoisted(() => vi.fn());
 
 vi.mock("../../lib/router", () => ({
   router: { navigate: navigateMock },
@@ -23,6 +26,17 @@ vi.mock("../../lib/router", () => ({
 vi.mock("../../hooks/useMembers", () => ({
   useOfficeMembers: useOfficeMembersMock,
 }));
+
+vi.mock("../../hooks/useTurnsLive", async () => {
+  const actual =
+    await vi.importActual<typeof import("../../hooks/useTurnsLive")>(
+      "../../hooks/useTurnsLive",
+    );
+  return {
+    ...actual,
+    useTurnsLive: useTurnsLiveMock,
+  };
+});
 
 vi.mock("../../api/client", async () => {
   const actual =
@@ -161,6 +175,7 @@ describe("<AgentSubspace>", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     useOfficeMembersMock.mockReturnValue({ data: [baseBot] });
+    useTurnsLiveMock.mockReturnValue({ data: {} });
     getSkillsListMock.mockResolvedValue({ skills: [] });
     getChannelsMock.mockResolvedValue({ channels: [] });
     getOfficeTasksMock.mockResolvedValue({ tasks: [] });

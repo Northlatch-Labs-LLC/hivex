@@ -1696,6 +1696,28 @@
   white-space: nowrap;
 }
 
+/* Latest-turn line (live-work surface): the turn engine's word on what
+   this bot's current — or most recent — turn is doing. Compact by design;
+   it sits under the status row in the header, not in a tab. The state goes
+   green only while the turn is in flight, matching the sidebar's
+   "green means working right now" rule. */
+.bot-subspace-latest-turn {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  margin-top: 2px;
+  font-family: var(--font-mono);
+  font-size: var(--text-2xs);
+  color: var(--text-tertiary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.bot-subspace-latest-turn__state--live {
+  color: var(--green, #22c55e);
+}
+
 /* ── Tab bar ── */
 .bot-subspace-tabbar {
   display: flex;

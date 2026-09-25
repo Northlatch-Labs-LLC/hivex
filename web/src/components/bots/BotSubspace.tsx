@@ -31,6 +31,7 @@ import { router } from "../../lib/router";
 import { BotKnowledgePanel } from "../knowledge/BotKnowledgePanel";
 import { HarnessBadge } from "../ui/HarnessBadge";
 import { PixelAvatar } from "../ui/PixelAvatar";
+import { LatestTurnLine } from "./LatestTurnLine";
 import { EditableName } from "./BotProfilePanel";
 import { TeachWorkflowModal } from "./TeachWorkflowModal";
 import { ChatTab } from "./tabs/ChatTab";
@@ -159,6 +160,9 @@ function ShellHeader({ agent, onTeachWorkflow }: ShellHeaderProps) {
               </span>
             ) : null}
           </div>
+          {/* The engine's live word on this bot's latest turn — the same
+              journal the sidebar's working dot reads, spelled out. */}
+          <LatestTurnLine slug={agent.slug} />
         </div>
 
         {/* Show it once. It will do it from now on. */}
