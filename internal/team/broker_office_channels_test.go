@@ -16,6 +16,8 @@ import (
 	"time"
 
 	"github.com/Northlatch-Labs-LLC/hivex/internal/channel"
+
+	"github.com/Northlatch-Labs-LLC/hivex/internal/config"
 )
 
 // TestHandleGenerateMember_RejectsNonPostAndUnauth verifies the method
@@ -772,5 +774,31 @@ func TestLoadDoesNotAppendDefaultsAfterBlueprintSeed(t *testing.T) {
 		case "cos", "executor", LibrarianSlug, appBuilderSlug:
 			t.Fatalf("slug %q was appended to the reloaded roster: a back-fill is live again (%v)", s, slugs)
 		}
+	}
+}
+
+// Saving ONLY the Z.ai key must change config — a revert-era brace bug had
+// the zai apply nested inside the Telegram branch, so the save came back
+// "no field to change" and silently dropped the operator's key.
+func TestSettingsUpdateZaiKeyAlone(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("HIVEX_CONFIG_PATH", filepath.Join(dir, "config.json"))
+	var b Broker
+	w := httptest.NewRecorder()
+	body := strings.NewReader(`{"zai_api_key":"zk-operator-key-0123456789abcd"}`)
+	// Drive the same handler route the UI's save uses; a bare Broker is
+	// enough because the key branch only touches config.
+	req := httptest.NewRequest(http.MethodPost, "/config", body)
+	req.Header.Set("Content-Type", "application/json")
+	b.handleConfig(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", w.Code, w.Body.String())
+	}
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ZaiAPIKey != "zk-operator-key-0123456789abcd" {
+		t.Fatalf("zai key must persist, got %q", config.KeyFingerprint(cfg.ZaiAPIKey))
 	}
 }

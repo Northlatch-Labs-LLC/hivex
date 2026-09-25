@@ -495,9 +495,10 @@ func (b *Broker) handleConfig(w http.ResponseWriter, r *http.Request) {
 		}
 		if body.TelegramToken != nil {
 			cfg.TelegramBotToken = strings.TrimSpace(*body.TelegramToken)
-			if body.ZaiKey != nil {
-				cfg.ZaiAPIKey = strings.TrimSpace(*body.ZaiKey)
-			}
+			changed = true
+		}
+		if body.ZaiKey != nil {
+			cfg.ZaiAPIKey = strings.TrimSpace(*body.ZaiKey)
 			changed = true
 		}
 		if body.OpenclawToken != nil {
