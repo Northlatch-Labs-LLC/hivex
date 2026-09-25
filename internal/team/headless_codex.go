@@ -61,6 +61,7 @@ func defaultHeadlessCodexRunTurn(l *Launcher, ctx context.Context, slug, notific
 		return fmt.Errorf("turn blocked for %s: monthly free-turn cap reached — upgrade at the Hive Customer Portal", slug)
 	}
 	turnID := l.broker.TurnBegin(slug, "", turnCh)
+	ctx = withHeadlessEngineTurnID(ctx, turnID)
 	l.broker.TurnTransition(turnID, TurnPolicyGate, "default-deny capability gate armed for tool calls")
 	var err error
 	switch {

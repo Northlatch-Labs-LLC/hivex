@@ -44,6 +44,21 @@ func withHeadlessTurnTaskID(ctx context.Context, taskID string) context.Context 
 
 // headlessTurnTaskID reads the executing turn's task id off ctx, or "" when the
 // caller is not on a tagged headless turn.
+type headlessEngineTurnIDKey struct{}
+
+// withHeadlessEngineTurnID carries the turn ENGINE's record id onto the
+// turn context so runners stamp usage (StampTurnUsage) against the record
+// the engine opened — runners mint their own SSE-scoped ids for manifests,
+// which do not match engine records.
+func withHeadlessEngineTurnID(ctx context.Context, id string) context.Context {
+	return context.WithValue(ctx, headlessEngineTurnIDKey{}, id)
+}
+
+func headlessEngineTurnID(ctx context.Context) string {
+	v, _ := ctx.Value(headlessEngineTurnIDKey{}).(string)
+	return v
+}
+
 type headlessTurnKindCtxKey struct{}
 
 // withHeadlessTurnKind tags the dispatched provider kind onto the turn
