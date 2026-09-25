@@ -1,0 +1,18 @@
+# Caddy reverse proxy for the hivex engine (see docker-compose.yml).
+#
+# Caddy obtains and renews a Let's Encrypt certificate for this name
+# automatically (ACME via ports 80/443). Requirements: the DNS record for
+# gridframes.app must point at this host, and 80/443 must be reachable from
+# the internet. To use a different domain, change it here AND in
+# HIVEX_WEB_PUBLIC_HOSTS in docker-compose.yml — the engine 403s any Host
+# that is not localhost or exactly that allowlisted name.
+
+gridframes.app {
+	encode zstd gzip
+
+	# 127.0.0.1 works because this Caddy shares the engine container's
+	# network namespace; the engine's loopback-only bind stays the security
+	# boundary. 7891 is the web UI port, which also proxies /api/* to the
+	# broker with the bearer token attached server-side.
+	reverse_proxy 127.0.0.1:7891
+}

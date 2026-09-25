@@ -5,6 +5,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -346,9 +347,7 @@ func isLoopbackRemote(r *http.Request) bool {
 //
 // The port component is intentionally not validated — the broker and web UI
 // run on different ports and dev setups may proxy through 80/443. The
-// loopback hostname is the security boundary. Assumes no trusted reverse
-// proxy sits in front of the listener; operators adding one must re-evaluate
-// (r.Host would then reflect the proxy's upstream, not the browser origin).
+// loopback hostname is the security boundary.
 func hostHeaderIsLoopback(r *http.Request) bool {
 	if r == nil {
 		return false
@@ -360,14 +359,71 @@ func hostHeaderIsLoopback(r *http.Request) bool {
 	return host == "localhost" || host == "127.0.0.1" || host == "::1"
 }
 
+// publicWebUIHostsEnv names the exact-host allowlist environment variable.
+// Comma-separated hostnames (e.g. "gridframes.app,office.example.org").
+const publicWebUIHostsEnv = "HIVEX_WEB_PUBLIC_HOSTS"
+
+// hostAllowedByPublicHostsEnv reports whether host — an already
+// port-stripped, case-folded Host-header hostname — exactly matches an entry
+// of HIVEX_WEB_PUBLIC_HOSTS. Entries are compared whole after trimming and
+// lowercasing: "gridframes.app" matches Host "gridframes.app" and
+// "gridframes.app:443" but NOT "evil.gridframes.app" or
+// "gridframes.app.evil.io" (no suffix, prefix, or wildcard matching — an
+// allowlist that pattern-matches is an allowlist that leaks). An unset or
+// empty env means no public host is allowlisted.
+func hostAllowedByPublicHostsEnv(host string) bool {
+	raw := strings.TrimSpace(os.Getenv(publicWebUIHostsEnv))
+	if raw == "" {
+		return false
+	}
+	host = strings.ToLower(strings.TrimSpace(host))
+	for _, entry := range strings.Split(raw, ",") {
+		entryHost := strings.ToLower(strings.TrimSpace(entry))
+		// Tolerate an operator who writes the port into the entry; the Host
+		// comparison is on the hostname only (see webUIHostAllowed).
+		if h, _, err := net.SplitHostPort(entryHost); err == nil {
+			entryHost = h
+		}
+		if entryHost != "" && entryHost == host {
+			return true
+		}
+	}
+	return false
+}
+
+// webUIHostAllowed reports whether the Host header may pass the rebinding
+// gate: a recognized localhost form, or a hostname the operator explicitly
+// listed in HIVEX_WEB_PUBLIC_HOSTS for serving the web UI behind a reverse
+// proxy on a public domain. The env path exists ONLY for that deployment
+// shape: the proxy is expected to run on the same host (RemoteAddr stays
+// loopback, enforced separately by webUIRebindGuard), terminate TLS, and
+// forward with the original Host preserved. Everything else still 403s.
+func webUIHostAllowed(r *http.Request) bool {
+	if hostHeaderIsLoopback(r) {
+		return true
+	}
+	if r == nil {
+		return false
+	}
+	host := strings.ToLower(r.Host)
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	return hostAllowedByPublicHostsEnv(host)
+}
+
 // webUIRebindGuard wraps a handler with a DNS-rebinding / cross-origin gate.
 // It rejects any request whose RemoteAddr is not loopback or whose Host header
-// is not a recognized localhost form. Applied on the web UI mux because that
-// mux auto-attaches the broker's Bearer token on forwarded requests; without
-// this gate, a malicious website can use DNS rebinding to ride the token.
+// is neither a recognized localhost form nor an operator-allowlisted public
+// host (HIVEX_WEB_PUBLIC_HOSTS, exact match). Applied on the web UI mux
+// because that mux auto-attaches the broker's Bearer token on forwarded
+// requests; without this gate, a malicious website can use DNS rebinding to
+// ride the token. The RemoteAddr loopback requirement is unchanged by the
+// public-host allowlist: a proxied deployment must keep the proxy on the same
+// host, and the Bearer-token auth on forwarded requests is unaffected.
 func webUIRebindGuard(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !isLoopbackRemote(r) || !hostHeaderIsLoopback(r) {
+		if !isLoopbackRemote(r) || !webUIHostAllowed(r) {
 			http.Error(w, "forbidden", http.StatusForbidden)
 			return
 		}

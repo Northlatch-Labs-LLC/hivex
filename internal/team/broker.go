@@ -270,9 +270,16 @@ type Broker struct {
 	// background cron tick could both archive the same articles, with the
 	// second sweep reading tombstone content (written by the first) into the
 	// .archive/ copy — silently destroying the original.
-	archiveSweepMu   sync.Mutex
-	server           *http.Server
-	listener         net.Listener
+	archiveSweepMu sync.Mutex
+	server         *http.Server
+	listener       net.Listener
+	// webUIServer/webUIListener are the web-UI-port counterparts of
+	// server/listener (set by ServeWebUI). Kept so a graceful shutdown can
+	// close BOTH listeners — Stop historically only closed the broker API
+	// listener, leaving the web UI port open until process exit. Guarded by
+	// brokerRestartMu like server/listener.
+	webUIServer      *http.Server
+	webUIListener    net.Listener
 	lifecycleCtx     context.Context
 	lifecycleCancel  context.CancelFunc
 	token            string   // shared secret for authenticating requests

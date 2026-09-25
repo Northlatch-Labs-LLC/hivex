@@ -11,8 +11,10 @@ package team
 import (
 	"context"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
+	"time"
 
 	"github.com/Northlatch-Labs-LLC/hivex/internal/provider"
 )
@@ -97,6 +99,48 @@ func (l *Launcher) Kill() error {
 		return err
 	}
 	return nil
+}
+
+// Shutdown stops a running office with a hard deadline. It is the SIGTERM/
+// SIGINT path for supervised deployments (docker compose, systemd), where
+// Kill alone could stall past any supervisor's patience: Kill waits on
+// subprocess-draining WaitGroups (stopHeadlessWorkers, Broker.Stop's
+// bgWG.Wait) with no overall bound, so a stuck bot subprocess made a
+// signalled engine look SIGTERM-immune and earned it a kill -9.
+//
+// Order matters and mirrors the deployment contract — save state, close
+// listeners, exit within the budget:
+//  1. Broker.Persist — final write-through of broker-state.json (fast,
+//     atomic rename; the same path every mutation already uses).
+//  2. Broker.CloseListeners — release the broker API + web UI listeners so
+//     the ports stop accepting the moment we decide to go.
+//  3. Kill with the remaining budget — full drain (watchdog, headless
+//     workers, broker Stop, temp files, office PID/info sidecars). If the
+//     drain exceeds the timeout we return anyway: state is saved and the
+//     listeners are closed, which is the guaranteed half of the contract.
+//     The caller (cmd/hivex runWeb) exits 0 immediately after.
+func (l *Launcher) Shutdown(timeout time.Duration) {
+	if l == nil {
+		return
+	}
+	if l.broker != nil {
+		if err := l.broker.Persist(); err != nil {
+			log.Printf("launcher shutdown: final broker state persist failed: %v", err)
+		}
+		l.broker.CloseListeners()
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if err := l.Kill(); err != nil {
+			log.Printf("launcher shutdown: kill: %v", err)
+		}
+	}()
+	select {
+	case <-done:
+	case <-time.After(timeout):
+		log.Printf("launcher shutdown: drain did not finish within %s; state is persisted and listeners are closed — exiting anyway", timeout)
+	}
 }
 
 func (l *Launcher) ResetSession() error {

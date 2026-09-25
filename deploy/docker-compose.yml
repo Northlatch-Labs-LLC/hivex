@@ -1,0 +1,63 @@
+# hivex behind a domain (TLS via Caddy), without weakening local security.
+#
+# Run from deploy/ (Caddyfile path below is relative to it):
+#
+#   docker compose up -d --build
+#
+# Security model, unchanged from local:
+#   * The engine binds 127.0.0.1 only — in this compose file Caddy shares
+#     the engine's network namespace (network_mode: "service:hivex"), so the
+#     engine still sees loopback RemoteAddr and its DNS-rebinding guard
+#     (webUIRebindGuard) keeps its full strength.
+#   * Caddy terminates TLS and forwards with the original Host preserved;
+#     the Host is allowlisted EXACTLY via HIVEX_WEB_PUBLIC_HOSTS. Anything
+#     else (other domains, subdomains of the allowlisted name) gets 403.
+#   * Bearer-token auth on the broker API is untouched.
+# Prereq: a DNS A/AAAA record for the domain pointing at this host.
+
+services:
+  hivex:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: hivex:latest
+    container_name: hivex
+    # The public hostname the web UI may serve. Exact-match, comma-separated;
+    # replace with your own domain before deploying.
+    environment:
+      HIVEX_WEB_PUBLIC_HOSTS: gridframes.app
+    # Engine binds loopback inside this netns; Caddy (below) reaches it via
+    # the shared namespace. Publish 80/443 here because this service owns
+    # the network namespace both containers live in. 443/udp is HTTP/3.
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      # Broker state, wiki, workspace tree (~/.hivex equivalent). Losing this
+      # volume loses the office.
+      - hivex_state:/data
+    # SIGTERM budget: the engine exits 0 within ~5s; 10s grace adds margin.
+    stop_grace_period: 10s
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2
+    container_name: hivex-caddy
+    # Same network namespace as the engine: Caddy's 127.0.0.1 IS the
+    # engine's 127.0.0.1. This is what lets the engine keep its
+    # loopback-only bind and loopback-RemoteAddr checks behind a domain.
+    network_mode: "service:hivex"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      # ACME account + certificates MUST persist or every restart re-issues.
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - hivex
+    restart: unless-stopped
+
+volumes:
+  hivex_state:
+  caddy_data:
+  caddy_config:

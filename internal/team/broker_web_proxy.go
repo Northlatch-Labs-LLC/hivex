@@ -162,6 +162,16 @@ func (b *Broker) ServeWebUI(port int) error {
 		return fmt.Errorf("web UI: listen on %s: %w", addr, err)
 	}
 	srv := &http.Server{Handler: mux}
+	// Record the web UI listener + server so a graceful shutdown (Launcher
+	// Shutdown → Broker.CloseListeners) can close this port too; before this
+	// existed the srv/ln pair was function-local and only process exit ever
+	// released the web UI port. ServeWebUI runs once per process (the broker
+	// restart path re-execs the binary rather than re-entering LaunchWeb), so
+	// there is no second call to orphan.
+	b.brokerRestartMu.Lock()
+	b.webUIServer = srv
+	b.webUIListener = ln
+	b.brokerRestartMu.Unlock()
 	go func() {
 		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Printf("broker web UI proxy: serve on :%d: %v", port, err)

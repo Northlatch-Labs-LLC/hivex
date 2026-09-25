@@ -655,6 +655,112 @@ func TestWebUIRebindGuard(t *testing.T) {
 	}
 }
 
+// TestWebUIRebindGuardPublicHostAllowlist covers HIVEX_WEB_PUBLIC_HOSTS: the
+// operator's escape hatch for serving the web UI behind a reverse proxy on a
+// real domain. Exact-host semantics only — an allowlisted hostname passes
+// with or without a port; lookalikes and suffixes stay 403; the RemoteAddr
+// loopback requirement is NOT relaxed by the env.
+func TestWebUIRebindGuardPublicHostAllowlist(t *testing.T) {
+	t.Setenv(publicWebUIHostsEnv, "gridframes.app, office.example.org")
+
+	guarded := webUIRebindGuard(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	cases := []struct {
+		name       string
+		remoteAddr string
+		host       string
+		wantStatus int
+	}{
+		{"allowlisted host, loopback remote", "127.0.0.1:5000", "gridframes.app", http.StatusOK},
+		{"allowlisted host with port", "127.0.0.1:5000", "gridframes.app:443", http.StatusOK},
+		{"allowlisted host uppercase Host", "127.0.0.1:5000", "GRIDFRAMES.APP", http.StatusOK},
+		{"second allowlisted entry", "127.0.0.1:5000", "office.example.org", http.StatusOK},
+		{"localhost still passes with env set", "127.0.0.1:5000", "127.0.0.1:7891", http.StatusOK},
+		{"subdomain of allowlisted host is NOT allowlisted", "127.0.0.1:5000", "evil.gridframes.app", http.StatusForbidden},
+		{"allowlisted host as suffix is NOT allowlisted", "127.0.0.1:5000", "gridframes.app.evil.io", http.StatusForbidden},
+		{"other public host stays 403", "127.0.0.1:5000", "attacker.test", http.StatusForbidden},
+		{"allowlisted host but non-loopback remote stays 403", "203.0.113.9:80", "gridframes.app", http.StatusForbidden},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "/api-token", nil)
+			req.RemoteAddr = tc.remoteAddr
+			req.Host = tc.host
+			rec := httptest.NewRecorder()
+			guarded.ServeHTTP(rec, req)
+			if rec.Code != tc.wantStatus {
+				t.Fatalf("status=%d, want %d; body=%q", rec.Code, tc.wantStatus, rec.Body.String())
+			}
+		})
+	}
+}
+
+// TestWebUIRebindGuardEmptyEnvKeepsLocalhostOnly pins the default: with
+// HIVEX_WEB_PUBLIC_HOSTS unset, empty, or whitespace, only localhost-form
+// Host headers pass. Deploying without the env must behave exactly like
+// today's purely-local broker.
+func TestWebUIRebindGuardEmptyEnvKeepsLocalhostOnly(t *testing.T) {
+	for _, envName := range []string{"unset", "empty", "whitespace", "blank entries"} {
+		t.Run(envName, func(t *testing.T) {
+			switch envName {
+			case "unset":
+				t.Setenv(publicWebUIHostsEnv, "")
+			case "empty":
+				t.Setenv(publicWebUIHostsEnv, "")
+			case "whitespace":
+				t.Setenv(publicWebUIHostsEnv, "   ")
+			case "blank entries":
+				t.Setenv(publicWebUIHostsEnv, " , ,, ")
+			}
+			guarded := webUIRebindGuard(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusOK)
+			}))
+
+			localReq := httptest.NewRequest(http.MethodGet, "/api-token", nil)
+			localReq.RemoteAddr = "127.0.0.1:5000"
+			localReq.Host = "localhost:7891"
+			rec := httptest.NewRecorder()
+			guarded.ServeHTTP(rec, localReq)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("localhost Host with %s env: status=%d, want 200", envName, rec.Code)
+			}
+
+			publicReq := httptest.NewRequest(http.MethodGet, "/api-token", nil)
+			publicReq.RemoteAddr = "127.0.0.1:5000"
+			publicReq.Host = "gridframes.app"
+			rec = httptest.NewRecorder()
+			guarded.ServeHTTP(rec, publicReq)
+			if rec.Code != http.StatusForbidden {
+				t.Fatalf("public Host with %s env: status=%d, want 403", envName, rec.Code)
+			}
+		})
+	}
+}
+
+// TestHostAllowedByPublicHostsEnv unit-pins the parser: case-insensitive,
+// whitespace-tolerant, port-tolerant on entries, and never a pattern match.
+func TestHostAllowedByPublicHostsEnv(t *testing.T) {
+	t.Setenv(publicWebUIHostsEnv, "Gridframes.App, example.org:443")
+	for _, tc := range []struct {
+		host string
+		want bool
+	}{
+		{"gridframes.app", true},
+		{"GRIDFRAMES.APP", true},
+		{"example.org", true},
+		{"evil.gridframes.app", false},
+		{"gridframes.app.evil.io", false},
+		{"not-in-list.test", false},
+		{"", false},
+	} {
+		if got := hostAllowedByPublicHostsEnv(tc.host); got != tc.want {
+			t.Fatalf("hostAllowedByPublicHostsEnv(%q) = %v, want %v", tc.host, got, tc.want)
+		}
+	}
+}
+
 // TestCORSMiddlewareDropsNullOriginWildcard verifies the fix for the CSO
 // finding: Access-Control-Allow-Origin: * was previously returned for empty
 // or "null" Origin headers. A file:// page could open on the operator's

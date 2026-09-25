@@ -728,26 +728,28 @@ func runWeb(args []string, packSlug string, unsafe bool, webPort int, opusCEO bo
 	shareController := newWebShareController(webPort)
 	tunnelController := newWebTunnelController()
 
-	// Clean up tunnel/share subprocesses, the launcher (headless workers,
-	// broker, per-bot temp files), and then exit when the process receives
-	// SIGINT or SIGTERM. Without l.Kill() the per-launch temp directory
-	// ($TMPDIR/hivex-launch-*) containing MCP configs and broker tokens
-	// would linger on disk after every Ctrl+C.
+	// Shut down cleanly on SIGINT/SIGTERM: stop tunnel/share subprocesses,
+	// persist broker state, close the HTTP listeners, and drain the launcher
+	// (headless workers, broker, per-bot temp files — the $TMPDIR/hivex-launch-*
+	// dir holding MCP configs and broker tokens) under a hard 5s budget.
+	// Without l.Shutdown's deadline the drain could stall indefinitely on a
+	// stuck subprocess, which is why a signalled engine previously had to be
+	// kill -9'd.
 	go func() {
 		sigCh := make(chan os.Signal, 1)
 		signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 		sig := <-sigCh
+		fmt.Fprintf(os.Stderr, "\nhivebot: received %v — saving state and shutting down...\n", sig)
 		_ = shareController.stop()
 		_ = tunnelController.stop()
-		_ = l.Kill()
-		// POSIX convention: a process killed by signal N exits with 128+N
-		// so process supervisors (systemd, npm, foreman) can distinguish a
-		// clean exit from an interrupted run. os.Exit(0) here would mask
-		// Ctrl+C as success in any caller that checks $?.
-		if s, ok := sig.(syscall.Signal); ok {
-			os.Exit(128 + int(s))
-		}
-		os.Exit(1)
+		l.Shutdown(5 * time.Second)
+		// Exit 0: supervised deployments (docker compose, systemd) read a
+		// clean stop this way, and l.Shutdown has already persisted broker
+		// state and closed both listeners by contract. This deliberately
+		// replaces the earlier 128+signal convention: SIGINT interactively
+		// and SIGTERM from a supervisor now both mean "clean shutdown"
+		// because the shutdown itself is bounded.
+		os.Exit(0)
 	}()
 
 	if err := l.PreflightWeb(); err != nil {
