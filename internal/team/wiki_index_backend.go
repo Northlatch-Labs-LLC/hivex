@@ -29,11 +29,10 @@ import (
 	"log"
 	"os"
 	"strings"
-
-	"github.com/Northlatch-Labs-LLC/hivex/internal/config"
 	"sync/atomic"
 	"testing"
 
+	"github.com/Northlatch-Labs-LLC/hivex/internal/config"
 	"github.com/Northlatch-Labs-LLC/hivex/internal/gbrain"
 )
 
