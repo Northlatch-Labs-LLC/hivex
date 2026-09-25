@@ -64,14 +64,11 @@ func TestCloseListenersClosesBrokerAndWebUIListeners(t *testing.T) {
 	// Give the kernel a beat to propagate the close, then require refusal.
 	deadline := time.Now().Add(2 * time.Second)
 	for _, addr := range []string{brokerAddr, webUIAddr} {
-		for {
-			if !acceptsConnections(t, addr) {
-				break
-			}
-			if time.Now().After(deadline) {
-				t.Fatalf("listener %s still accepting after CloseListeners", addr)
-			}
+		for acceptsConnections(t, addr) && !time.Now().After(deadline) {
 			time.Sleep(20 * time.Millisecond)
+		}
+		if acceptsConnections(t, addr) {
+			t.Fatalf("listener %s still accepting after CloseListeners", addr)
 		}
 	}
 }

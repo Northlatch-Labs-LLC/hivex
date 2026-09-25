@@ -904,8 +904,12 @@ type openaiStreamToolFunction struct {
 // understanding both the OpenAI shape ({"data":[{"id":...}]}) and the
 // ToshLLM shape ({"models":[{"model":..., "name":...}] with full-path ids).
 func firstServedModel(baseURL, kind string) string {
+	return firstServedModelCtx(context.Background(), baseURL, kind)
+}
+
+func firstServedModelCtx(ctx context.Context, baseURL, kind string) string {
 	client := &http.Client{Timeout: 5 * time.Second}
-	req, err := http.NewRequest(http.MethodGet, strings.TrimRight(baseURL, "/")+"/models", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(baseURL, "/")+"/models", nil)
 	if err != nil {
 		return ""
 	}
