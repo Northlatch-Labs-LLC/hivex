@@ -158,7 +158,7 @@ func TestRunHeadlessCodexTurnUsesHeadlessOfficeRuntime(t *testing.T) {
 	// same tempdir post-Phase-0 migration (worktree_guard_test init pins a
 	// process-wide HIVEX_RUNTIME_HOME otherwise).
 	t.Setenv("HIVEX_RUNTIME_HOME", tmpHome)
-	t.Setenv("HIVEX_OPENAI_API_KEY", "openai-secret-key")
+	t.Setenv("HIVEX_OPENAI_API_KEY", "openai-secret-key-0123456789")
 	t.Setenv("HIVEX_ONE_SECRET", "one-secret-value")
 	t.Setenv("HIVEX_ONE_IDENTITY", "founder@example.com")
 	t.Setenv("HIVEX_ONE_IDENTITY_TYPE", "user")
@@ -240,13 +240,13 @@ func TestRunHeadlessCodexTurnUsesHeadlessOfficeRuntime(t *testing.T) {
 	if containsEnvPrefix(record.Env, "HIVEX_API_KEY=") {
 		t.Fatalf("a retired knowledge-graph API key must not be forwarded, got %#v", record.Env)
 	}
-	if !containsEnv(record.Env, "HIVEX_OPENAI_API_KEY=openai-secret-key") || !containsEnv(record.Env, "OPENAI_API_KEY=openai-secret-key") {
+	if !containsEnv(record.Env, "HIVEX_OPENAI_API_KEY=openai-secret-key-0123456789") || !containsEnv(record.Env, "OPENAI_API_KEY=openai-secret-key-0123456789") {
 		t.Fatalf("expected openai API env, got %#v", record.Env)
 	}
 	if !containsEnv(record.Env, "ONE_SECRET=one-secret-value") {
 		t.Fatalf("expected one secret env, got %#v", record.Env)
 	}
-	if strings.Contains(joinedArgs, l.broker.Token()) || strings.Contains(joinedArgs, "hive-secret-key") || strings.Contains(joinedArgs, "openai-secret-key") || strings.Contains(joinedArgs, "one-secret-value") {
+	if strings.Contains(joinedArgs, l.broker.Token()) || strings.Contains(joinedArgs, "hive-secret-key") || strings.Contains(joinedArgs, "openai-secret-key-0123456789") || strings.Contains(joinedArgs, "one-secret-value") {
 		t.Fatalf("expected secret values to stay out of args, got %#v", record.Args)
 	}
 	if !strings.Contains(record.Stdin, "<system>") || !strings.Contains(record.Stdin, "You have new work in #launch.") {
@@ -310,7 +310,7 @@ func TestRunHeadlessCodexTurnMetricsNoDataRace(t *testing.T) {
 	tmpHome := t.TempDir()
 	t.Setenv("HOME", tmpHome)
 	t.Setenv("HIVEX_RUNTIME_HOME", tmpHome)
-	t.Setenv("HIVEX_OPENAI_API_KEY", "openai-secret-key")
+	t.Setenv("HIVEX_OPENAI_API_KEY", "openai-secret-key-0123456789")
 
 	l := &Launcher{
 		pack:     bot.GetPack("founding-team"),
@@ -325,6 +325,9 @@ func TestRunHeadlessCodexTurnMetricsNoDataRace(t *testing.T) {
 }
 
 func TestRunHeadlessCodexTurnUsesAssignedWorktreeForCodingBots(t *testing.T) {
+	// Hermetic codex auth: no dependence on the developer machine's
+	// config or ambient keys.
+	t.Setenv("HIVEX_OPENAI_API_KEY", "sk-codex-test-0123456789abcdef")
 	recordFile := filepath.Join(t.TempDir(), "headless-codex-record.jsonl")
 	worktreeDir := t.TempDir()
 	repoRoot := t.TempDir()
@@ -450,6 +453,9 @@ func TestRunHeadlessCodexTurnUsesAssignedWorktreeForCodingBots(t *testing.T) {
 }
 
 func TestRunHeadlessCodexTurnUsesAssignedWorktreeForLocalWorktreeBuilder(t *testing.T) {
+	// Hermetic codex auth: no dependence on the developer machine's
+	// config or ambient keys.
+	t.Setenv("HIVEX_OPENAI_API_KEY", "sk-codex-test-0123456789abcdef")
 	recordFile := filepath.Join(t.TempDir(), "headless-codex-record.jsonl")
 	worktreeDir := t.TempDir()
 	repoRoot := t.TempDir()
@@ -534,6 +540,9 @@ func TestRunHeadlessCodexTurnUsesAssignedWorktreeForLocalWorktreeBuilder(t *test
 }
 
 func TestRunHeadlessCodexTurnPassesScopedChannelEnv(t *testing.T) {
+	// Hermetic codex auth: no dependence on the developer machine's
+	// config or ambient keys.
+	t.Setenv("HIVEX_OPENAI_API_KEY", "sk-codex-test-0123456789abcdef")
 	recordFile := filepath.Join(t.TempDir(), "headless-codex-record.jsonl")
 	oldLookPath := headlessCodexLookPath
 	oldExecutablePath := headlessCodexExecutablePath
@@ -2498,7 +2507,7 @@ func TestPreflightHeadlessCodexAuthPassesWhenOpenAIKeySet(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	t.Setenv("HIVEX_OPENAI_API_KEY", "")
-	t.Setenv("OPENAI_API_KEY", "sk-test-key")
+	t.Setenv("OPENAI_API_KEY", "sk-test-key-0123456789abcdef")
 	if err := config.Save(config.Config{}); err != nil {
 		t.Fatalf("save config: %v", err)
 	}

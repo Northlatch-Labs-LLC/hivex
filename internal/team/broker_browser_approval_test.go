@@ -251,7 +251,7 @@ func writeFakeCuaRunner(t *testing.T, script string) {
 	if err := os.WriteFile(runner, []byte("#!/bin/sh\n"+script), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("HIVEX_OPENAI_API_KEY", "test-key")
+	t.Setenv("HIVEX_OPENAI_API_KEY", "test-key-0123456789abcdef")
 	t.Setenv("HIVEX_CUA_PYTHON", "sh")
 	t.Setenv("HIVEX_CUA_RUNNER", runner)
 }

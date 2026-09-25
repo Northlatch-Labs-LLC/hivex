@@ -113,7 +113,7 @@ func TestHandleExecuteBrowserStreams(t *testing.T) {
 	if err := os.WriteFile(runner, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("HIVEX_OPENAI_API_KEY", "test-key")
+	t.Setenv("HIVEX_OPENAI_API_KEY", "test-key-0123456789abcdef")
 	t.Setenv("HIVEX_CUA_PYTHON", "sh")
 	t.Setenv("HIVEX_CUA_RUNNER", runner)
 
@@ -150,7 +150,7 @@ func TestHandleExecuteReplayStreams(t *testing.T) {
 	if err := os.WriteFile(runner, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("HIVEX_OPENAI_API_KEY", "test-key")
+	t.Setenv("HIVEX_OPENAI_API_KEY", "test-key-0123456789abcdef")
 	t.Setenv("HIVEX_CUA_PYTHON", "sh")
 	t.Setenv("HIVEX_CUA_RUNNER", runner)
 
@@ -171,7 +171,7 @@ func TestHandleExecuteReplayStreams(t *testing.T) {
 }
 
 func TestHandleExecuteReplayRejectsEmptyTrajectory(t *testing.T) {
-	t.Setenv("HIVEX_OPENAI_API_KEY", "test-key")
+	t.Setenv("HIVEX_OPENAI_API_KEY", "test-key-0123456789abcdef")
 	r := httptest.NewRequest(http.MethodPost, "/execute/replay", strings.NewReader(`{}`))
 	w := httptest.NewRecorder()
 	(&Broker{}).handleExecuteReplay(w, r)

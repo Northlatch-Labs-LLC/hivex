@@ -427,6 +427,13 @@ func (l *Launcher) buildHeadlessCodexEnv(slug string, workspaceDir string, chann
 	// needs prefix-match, so we run gitexec.CleanEnv first and stripEnvKeys
 	// second.
 	env := stripEnvKeys(gitexec.AgentEnv(), headlessCodexEnvVarsToStrip)
+	// The allowlist drops ambient credentials by design; the codex CLI
+	// authenticates with OPENAI_API_KEY, so the harness hands it the
+	// RESOLVED key explicitly (Settings config > explicit env > ambient) —
+	// never an accidental machine inheritance.
+	if k := config.ResolveOpenAIAPIKey(); k != "" {
+		env = setEnvValue(env, "OPENAI_API_KEY", k)
+	}
 	if workspaceDir = normalizeHeadlessWorkspaceDir(workspaceDir); workspaceDir != "" {
 		env = setEnvValue(env, "PWD", workspaceDir)
 	}

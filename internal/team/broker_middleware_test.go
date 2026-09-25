@@ -146,7 +146,7 @@ func TestBrokerAuthRejectsUnauthenticated(t *testing.T) {
 	b := newTestBroker(t)
 	b.runtimeProvider = "codex"
 	t.Setenv("HIVEX_MEMORY_BACKEND", config.MemoryBackendGBrain)
-	t.Setenv("HIVEX_OPENAI_API_KEY", "sk-test-openai")
+	t.Setenv("HIVEX_OPENAI_API_KEY", "sk-test-openai-0123456789abcdef")
 	// Force the gbrain CLI to be undiscoverable so "inactive without CLI
 	// installed" is deterministic regardless of whether the host running the
 	// suite has gbrain on PATH. The OpenAI key keeps the embedding side ready,

@@ -291,7 +291,7 @@ func TestResolveMemoryBackendDefaultsToMarkdownWhenAnthropicOnly(t *testing.T) {
 		t.Setenv("HIVEX_MEMORY_BACKEND", "")
 		t.Setenv("HIVEX_OPENAI_API_KEY", "")
 		t.Setenv("OPENAI_API_KEY", "")
-		t.Setenv("HIVEX_ANTHROPIC_API_KEY", "sk-ant-test")
+		t.Setenv("HIVEX_ANTHROPIC_API_KEY", "sk-ant-test-0123456789abcdef")
 		fakeGBrainOnPath(t)
 		setGBrainOllamaEmbedder(t, false)
 		if got := ResolveMemoryBackend(""); got != MemoryBackendMarkdown {

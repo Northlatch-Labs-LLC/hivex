@@ -166,7 +166,7 @@ func TestResolveMemoryBackendStatusDefaultFallsBackToMarkdown(t *testing.T) {
 
 func TestResolveMemoryBackendStatusGBrainReady(t *testing.T) {
 	t.Setenv("HIVEX_MEMORY_BACKEND", config.MemoryBackendGBrain)
-	t.Setenv("HIVEX_OPENAI_API_KEY", "sk-test-openai")
+	t.Setenv("HIVEX_OPENAI_API_KEY", "sk-test-openai-0123456789abcdef")
 
 	binDir := t.TempDir()
 	gbrainBin := filepath.Join(binDir, "gbrain")

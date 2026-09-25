@@ -90,11 +90,11 @@ func newWikiIndexForBackend(ctx context.Context, root string) (*WikiIndex, error
 		return NewWikiIndex(root), nil
 	}
 
-	// The gbrain index is only for hosts whose memory backend IS gbrain.
-	// A markdown/none host never asked for it: attempting it anyway made
-	// every boot log "facts will NOT persist" for a backend that was never
-	// in play.
-	if mb := config.ResolveMemoryBackend(""); mb != "gbrain" {
+	// An operator who EXPLICITLY chose markdown/none never asked for
+	// gbrain: attempting it anyway made every boot log "facts will NOT
+	// persist" for a backend that was never in play. Hosts on the implicit
+	// default keep the original behavior (try gbrain; warn when absent).
+	if explicitMemoryBackend() {
 		return NewWikiIndex(root), nil
 	}
 
@@ -157,4 +157,16 @@ func SetBrokerShimBase(base string) { brokerShimBase.Store(strings.TrimSpace(bas
 func shimBaseURL() string {
 	v, _ := brokerShimBase.Load().(string)
 	return v
+}
+
+// explicitMemoryBackend reports an operator's explicit markdown/none
+// memory-backend choice (env, then config) — as opposed to the implicit
+// gbrain-ready default.
+func explicitMemoryBackend() bool {
+	v := strings.TrimSpace(config.Getenv("HIVEX_MEMORY_BACKEND"))
+	if v == "" {
+		cfg, _ := config.Load()
+		v = strings.TrimSpace(cfg.MemoryBackend)
+	}
+	return v == "markdown" || v == "none"
 }

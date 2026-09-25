@@ -250,7 +250,7 @@ func TestRunHeadlessClaudeTurn_NoResumeFlag(t *testing.T) {
 
 func TestBuildMCPServerMap_GBrainCredentialsFlowThroughOffice(t *testing.T) {
 	t.Setenv("HIVEX_MEMORY_BACKEND", "gbrain")
-	t.Setenv("HIVEX_OPENAI_API_KEY", "openai-test-key")
+	t.Setenv("HIVEX_OPENAI_API_KEY", "openai-test-key-0123456789abcdef")
 
 	l := minimalLauncher(false)
 	servers, err := l.buildMCPServerMap()
@@ -269,7 +269,7 @@ func TestBuildMCPServerMap_GBrainCredentialsFlowThroughOffice(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected office env map, got %#v", server["env"])
 	}
-	if env["OPENAI_API_KEY"] != "openai-test-key" {
+	if env["OPENAI_API_KEY"] != "openai-test-key-0123456789abcdef" {
 		t.Fatalf("expected OPENAI_API_KEY to flow through office env, got %#v", env)
 	}
 }

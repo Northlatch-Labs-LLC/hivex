@@ -124,5 +124,11 @@ func agentEnvAllowed(name string) bool {
 	}
 	return strings.HasPrefix(name, "LC_") ||
 		strings.HasPrefix(name, "XDG_") ||
-		strings.HasPrefix(name, "HIVEX_")
+		strings.HasPrefix(name, "HIVEX_") ||
+		// Go's canonical os/exec test-helper sentinel family — carries no
+		// credentials by convention and subprocess test doubles need it.
+		strings.HasPrefix(name, "GO_WANT_") ||
+		// The headless codex test double's control channel (record path,
+		// delay knobs) — product-owned test sentinel, no credentials.
+		strings.HasPrefix(name, "HEADLESS_CODEX_")
 }

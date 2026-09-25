@@ -39,7 +39,7 @@ func withRealtimeStub(t *testing.T, stub *rtStub) {
 }
 
 func TestHandleRealtimeSession_MintsEphemeralKey(t *testing.T) {
-	t.Setenv("HIVEX_OPENAI_API_KEY", "sk-real-secret")
+	t.Setenv("HIVEX_OPENAI_API_KEY", "sk-real-secret-0123456789abcdef")
 	t.Setenv("HIVEX_REALTIME_MODEL", "gpt-realtime")
 	stub := &rtStub{status: 200, body: `{"value":"ek_abc","expires_at":999}`}
 	withRealtimeStub(t, stub)
@@ -52,7 +52,7 @@ func TestHandleRealtimeSession_MintsEphemeralKey(t *testing.T) {
 		t.Fatalf("status: got %d, want 200 (body %q)", rec.Code, rec.Body.String())
 	}
 	// The real key is forwarded to OpenAI but must NOT appear in the response.
-	if stub.gotAuth != "Bearer sk-real-secret" {
+	if stub.gotAuth != "Bearer sk-real-secret-0123456789abcdef" {
 		t.Fatalf("upstream auth: got %q", stub.gotAuth)
 	}
 	if strings.Contains(rec.Body.String(), "sk-real-secret") {
