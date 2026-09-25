@@ -35,6 +35,11 @@ const CLOUD_MODELS: Record<
     // plan ids belong here; discovery fills the rest live.
     "GLM-5.3",
   ],
+  toshllm: [
+    // Local engine: the loaded model resolves live from the engine's
+    // /models at request time — the catalog intentionally stays empty and
+    // discovery (or auto-resolution) supplies the id.
+  ],
   "zai-code": [
     // The GLM Coding Plan catalog, current-first. Only ids verified against
     // the plan belong here — no speculative model names.

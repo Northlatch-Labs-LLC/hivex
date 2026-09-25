@@ -43,6 +43,12 @@ export const RUNTIME_PROVIDER_OPTIONS: readonly RuntimeProviderOption[] = [
     binary: "opencode",
   },
   {
+    id: "toshllm",
+    label: "ToshLLM (Metal)",
+    desc: "Local GPU inference on the ToshLLM engine (:8080) — the local default; ollama is CPU-heavy legacy",
+    kind: "local",
+  },
+  {
     id: "mlx-lm",
     label: "MLX-LM",
     desc: "Apple Silicon local OpenAI-compatible runtime",
@@ -71,6 +77,7 @@ export const FALLBACK_LLM_KINDS: LLMRuntimeKind[] = [
   "codex",
   "opencode",
   "mlx-lm",
+  "toshllm",
   "ollama",
   "exo",
 ];

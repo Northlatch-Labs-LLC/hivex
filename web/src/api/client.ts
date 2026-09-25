@@ -1013,6 +1013,7 @@ export type LLMRuntimeKind =
   | "codex"
   | "opencode"
   | "mlx-lm"
+  | "toshllm"
   | "exo";
 
 // GatewayKind names a runtime that is reached through an integration gateway

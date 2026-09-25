@@ -306,6 +306,14 @@ func runOpenAICompatStream(
 	if trimmed := strings.TrimSpace(modelOverride); trimmed != "" {
 		model = trimmed
 	}
+	if model == "" {
+		// No pinned model (an engine whose loaded model is dynamic, e.g.
+		// ToshLLM): resolve the engine's first served model. Best-effort —
+		// an engine with no models surfaces its own clear error below.
+		if m := firstServedModel(baseURL, kind); m != "" {
+			model = m
+		}
+	}
 	endpoint := normalizeOpenAICompatEndpoint(baseURL)
 
 	body := openaiRequest{
@@ -890,4 +898,53 @@ type openaiStreamToolCall struct {
 type openaiStreamToolFunction struct {
 	Name      string `json:"name,omitempty"`
 	Arguments string `json:"arguments,omitempty"`
+}
+
+// firstServedModel fetches {base}/models and returns the first id,
+// understanding both the OpenAI shape ({"data":[{"id":...}]}) and the
+// ToshLLM shape ({"models":[{"model":..., "name":...}] with full-path ids).
+func firstServedModel(baseURL, kind string) string {
+	client := &http.Client{Timeout: 5 * time.Second}
+	req, err := http.NewRequest(http.MethodGet, strings.TrimRight(baseURL, "/")+"/models", nil)
+	if err != nil {
+		return ""
+	}
+	if key := resolveOpenAICompatAPIKey(kind); key != "" {
+		req.Header.Set("Authorization", "Bearer "+key)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return ""
+	}
+	var body struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+		Models []struct {
+			Model string `json:"model"`
+			Name  string `json:"name"`
+		} `json:"models"`
+	}
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if json.Unmarshal(raw, &body) != nil {
+		return ""
+	}
+	for _, m := range body.Data {
+		if id := strings.TrimSpace(m.ID); id != "" {
+			return id
+		}
+	}
+	for _, m := range body.Models {
+		if id := strings.TrimSpace(m.Model); id != "" {
+			return id
+		}
+		if id := strings.TrimSpace(m.Name); id != "" {
+			return id
+		}
+	}
+	return ""
 }

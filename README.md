@@ -23,7 +23,7 @@ ship inside a single binary that binds to loopback and nothing else.
 │  Broker (loopback) ── auth, task planning, metering, marketplace        │
 │      │                                                                   │
 │      ├── CLI runtimes: claude-code · zai-code · codex · opencode        │
-│      ├── HTTP runtimes: zai (GLM) · hiveapi · ollama · mlx-lm · exo     │
+│      ├── HTTP runtimes: zai (GLM) · toshllm (Metal) · hiveapi · mlx-lm  │
 │      └── custom-*: any OpenAI-compatible endpoint added in Settings     │
 │      ▼                                                                   │
 │  Gridframe engine ── T0–T3 approval gates · append-only ledgers         │

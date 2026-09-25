@@ -19,6 +19,7 @@ export const PROVIDER_LABELS: Record<LLMRuntimeKind, string> = {
   codex: "Codex",
   opencode: "Opencode",
   "mlx-lm": "MLX-LM",
+  toshllm: "ToshLLM (Metal)",
   ollama: "Ollama",
   exo: "Exo",
 };

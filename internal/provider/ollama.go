@@ -1,5 +1,10 @@
 package provider
 
+// DEPRECATED as the local default: ollama runs CPU-only on most installs
+// and starves the machine under concurrent work; ToshLLM (kind "toshllm")
+// is the GPU-backed local runtime. The kind stays registered so existing
+// configs keep working — new installs should prefer toshllm.
+
 // Ollama runs as a local daemon (`brew services start ollama`) on :11434
 // and exposes both its native API and an OpenAI-compatible surface at
 // /v1/chat/completions. The default model below is a coder-tuned Qwen2.5

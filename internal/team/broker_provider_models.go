@@ -37,6 +37,11 @@ func (b *Broker) handleProviderModels(w http.ResponseWriter, r *http.Request) {
 			base = v
 		}
 		key = config.ResolveZaiAPIKey()
+	case kind == provider.KindToshllm:
+		base = "http://127.0.0.1:8080/v1"
+		if v := strings.TrimSpace(os.Getenv("HIVEX_TOSHLLM_BASE_URL")); v != "" {
+			base = v
+		}
 	case strings.HasPrefix(kind, config.CustomProviderKindPrefix):
 		if cp, err := config.FindCustomProviderByKey(kind); err == nil {
 			base, key = cp.BaseURL, cp.APIKey
@@ -74,6 +79,11 @@ func (b *Broker) handleProviderModels(w http.ResponseWriter, r *http.Request) {
 		Data []struct {
 			ID string `json:"id"`
 		} `json:"data"`
+		// ToshLLM lists models in its own shape with full-path ids.
+		Models []struct {
+			Model string `json:"model"`
+			Name  string `json:"name"`
+		} `json:"models"`
 	}
 	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if json.Unmarshal(raw, &body) != nil {
@@ -84,6 +94,14 @@ func (b *Broker) handleProviderModels(w http.ResponseWriter, r *http.Request) {
 	for _, m := range body.Data {
 		if id := strings.TrimSpace(m.ID); id != "" {
 			models = append(models, id)
+		}
+	}
+	for _, m := range body.Models {
+		for _, cand := range []string{m.Model, m.Name} {
+			if id := strings.TrimSpace(cand); id != "" {
+				models = append(models, id)
+				break
+			}
 		}
 	}
 	out["models"] = models
